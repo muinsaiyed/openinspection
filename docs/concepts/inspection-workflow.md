@@ -1,0 +1,156 @@
+# OpenInspection Workflow
+
+## 1. Data Model — Template-Driven JSON Schema
+
+Inspection forms are not flat database tables. Two key tables:
+
+### `templates`
+
+Form structure as JSON in the `schema` column. Each tenant has one or more templates.
+
+```json
+{
+  "title": "Standard Home Inspection",
+  "sections": [
+    {
+      "id": "sec_exterior",
+      "title": "Exterior",
+      "items": [
+        {
+          "id": "item_roof",
+          "title": "Roof Coverings",
+          "type": "rich"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**9 item types**: `rich` (rating + 3 canned-comment tabs) plus `boolean`, `text`, `textarea`, `number`, `select`, `multi_select`, `date`, `photo_only`. Rating stored on `result.rating`, non-rich values on `result.value`.
+
+**Rating systems** are configurable per template (`rating_system_id` → `rating_systems` table). Each system defines levels with labels, colors, and severity buckets.
+
+Schema is validated by `server/lib/validations/template.schema.ts` (single canonical v2 format).
+
+`items` is a flat, ordered array even when the form it represents is nested: an item nests by naming another item in the same section as its `parentId`, and the array stays in pre-order. Before adding a field to an item, or writing anything that walks `section.items`, read [`template-item-hierarchy.md`](template-item-hierarchy.md) — both have a failure mode that prints less rather than throwing.
+
+### `inspection_results`
+
+Inspector's field responses as JSON in `data`. One row per inspection.
+
+```json
+{
+  "item_roof": { "rating": "Defect", "notes": "Missing 3 shingles", "media": ["uuid-photo"] },
+  "item_siding": { "rating": "Satisfactory", "notes": "" }
+}
+```
+
+Keys are item IDs from the template. Only items the inspector interacted with are stored (sparse).
+
+## 2. Field Collection
+
+Field collection happens in the inspection editor (`app/routes/inspection-edit.tsx`) — the single fill surface. Values are captured through the findings API into the collaborative results document (`app/lib/collab/results-binding.ts`), keyed by the composite `finding-key`. (The former standalone offline form-renderer route was retired; there is no separate mobile form surface.)
+
+**Field-level merge**: writes are last-write-wins per item key — only changed items need to be sent. The bulk write path is `POST /api/inspections/:id/results/batch` (there is no `PATCH /api/inspections/:id/results` route).
+
+## 3. Photo Upload Pipeline
+
+```
+POST /api/inspections/:id/upload
+Content-Type: multipart/form-data
+```
+
+Worker stores the file in R2 under `{tenantId}/{inspectionId}/{filename}`. Photos are read back through `GET /api/inspections/:id/photo?key=<r2-key>` — role-guarded, and scoped to the caller's tenant and inspection by the key prefix. The R2 key contains `/`, which is why it travels as a query parameter rather than a path segment. The public report viewer has its own token-scoped twin in `public-report.ts`.
+
+(There is no `GET /api/inspections/files/:key`. This page named one for a long time and no such route has ever existed.)
+
+Photos can have annotations and captions (`inspection_media_pool` table).
+
+## 4. Report Generation & PDF
+
+When an inspection is published:
+1. `inspections.status` is set to `'published'`
+2. A report version snapshot is created (`report_versions` table)
+3. Email sent to client with report link
+4. Report rendered as HTML with print stylesheet — users invoke `window.print()` for PDF
+
+Report viewer: `app/routes/public/report.tsx` (card-stack layout with section navigation).
+
+## 5. Canned Comments & AI
+
+**Canned comments**: 250+ pre-written inspection comments in `comments` table. 3-tab picker (Satisfactory / Monitor / Defect) on each `rich` item. Slash-trigger (`/`) opens snippet picker in the notes field.
+
+**AI assistance** (`server/api/ai.ts`):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/ai/comment-assist` | Professional rewrite of inspector's note |
+| `POST /api/ai/auto-summary` | Bullet-point summary of all defects |
+
+Both go through the one OpenAI-compatible adapter, at whatever endpoint and
+model the deployment or the company configured — there is no compiled-in vendor
+or model, and with `AI_MODEL` / `AI_BASE_URL` unset both fail closed with a 503.
+See [AI](../integrations/ai.md).
+
+## 6. Template Management
+
+| Endpoint | Role | Purpose |
+|---|---|---|
+| `GET /api/inspections/templates` | Any | List templates |
+| `POST /api/inspections/templates` | admin/owner | Create (name + schema JSON) |
+| `PUT /api/inspections/templates/:id` | admin/owner | Update, bumps version |
+| `DELETE /api/inspections/templates/:id` | admin/owner | Delete (409 if in use) |
+
+Bringing templates over from another product is not an endpoint on this router: it goes through the import wizard at `/settings/imports?intent=templates.create`, which asks which product the file came from, shows what the conversion produced before anything is written, and stages the run so it can be reviewed and repaired.
+
+**Marketplace**: a curated catalogue of first-party template packs, served by `GET /api/marketplace/templates` with one-click install. It is **not** community-contributed content, and the browsing UI is **SaaS-only** — in the default `standalone` deployment mode nothing populates the catalogue, so `/library/marketplace` returns 404 and the Library hub does not offer the tile. The API handlers remain mounted in both modes. To pick up starter content a release ships, use Settings → Data → **Install what's new** (`POST /api/admin/data/install-bundled-content`).
+
+## 7. Availability & Booking
+
+Inspectors manage weekly schedule + date overrides via `availability` / `availability_overrides` tables.
+
+Public booking: the page is a React Router route at `/book/:tenant`, and its data comes from `GET /api/public/book/:tenant` (all services and available slots). The system auto-assigns the first available qualified inspector. An optional inspector-choice dropdown is shown when the tenant enables "Allow clients to choose their inspector" (Settings → Online Booking → Booking policies). Customer submits via `POST /api/public/book` with Turnstile bot protection. Legacy per-inspector URLs `/book/:tenant/:slug` redirect 302 to the company page with that inspector pre-selected.
+
+## 8. Execution Flow
+
+```
+1. Admin/inspector creates inspection
+   → selects template, assigns inspector, enters address + client info
+
+2. Inspector opens inspection in the editor (/inspections/:id/edit)
+   → template JSON parsed into interactive checklist
+   → keyboard-driven: 1-5 ratings, / snippet picker, Cmd-K palette
+   → every edit lands in the Yjs results document, buffered in IndexedDB
+
+3. Inspector photographs defects
+   → POST /api/inspections/:id/upload → R2
+   → binary upload needs a connection; offline it is declined, not queued
+
+4. The Durable Object merges and persists
+   → edits sync over the collab WebSocket; the DO is the only writer of
+     inspection_results.data, and it also stores the binary CRDT state
+   → offline edits merge on reconnect with no lost operations
+
+5. Inspector publishes report
+   → report version snapshot created
+   → email sent to client with report link
+
+6. Client receives email → opens report
+   → signs agreement if required
+   → pays via Stripe if required
+   → full report accessible
+```
+
+## Key code paths
+
+| Path | Purpose |
+|---|---|
+| `server/api/inspections.ts` | Inspection + template CRUD |
+| `server/api/bookings.ts` | Public booking + availability |
+| `server/api/ai.ts` | AI comment assist + auto-summary |
+| `server/services/inspection.service.ts` | Core business logic |
+| `server/lib/validations/template.schema.ts` | Template v2 schema validation |
+| `app/routes/inspection-edit.tsx` | 3-pane inspection editor (single fill surface) |
+| `app/hooks/useInspection.ts` | Inspection state management |
+| `app/hooks/useCannedComments.ts` | Comment picker logic |

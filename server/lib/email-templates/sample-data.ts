@@ -1,0 +1,36 @@
+import type { EmailTemplateDescriptor } from './types';
+
+const EXAMPLES: Record<string, string> = {
+  address: '123 Main St', propertyAddress: '123 Main St',
+  reportUrl: 'https://app.example.com/r/abc123', signUrl: 'https://app.example.com/sign/abc123',
+  verifyUrl: 'https://app.example.com/verify/abc123', confirmUrl: 'https://app.example.com/confirm/abc123',
+  reviewUrl: 'https://app.example.com/review/abc123', dashboardUrl: 'https://app.example.com/inspections',
+  viewUrl: 'https://app.example.com/messages/abc123', acceptUrl: 'https://app.example.com/accept/abc123',
+  payUrl: 'https://app.example.com/invoice/abc123',
+  inviteLink: 'https://app.example.com/join/abc123', resetLink: 'https://app.example.com/reset/abc123',
+  loginUrl: 'https://app.example.com/auth?link=abc123', shareUrl: 'https://app.example.com/repair-request/abc123',
+  billingPortalUrl: 'https://app.example.com/billing',
+  // A real sentence, not a placeholder: this template's whole body is this one
+  // variable, so a preview showing `{noticeBody}` would show nothing at all.
+  noticeBody: 'Tenant destruction initiated on 2026-08-17 did not complete for the following stores: durable_objects. The database and cache portions completed. The remaining deletion is being remediated, and we will confirm when it is complete.',
+  importLink: 'https://app.example.com/settings/imports/abc123',
+  // A real sentence for the same reason `noticeBody` has one: the declined
+  // template's whole body is this variable, so a preview showing
+  // `{declineReason}` would show an admin nothing to judge their copy by.
+  declineReason: 'The export is a password-protected archive, and we have no way to open it without the password.',
+  expiresOn: 'September 17, 2026',
+  clientName: 'Jordan Smith', inspectorName: 'Alex Rivera', agentName: 'Pat Lee',
+  tenantName: 'Acme Inspections', workspaceName: 'Acme Inspections', agreementName: 'Inspection Agreement',
+  date: 'July 1, 2026', time: '3:00 PM', amount: '$350.00',
+  confirmationId: 'A1B2C3', signedAtUtc: '2026-07-01T15:00:00Z', ipAddress: '203.0.113.7',
+  fromName: 'Alex Rivera', snippet: 'Thanks — see you then!', envelopeId: 'ENV-12345',
+  message: 'Could you quote items 2 and 3?', reason: 'The seller asked to reschedule.',
+};
+
+/** Phase 3 — sample values for every declared variable, used by template preview. */
+export function sampleDataFor(descriptor: EmailTemplateDescriptor): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const v of descriptor.variables) out[v.name] = EXAMPLES[v.name] ?? `{${v.name}}`;
+  out.icsAttached = 'true'; // so booking-confirmation preview shows the ics hint
+  return out;
+}

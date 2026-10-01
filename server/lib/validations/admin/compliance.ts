@@ -1,0 +1,296 @@
+import { z } from '@hono/zod-openapi';
+import { createApiResponseSchema } from '../shared.schema';
+import { ROLES } from '../../auth/roles';
+import { TOGGLEABLE, type Capability } from '../../auth/capabilities';
+
+/**
+ * The sparse capability-toggle map, DERIVED from `TOGGLEABLE` — never hand-listed.
+ *
+ * A literal list is precisely how `viewCommunication` went missing (#77): the
+ * capability was declared, defaulted per role, enforced on
+ * `GET /api/inspections/:id/communication`, returned by `/me` and by the team
+ * endpoint, and rendered as a checkbox in BOTH drawers — while these request
+ * schemas silently stripped it, so ticking that box did nothing and no one in
+ * any workspace could grant or withdraw it. A sixth capability would have gone
+ * the same way. Each call returns a fresh `z.object` so the three consumers do
+ * not share one OpenAPI-decorated instance.
+ *
+ * Parity with `TOGGLEABLE` is asserted by
+ * `tests/unit/platform/capability-schema-parity.spec.ts`.
+ */
+function capabilityToggleMap() {
+    return z.object(
+        Object.fromEntries(TOGGLEABLE.map((cap) => [cap, z.boolean().optional()])) as {
+            [K in Capability]: z.ZodOptional<z.ZodBoolean>;
+        },
+    );
+}
+
+/**
+ * One sentence per capability, published in the OpenAPI document.
+ *
+ * `Record<Capability, string>`, so adding a member to `TOGGLEABLE` does not
+ * compile until its sentence exists — the same forcing function `CAP_LABELS`
+ * applies on the UI side. The five original sentences are moved here VERBATIM
+ * from the inline `z.object` in `server/api/auth/profile.ts`: they are the
+ * published contract, so a paraphrase would be a silent contract change.
+ */
+export const CAPABILITY_DESCRIPTIONS: Record<Capability, string> = {
+    publish:           'May publish and unpublish reports.',
+    scheduleOthers:    'May schedule inspections for other inspectors.',
+    financial:         'May see money on inspections, services and invoices.',
+    manageContacts:    'May create, edit and archive contacts and role profiles.',
+    viewCommunication: 'May read the per-inspection Outbox, including recipient addresses.',
+    templateCreate:    'May create new inspection templates.',
+    templateEdit:      'May change an existing inspection template, including through a template migration.',
+    templateDelete:    'May delete an inspection template, directly or as part of a migration.',
+    templateImport:    'May bring a template in from a Spectora export or the content marketplace.',
+};
+
+/**
+ * The RESOLVED capability set, as `GET /api/auth/me` returns it: every key
+ * present, every key required.
+ *
+ * ⚠️ Deliberately NOT the same shape as `capabilityToggleMap()` above. That one
+ * is the SPARSE override map (all keys optional — only what differs from the
+ * role template travels); this one is the complete answer. Collapsing them
+ * would make the request schema accept a partial set where the response
+ * promises a full one, and would let a capability go missing from /me as
+ * merely "absent" rather than "false".
+ *
+ * Derived from `TOGGLEABLE` because `/me` used to hand-list five keys inline —
+ * the exact shape of #77, one layer over. Parity is asserted by
+ * `tests/unit/platform/capability-schema-parity.spec.ts`.
+ */
+export function resolvedCapabilitySchema() {
+    return z.object(
+        Object.fromEntries(
+            TOGGLEABLE.map((cap) => [cap, z.boolean().describe(CAPABILITY_DESCRIPTIONS[cap])]),
+        ) as { [K in Capability]: z.ZodBoolean },
+    );
+}
+
+/**
+ * Validation schema for inviting a new team member.
+ */
+export const InviteMemberSchema = z.object({
+    email: z.string().email('Invalid email address').openapi({ example: 'new-user@example.com' }).describe('TODO describe email field for the OpenInspection MCP integration'),
+    role: z.enum(ROLES)
+        .default('inspector').openapi({ example: 'inspector' }).describe('TODO describe role field for the OpenInspection MCP integration'),
+    // Role permission-template overrides (2026-06-13). Optional sparse map of
+    // every toggleable capability. Only differing-from-template keys are sent;
+    // TeamService stores the diff (or null when nothing differs) and it is
+    // replayed onto the new users row at accept time.
+    permissionOverrides: capabilityToggleMap().optional().openapi({ example: { publish: false } }).describe('Sparse capability override map for the invited member'),
+    /**
+     * Whether to email the invitation. DEFAULTS TO TRUE, so a caller that does
+     * not mention it behaves exactly as before.
+     *
+     * `false` creates the invite and sends nothing. That is only usable because
+     * the response carries `inviteLink` and the pending row exposes the same
+     * link to copy — an invitation nobody can reach is not a quieter invitation,
+     * it is a broken one.
+     */
+    notify: z.boolean().default(true).openapi({ example: true }).describe('Email the invitation. False creates it silently; deliver the returned inviteLink yourself.'),
+}).openapi('InviteMember');
+
+/**
+ * Validation schema for editing an existing team member (IA-101).
+ *
+ * Both fields are optional so the caller can move a role without restating
+ * every capability, or flip a capability without touching the role. Sending
+ * neither is a no-op rather than an error — a form that submits unchanged is
+ * not a client mistake.
+ *
+ * `permissionOverrides` is REPLACE, not merge: the drawer always submits the
+ * full toggle set, and a merge would make un-ticking a box unexpressible.
+ */
+export const UpdateMemberSchema = z.object({
+    role: z.enum(ROLES).optional().openapi({ example: 'manager' }).describe('New role for this member. Omit to leave unchanged.'),
+    permissionOverrides: capabilityToggleMap().nullable().optional().openapi({ example: { financial: true } }).describe('Full capability map to store as the diff against the role template. Null clears all overrides.'),
+}).openapi('UpdateMember');
+
+/**
+ * Validation schema for the GDPA data erasure request.
+ */
+export const DataErasureSchema = z.object({
+    clientEmail: z.string().email('Invalid email address').openapi({ example: 'client-to-delete@example.com' }).describe('TODO describe clientEmail field for the OpenInspection MCP integration'),
+}).openapi('DataErasure');
+
+/**
+ * Response Schemas
+ */
+export const AdminExportResponseSchema = createApiResponseSchema(z.object({
+    exportedAt: z.string().openapi({ example: '2024-04-09T10:00:00Z' }).describe('TODO describe exportedAt field for the OpenInspection MCP integration'),
+    tenantId: z.string().trim().min(1).describe('TODO describe tenantId field for the OpenInspection MCP integration'),
+    inspections: z.array(z.record(z.string(), z.any())).describe('TODO describe inspections field for the OpenInspection MCP integration'),
+    templates: z.array(z.record(z.string(), z.any())).describe('TODO describe templates field for the OpenInspection MCP integration'),
+    agreements: z.array(z.record(z.string(), z.any())).describe('TODO describe agreements field for the OpenInspection MCP integration'),
+    inspectionResults: z.array(z.record(z.string(), z.any())).describe('TODO describe inspectionResults field for the OpenInspection MCP integration'),
+})).openapi('AdminExportResponse');
+
+export const MemberListResponseSchema = createApiResponseSchema(z.array(z.object({
+    id: z.string().trim().min(1).describe('TODO describe id field for the OpenInspection MCP integration'),
+    email: z.string().describe('TODO describe email field for the OpenInspection MCP integration'),
+    role: z.string().describe('TODO describe role field for the OpenInspection MCP integration'),
+    createdAt: z.string().describe('TODO describe createdAt field for the OpenInspection MCP integration'),
+    calendarConnected: z.boolean().describe('Whether this member has a connected Google calendar'),
+    calendarLastSyncAt: z.number().nullable().describe('Epoch ms of the last successful Google busy pull; null when never synced'),
+}))).openapi('MemberListResponse');
+
+export const AuditLogResponseSchema = createApiResponseSchema(z.object({
+    items: z.array(z.object({
+        id: z.string().trim().min(1).describe('TODO describe id field for the OpenInspection MCP integration'),
+        action: z.string().describe('TODO describe action field for the OpenInspection MCP integration'),
+        entityType: z.string().describe('TODO describe entityType field for the OpenInspection MCP integration'),
+        metadata: z.any().nullable().describe('TODO describe metadata field for the OpenInspection MCP integration'),
+        ipAddress: z.string().nullable().describe('TODO describe ipAddress field for the OpenInspection MCP integration'),
+        createdAt: z.string().describe('TODO describe createdAt field for the OpenInspection MCP integration'),
+        userId: z.string().trim().min(1).nullable().describe('TODO describe userId field for the OpenInspection MCP integration'),
+    })).describe('TODO describe items field for the OpenInspection MCP integration'),
+    nextCursor: z.string().nullable().describe('TODO describe nextCursor field for the OpenInspection MCP integration'),
+})).openapi('AuditLogResponse');
+
+export const InviteResponseSchema = createApiResponseSchema(z.object({
+    inviteLink: z.string().describe('TODO describe inviteLink field for the OpenInspection MCP integration'),
+    expiresAt: z.string().describe('TODO describe expiresAt field for the OpenInspection MCP integration'),
+})).openapi('InviteResponse');
+
+/**
+ * What a delivered conversion reports back.
+ *
+ * Per-family counts rather than one number, because a converted file that
+ * produced no members when it was supposed to is a delivery worth catching at
+ * the moment it is made. Nothing here counts rows in real tables — this route
+ * writes none.
+ */
+export const ImportResponseSchema = createApiResponseSchema(z.object({
+    batchId: z.string().describe('Id of the import run this bundle was delivered into'),
+    rows: z.number().describe('How many entries the run now carries'),
+    byEntity: z.object({
+        template: z.number().describe('Templates prepared by this delivery'),
+        contact: z.number().describe('Contacts prepared by this delivery'),
+        member: z.number().describe('Team invitations prepared by this delivery'),
+    }).describe('Entries prepared, split by kind'),
+})).openapi('ImportResponse');
+
+export const EraseDataResponseSchema = createApiResponseSchema(z.object({
+    message: z.string().describe('Human-readable confirmation message.'),
+    // Legacy additive fields (preserved for existing callers).
+    templates: z.number().optional().describe('Legacy field — number of template rows affected.'),
+    inspections: z.number().optional().describe('Legacy field — number of inspection rows matched.'),
+    results: z.number().optional().describe('Legacy field — total result rows affected.'),
+    matched: z.number().optional().describe('Number of inspections the subject appeared on.'),
+    deletedAgreements: z.number().optional().describe('Legacy additive field — number of matched inspections (mirrors matched).'),
+    // Orchestrator summary fields (Track I-a).
+    status: z.enum(['completed', 'partially_completed', 'refused', 'held']).optional()
+        .describe('Overall erasure outcome. partially_completed means at least one step threw; the rest still landed. held means an active legal hold covered the workspace, so the request was recorded and nothing was erased — distinct from refused, which means the run could not be carried out at all.'),
+    preservedCount: z.number().int().optional()
+        .describe('Scopes kept because a legal hold covers them. Separate from retainedCount, which counts rows kept under an Art. 17(3) exemption — a preservation order and an evidence exemption are different grounds and a reader must be able to tell them apart.'),
+    logId: z.string().optional().describe('UUID of the append-only erasure_log decision row (Art. 5(2)/30).'),
+    anonymizedCount: z.number().int().optional()
+        .describe('Total rows anonymized (PII sentinel-cleared, evidence retained under Art. 17(3) exemption).'),
+    deletedCount: z.number().int().optional()
+        .describe('Total rows deleted (draft envelopes + signer rows + contact rows).'),
+    retainedCount: z.number().int().optional()
+        .describe('Total rows retained as anonymized evidence (signer rows + envelope rows, post-anonymization).'),
+    decisions: z.array(z.object({
+        table: z.string().describe('DB table the decision applies to.'),
+        // BOTH values, and the older one is not deprecation debt.
+        //
+        // `erase_in_place` replaced `anonymize` in the source vocabulary on
+        // 2026-08-17 (the old label invited a reader
+        // to conclude we had produced legally deidentified data). This schema is
+        // not source: it describes a RESPONSE and it validates the same array
+        // that is persisted in `erasure_log.decisions_json` and shipped to
+        // portal as `reply.subject.erased.v1`.
+        //
+        // Narrowing it to the new value alone would do two things a rename must
+        // not: break a versioned cross-repo event whose consumer validates the
+        // enum, and make every row written before the rename unreadable against
+        // its own schema. An accountability record that cannot be parsed is
+        // worse than one with an unfashionable word in it.
+        //
+        // New writes emit `erase_in_place`. Old rows keep what they said.
+        action: z.enum(['delete', 'null', 'anonymize', 'erase_in_place', 'preserve'])
+            .describe('Action taken on this table. `erase_in_place` on new rows; `anonymize` on rows written before 2026-08-17 and on the versioned portal reply event. `preserve` means nothing was done to it because a legal hold covers it.'),
+        count: z.number().int().describe('Rows affected.'),
+        legalBasis: z.enum(['art_17_3_b', 'art_17_3_e']).optional()
+            .describe('GDPR Art. 17(3) exemption invoked, when retaining evidence.'),
+        retentionExpiry: z.number().optional()
+            .describe('Unix-MS integer: signedAt + retentionYears. Present on erase_in_place steps (`anonymize` on rows predating the rename).'),
+        error: z.string().optional()
+            .describe('Set when this step threw (fail-closed accountability).'),
+        holdReason: z.string().optional()
+            .describe('Set on `preserve`: why this was kept, in the words the data subject is given. Never set on the other actions.'),
+    })).optional().describe('Per-table erasure decisions recorded in the log row.'),
+})).openapi('EraseDataResponse');
+
+export const TeamMembersResponseSchema = createApiResponseSchema(z.object({
+    members: z.array(z.object({
+        id: z.string().trim().min(1).describe('TODO describe id field for the OpenInspection MCP integration'),
+        name: z.string().nullable().describe("The member's display name; null when never set (renders as 'Unnamed')."),
+        email: z.string().describe('TODO describe email field for the OpenInspection MCP integration'),
+        role: z.string().describe('TODO describe role field for the OpenInspection MCP integration'),
+        // Named bits, not `z.record(z.string(), z.boolean())`. The column holds a
+        // SPARSE map (`PermissionOverrides` = `Partial<CapabilitySet>`), so a
+        // record-of-required-booleans described a payload the server never sends
+        // and left the toggle names undiscoverable in the OpenAPI document. The
+        // names come from TOGGLEABLE, so read and write describe one set.
+        permissionOverrides: capabilityToggleMap().nullable().optional()
+            .describe("Capability toggles that differ from this member's role template, or null when they match it exactly."),
+        // The FLAG only. Never the secret and never the recovery-code hashes:
+        // this list is readable by every inspector, and the page needs exactly
+        // one bit — whether there is a second factor for an owner to clear.
+        totpEnabled: z.boolean().describe('Whether this member has two-factor authentication enrolled. An owner can clear it from the team page when they have lost both their authenticator and their recovery codes.'),
+        createdAt: z.string().describe('TODO describe createdAt field for the OpenInspection MCP integration'),
+    })).describe('TODO describe members field for the OpenInspection MCP integration'),
+    invites: z.array(z.object({
+        id: z.string().describe('TODO describe id field for the OpenInspection MCP integration'),
+        email: z.string().describe('TODO describe email field for the OpenInspection MCP integration'),
+        role: z.string().describe('TODO describe role field for the OpenInspection MCP integration'),
+        status: z.string().describe('TODO describe status field for the OpenInspection MCP integration'),
+        expiresAt: z.string().describe('TODO describe expiresAt field for the OpenInspection MCP integration'),
+        // The SAME string the invitation email carries, built from the same
+        // deployment base URL. It is here rather than composed by the caller
+        // because a client that pastes its own origin in front of the token
+        // produces a second, different URL for one invitation — and on any
+        // deployment reached at an address other than its configured base
+        // (a proxy, a preview host, a custom domain) that second URL is the
+        // wrong one. `id` above already IS the token, so this exposes nothing
+        // the response did not already carry.
+        inviteLink: z.string().describe('Absolute accept URL for this invitation — identical to the one emailed.'),
+    })).describe('TODO describe invites field for the OpenInspection MCP integration'),
+})).openapi('TeamMembersResponse');
+
+/**
+ * Saying, out loud, that a file could not be converted.
+ *
+ * A reason is required and has a floor on its length, because the reason is the
+ * entire product of this call: the run stops either way, and what distinguishes
+ * declining from letting it expire is that somebody wrote down why.
+ */
+export const DeclineImportRequestSchema = z.object({
+    batchId: z.string().min(1).describe('Id of the waiting import run being handed back unconverted'),
+    reason: z.string().min(10).max(500).describe('Why the file could not be converted, in a sentence the operator can act on'),
+}).openapi('DeclineImportRequest');
+
+export const DeclinedImportResponseSchema = createApiResponseSchema(z.object({
+    batchId: z.string().describe('Id of the run that was handed back'),
+    status: z.string().describe('Lifecycle state recording that we stopped, rather than that the operator did'),
+})).openapi('DeclinedImportResponse');
+
+/**
+ * The two-working-day acknowledgement, given an action of its own.
+ *
+ * Without one that deadline is a sentence in a runbook that only a person can
+ * keep, and "nothing has happened yet" looks exactly like "somebody is on it".
+ */
+export const AcknowledgeImportRequestSchema = z.object({
+    batchId: z.string().min(1).describe('Id of the waiting import run being acknowledged'),
+}).openapi('AcknowledgeImportRequest');
+
+export const AcknowledgedImportResponseSchema = createApiResponseSchema(z.object({
+    batchId: z.string().describe('Id of the run that was acknowledged'),
+    notified: z.number().describe('How many people were emailed'),
+})).openapi('AcknowledgedImportResponse');

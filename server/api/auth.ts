@@ -1,0 +1,613 @@
+import { createRoute, z } from '@hono/zod-openapi';
+import { createApiRouter } from '../lib/openapi-router';
+import { and, eq, isNull, sql } from 'drizzle-orm';
+import { users } from '../lib/db/schema';
+import { setCookie } from 'hono/cookie';
+import { Errors } from '../lib/errors';
+import { logger } from '../lib/logger';
+import { getDeploymentProfile } from '../lib/deployment-profile';
+import { getBaseUrl } from '../lib/url';
+import { checkRateLimit } from '../lib/rate-limit';
+import { requireCsrfToken } from '../lib/middleware/csrf';
+import { signJwt } from '../lib/jwt-keyring';
+import { writeAuditLog, auditFromContext } from '../lib/audit';
+import {
+    LoginSchema,
+    ChangePasswordSchema,
+    JoinTeamSchema,
+    ForgotPasswordSchema,
+    ResetPasswordSchema,
+    AuthResponseSchema,
+    SetupSchema,
+} from '../lib/validations/auth.schema';
+import { createApiResponseSchema, SuccessResponseSchema } from '../lib/validations/shared.schema';
+import { withMcpMetadata } from '../lib/route-metadata-standards';
+import { authCookieOptions, AUTH_COOKIE_NAME } from '../lib/auth-helpers';
+import { safeReturnTo } from '../lib/mcp/safe-return-to';
+import { findGlobalAgentById } from '../services/agent/account';
+import totpRoutes from './auth/totp';
+import profileRoutes from './auth/profile';
+import { getDrizzle } from '../lib/route-helpers';
+import { platformActorClaims } from '../lib/platform-actor-claims';
+
+// --- Routes ---
+
+const loginRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/login',
+    operationId: 'loginWithPassword',
+    summary: 'Log in with email and password',
+    description: 'Validates email + password credentials and sets a JWT session cookie. Returns a short-lived 2FA challenge token instead of a session when the account has TOTP enabled.',
+    tags: ['auth', 'public'],
+    middleware: [requireCsrfToken],
+    request: {
+        body: {
+            content: {
+                'application/json': { schema: LoginSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            }
+        }
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': { schema: AuthResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            },
+            description: 'Login successful'
+        },
+        400: { description: 'Invalid input' },
+        401: { description: 'Unauthorized' }
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+const changePasswordRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/change-password',
+    operationId: 'changeMyPassword',
+    summary: 'Change current user password',
+    description: 'Updates the authenticated user\'s password after verifying the current one. Invalidates all outstanding session JWTs for this user on success.',
+    tags: ['auth'],
+    request: {
+        body: {
+            content: {
+                'application/json': { schema: ChangePasswordSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            }
+        }
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': { schema: SuccessResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            },
+            description: 'Password updated'
+        },
+        401: { description: 'Unauthorized' }
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+const joinTeamRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/join',
+    operationId: 'joinTeamFromInvite',
+    summary: 'Join a team via invitation token',
+    description: 'Finalizes a team invitation: validates the invite token, sets the new user\'s password, creates the account, and issues a session cookie.',
+    tags: ['auth', 'public'],
+    request: {
+        body: {
+            content: {
+                'application/json': { schema: JoinTeamSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            }
+        }
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': { schema: AuthResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            },
+            description: 'Team joined successfully'
+        }
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+/**
+ * GET /sso?code=<uuid>
+ *
+ * SSO consume endpoint — the receiving half of the portal-issued handoff token
+ * minted at POST /api/platform/sso-handoff. Reads `sso:<code>` from KV
+ * (single-use, short TTL), looks up the user, issues a workspace-scoped session
+ * cookie, and redirects into the inspector dashboard. Public route (no auth
+ * middleware): the code IS the credential, and it is deleted from KV on success
+ * so a leaked URL can't be replayed.
+ *
+ * This is what makes multi-workspace switching frictionless: the user clicks a
+ * workspace card → portal calls /api/platform/sso-handoff for a code → portal
+ * 302s the browser here → core sets the right cookie → the user lands on the
+ * right tenant's dashboard.
+ *
+ * Spec 3 Task 5b — the KV payload's `tenantId` is OPTIONAL. When ABSENT (an
+ * agent handoff: portal's Google-OIDC agent-mode callback hands off just an
+ * email), this mints a tenant-less agent JWT and redirects to /agent-dashboard.
+ */
+const ssoConsumeRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/sso',
+    operationId: 'ssoConsume',
+    summary: 'Consume a portal-issued SSO handoff code',
+    description: 'Reads sso:<code> from KV, issues a session cookie, redirects to /inspections.',
+    tags: ['auth', 'public'],
+    request: {
+        query: z.object({
+            code: z.string().min(8).describe('One-time SSO handoff code minted by the portal at POST /api/platform/sso-handoff. Single-use, expires after 60 seconds, deleted from KV on successful consume.'),
+            return_to: z.string().optional().describe('Same-origin path to redirect to after the SSO handoff completes (e.g. /oauth/authorize?...); rejected if not a single-slash path — open-redirect guard.'),
+        }),
+    },
+    responses: {
+        302: { description: 'Redirect to /inspections on success or /login on failure' },
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+const forgotPasswordRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/forgot-password',
+    operationId: 'requestPasswordReset',
+    summary: 'Request a password reset email',
+    description: 'Triggers a password reset email if the account exists. Always returns 200 even for unknown emails to avoid account enumeration.',
+    tags: ['auth', 'public'],
+    request: {
+        body: {
+            content: {
+                'application/json': { schema: ForgotPasswordSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            }
+        }
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': { schema: SuccessResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            },
+            description: 'Reset email sent (if user exists)'
+        },
+        410: {
+            content: {
+                'application/json': { schema: z.object({ success: z.literal(false), error: z.object({ code: z.string(), message: z.string() }) }) }
+            },
+            description: 'Password reset disabled — SaaS tenants must use the workspace portal'
+        }
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+const resetPasswordRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/reset-password',
+    operationId: 'resetPasswordWithToken',
+    summary: 'Reset password using a token',
+    description: 'Completes a password reset flow: validates the one-time reset token and updates the account password to the new value supplied.',
+    tags: ['auth', 'public'],
+    request: {
+        body: {
+            content: {
+                'application/json': { schema: ResetPasswordSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            }
+        }
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': { schema: SuccessResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            },
+            description: 'Password reset successful'
+        }
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+const setupRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/setup',
+    operationId: 'initializeFirstTenant',
+    summary: 'Initialize first tenant and admin',
+    description: 'Creates the initial tenant and the first admin user account. Only callable when no tenant-scoped users yet exist (system is uninitialized).',
+    tags: ['auth', 'public'],
+    request: {
+        body: {
+            content: {
+                'application/json': { schema: SetupSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            }
+        }
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': { schema: AuthResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') }
+            },
+            description: 'Success'
+        },
+        403: { description: 'Forbidden: System already initialized' }
+    }
+}, { scopes: [], tier: 'excluded' }));
+
+// C-10 ③-B — GET /api/auth/invite-info?token= — preview the invited email +
+// workspace name on the team-invite accept page (`/join`) before the form.
+const inviteInfoRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/invite-info',
+    tags: ['auth', 'public'],
+    summary: 'Resolve a team-invite token for the accept page',
+    request: { query: z.object({ token: z.string().describe('Team-invite token (the invite id) from the URL.') }) },
+    responses: {
+        200: { content: { 'application/json': { schema: createApiResponseSchema(z.object({ email: z.string(), workspaceName: z.string() })) } }, description: 'Invite preview' },
+        404: { description: 'Invite not found, expired, or already used' },
+    },
+    operationId: 'getInviteInfo',
+    description: 'Public, no-login resolution of a team-invite token into the invited email + workspace name for the /join accept page. Returns 404 for unknown/expired/used invites so the page renders its recovery state.',
+}, { scopes: [], tier: 'excluded' }));
+
+// C-10 ③-B — GET /api/auth/setup-status — whether first-run setup is done, so
+// the `/setup` page can redirect to /login when the instance already has users.
+const setupStatusRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/setup-status',
+    tags: ['auth', 'public'],
+    summary: 'Report whether first-run setup is complete',
+    responses: {
+        200: { content: { 'application/json': { schema: createApiResponseSchema(z.object({ isSetUp: z.boolean() })) } }, description: 'Setup status' },
+    },
+    operationId: 'getSetupStatus',
+    description: 'Public, no-login check of whether the instance has completed first-run setup (any tenant-scoped user exists). Drives the /setup page redirect guard.',
+}, { scopes: [], tier: 'excluded' }));
+
+// `GET /sso` is its own router so server/index.ts can mount it at the ROOT without
+// dragging the rest of the auth surface there: the portal mints an absolute
+// `https://app.{domain}/sso?code=<code>` and the browser navigates straight to it.
+export const ssoRootRoutes = createApiRouter().openapi(ssoConsumeRoute, async (c) => {
+    const { code, return_to } = c.req.valid('query');
+    if (!c.env.TENANT_CACHE) return c.redirect('/login?sso=unavailable', 302);
+
+    const raw = await c.env.TENANT_CACHE.get(`sso:${code}`);
+    if (!raw) return c.redirect('/login?sso=expired', 302);
+    // Single-use: delete BEFORE issuing the cookie so a parallel replay
+    // can't piggyback on a still-resolving call.
+    await c.env.TENANT_CACHE.delete(`sso:${code}`);
+
+    let parsed: { userId?: string; tenantId?: string; actor?: { platformAdminId?: string; email?: string } | null };
+    try { parsed = JSON.parse(raw); } catch { return c.redirect('/login?sso=invalid', 302); }
+    if (!parsed.userId) return c.redirect('/login?sso=invalid', 302);
+
+    if (!parsed.tenantId) {
+        // Agent handoff (Spec 3 Task 5b) — tenant-null payload minted by
+        // the agent branch of POST /api/platform/sso-handoff.
+        // Re-verify the account AT REDEEM TIME (mirrors
+        // redeemMagicLogin/findGlobalAgentById — server/services/agent/
+        // magic-login.service.ts) rather than trusting the issue-time
+        // snapshot: the account may have been deleted or demoted from
+        // 'agent' during the code's TTL window.
+        const agent = await findGlobalAgentById(c.env.DB, parsed.userId);
+        if (!agent) return c.redirect('/login?sso=invalid', 302);
+
+        const keyring = await c.var.keyringPromise!;
+        const now = Math.floor(Date.now() / 1000);
+        // Agent JWT claim shape mirrors server/api/agent/login.ts and
+        // server/api/agent/magic-login.ts EXACTLY — no
+        // tenantId/custom:tenantId. Agents are global users.
+        const token = await signJwt({
+            sub: agent.id,
+            role: 'agent',
+            'custom:userRole': 'agent',
+            email: agent.email,
+            iat: now,
+            exp: now + 60 * 60 * 24,
+        }, keyring);
+
+        setCookie(c, AUTH_COOKIE_NAME, token, authCookieOptions());
+        // Global agent identity — tenant-less by design, so this does NOT
+        // go through the tenant-scoped audit_logs table (auditLogs.tenantId
+        // is a NOT NULL FK to tenants.id). Structured logging only, mirrors
+        // the magic-login redeem handler.
+        logger.info('sso_consume.agent_session_minted', { userId: agent.id });
+        return c.redirect('/agent-dashboard', 302);
+    }
+
+    const d = getDrizzle(c);
+    // Excludes soft-deleted (removed member) rows — a portal handoff must
+    // not mint a session cookie for a member who has been removed from
+    // this workspace.
+    const user = await d.select().from(users)
+        .where(and(eq(users.id, parsed.userId), eq(users.tenantId, parsed.tenantId), isNull(users.deletedAt)))
+        .get();
+    if (!user) return c.redirect('/login?sso=invalid', 302);
+
+    const keyring = await c.var.keyringPromise!;
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signJwt({
+        sub: user.id,
+        'custom:tenantId': user.tenantId,
+        'custom:userRole': user.role,
+        role: user.role,
+        iat: now,
+        exp: now + 60 * 60 * 24,
+        // Marker so audit logs / downstream middleware can detect that
+        // this session was minted via portal handoff rather than direct
+        // password login.
+        'custom:sso': true,
+        ...platformActorClaims(parsed.actor), // a support session, when it is one
+    }, keyring);
+
+    setCookie(c, AUTH_COOKIE_NAME, token, authCookieOptions());
+    return c.redirect(safeReturnTo(return_to, '/inspections'), 302);
+});
+
+const coreAuthRoutes = createApiRouter()
+    .openapi(loginRoute, async (c) => {
+        // SaaS deploys disable the local password form (login via portal) —
+        // see the matching guard on GET /login. Returning Gone (410) + a
+        // redirect hint lets stale clients (cached SPA build, scripted callers)
+        // bail out cleanly instead of attempting credential validation against
+        // a per-(tenant_id,email) row they can't disambiguate.
+        const profile = c.var.profile;
+        if (profile?.mode === 'saas') {
+            const portal = c.var.profile.loginRedirectBase;
+            return c.json({
+                success: false,
+                error: {
+                    code: 'LOGIN_MOVED_TO_PORTAL',
+                    message: 'Sign in via the workspace portal.',
+                    ...(portal ? { details: { redirect: `${portal}/login` } } : {}),
+                },
+            }, 410);
+        }
+
+        await checkRateLimit(c, 'login');
+
+        const body = c.req.valid('json');
+        // The profile owns this, fallback included — `getDeploymentProfile`
+        // resolves `SINGLE_TENANT_ID ?? FIXED_TENANT_FALLBACK`. Writing the
+        // literal here was a second copy of a decision, and the all-zero UUID
+        // appeared three times in this repo for two answers.
+        const tenantId = getDeploymentProfile(c.env).fixedTenantId!;
+        const user = await c.var.services.auth.validateCredentials(body.email, body.password, tenantId);
+
+        const keyring = await c.var.keyringPromise!;
+        const now = Math.floor(Date.now() / 1000);
+
+        // Spec 4A — If the user has 2FA enabled, return a short-lived challenge token instead of
+        // the session JWT. The client must POST it back along with a TOTP code to /api/auth/login/2fa
+        // before any session is granted.
+        if (user.totpEnabled) {
+            const challengeToken = await signJwt({
+                sub: user.id,
+                t: 'challenge',
+                iat: now,
+                exp: now + 60 * 5,
+            }, keyring);
+            // Intentionally NOT a Set-Cookie — challenge tokens travel JSON-only so a stolen
+            // session cookie alone never permits 2FA bypass.
+            return c.json({
+                success: true,
+                data: { requires2fa: true, challengeToken }
+            }, 200);
+        }
+
+        // Email is intentionally NOT in the payload — JWTs are signed but not encrypted, and the
+        // token travels through logs / intermediaries. PII belongs in the DB, not in the bearer.
+        const token = await signJwt({
+            sub: user.id,
+            'custom:tenantId': user.tenantId,
+            'custom:userRole': user.role,
+            role: user.role,
+            iat: now,
+            exp: now + 60 * 60 * 24,
+        }, keyring);
+
+        setCookie(c, AUTH_COOKIE_NAME, token, authCookieOptions());
+
+        // Token Relay BFF: when the React Router v7 SSR frontend (server-to-server) calls
+        // this endpoint, Workers fetch() may strip Set-Cookie. The BFF signals
+        // itself via X-Token-Relay header; we return the JWT in the body so the
+        // BFF can store it in its own session cookie. The browser never sees this
+        // header because the BFF is the only caller — browsers use the HttpOnly
+        // cookie path exclusively.
+        const isBff = c.req.header('x-token-relay') === '1';
+        return c.json({
+            success: true,
+            data: { redirect: '/inspections', ...(isBff ? { token } : {}) }
+        }, 200);
+    })
+    .openapi(changePasswordRoute, async (c) => {
+        // The global JWT middleware has already verified the token and populated c.var.user.
+        const user = c.get('user');
+        if (!user?.sub) throw Errors.Unauthorized();
+
+        const body = c.req.valid('json');
+        await c.var.services.auth.updatePassword(user.sub, body.currentPassword, body.newPassword);
+
+        // The service also emits a `user.password_changed` outbox event. That
+        // is replication and it expires after two cycles; this row is the
+        // durable half, and it is the half a later reader asks for.
+        //
+        // Deliberately no metadata: nothing about a password belongs in a
+        // column whose redaction is documented as knowingly incomplete.
+        auditFromContext(c, 'user.password_change', 'user', {
+            entityId: user.sub,
+        });
+
+        return c.json({ success: true }, 200);
+    })
+    .openapi(joinTeamRoute, async (c) => {
+        const body = c.req.valid('json');
+        // The seat decision belongs to the deployment, not to the service:
+        // standalone has a `max_users` default and no billing behind it.
+        const user = await c.var.services.auth.joinTeam(body.token, body.password, {
+            name: body.name,
+            seatQuota: {
+                enforce: c.var.profile.hasSeatQuota,
+                billingPortalUrl: c.var.profile.billingPortalUrl,
+            },
+        });
+
+        const keyring = await c.var.keyringPromise!;
+        const now = Math.floor(Date.now() / 1000);
+        const token = await signJwt({
+            sub: user.id,
+            'custom:tenantId': user.tenantId,
+            'custom:userRole': user.role,
+            role: user.role,
+            iat: now,
+            exp: now + 60 * 60 * 24,
+        }, keyring);
+
+        setCookie(c, AUTH_COOKIE_NAME, token, authCookieOptions());
+
+        // An invite being ACCEPTED is the other half of the invite being sent,
+        // and the pair is what answers "how did this person get in".
+        //
+        // `writeAuditLog` and not `auditFromContext`: the JWT middleware returns
+        // early for `/join`, so there is no tenant on the context here. The
+        // tenant is the one the invite belongs to, which is what `joinTeam`
+        // just returned.
+        writeAuditLog({
+            db: c.env.DB,
+            tenantId: user.tenantId,
+            userId: user.id,
+            action: 'user.join',
+            entityType: 'user',
+            entityId: user.id,
+            metadata: { role: user.role },
+            ipAddress: c.req.header('CF-Connecting-IP'),
+        });
+
+        return c.json({
+            success: true,
+            data: { redirect: '/inspections' }
+        }, 200);
+    })
+    .route('/', ssoRootRoutes) // what keeps /api/auth/sso answering; index.ts mounts the same router at the root
+    .openapi(forgotPasswordRoute, async (c) => {
+        // SaaS deploys disable the local password form (password reset via
+        // portal) — see the matching guard on POST /api/auth/login. Password
+        // resets must go through the workspace portal which owns the identity
+        // layer for SaaS tenants.
+        const profile = c.var.profile;
+        if (profile?.mode === 'saas') {
+            return c.json({
+                success: false as const,
+                error: {
+                    code: 'PASSWORD_RESET_MOVED_TO_PORTAL',
+                    message: 'Use the workspace portal to reset your password.',
+                },
+            }, 410);
+        }
+
+        await checkRateLimit(c, 'forgot');
+
+        const body = c.req.valid('json');
+        const resetToken = await c.var.services.auth.createPasswordResetToken(
+            body.email,
+            getDeploymentProfile(c.env).fixedTenantId!,
+        );
+
+        if (!resetToken) return c.json({ success: true }, 200);
+
+        const baseUrl = getBaseUrl(c);
+        const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
+
+        await c.var.services.email.sendPasswordReset(body.email, resetLink)
+            .catch(() => { /* email delivery is best-effort */ });
+
+        return c.json({ success: true }, 200);
+    })
+    .openapi(resetPasswordRoute, async (c) => {
+        const body = c.req.valid('json');
+        await c.var.services.auth.resetPassword(body.token, body.newPassword);
+        return c.json({ success: true }, 200);
+    })
+    .openapi(setupRoute, async (c) => {
+        // 1. Safety Check: Only allow if no tenant-scoped users exist.
+        // Agent Accounts A1 — global agents (tenant_id IS NULL) are unrelated to
+        // first-time tenant initialization, so they must not block setup.
+        const db = getDrizzle(c);
+        const existingTenantUser = await db.select().from(users).where(sql`${users.tenantId} IS NOT NULL`).limit(1).get();
+        if (existingTenantUser) {
+            return c.json({ success: false, error: { code: 'already_initialized', message: 'System already initialized' } }, 409);
+        }
+
+        const body = c.req.valid('json');
+
+        // 2. Verification Code Check — gated solely by the SETUP_CODE secret.
+        // Fail closed when it is unset so an unprotected Worker can't be claimed.
+        const storedCode = c.env.SETUP_CODE;
+        if (!storedCode) {
+            return c.json({ success: false, error: { code: 'setup_code_unset', message: 'SETUP_CODE is not configured on this Worker. Set it as a secret and try again.' } }, 400);
+        }
+        if (body.verificationCode !== storedCode) {
+            return c.json({ success: false, error: { code: 'invalid_code', message: 'Invalid verification code' } }, 400);
+        }
+
+        // 3. Initialize Workspace
+        const passwordHash = await c.var.services.auth.hashPassword(body.password);
+        // The profile owns this, fallback included — `getDeploymentProfile`
+        // resolves `SINGLE_TENANT_ID ?? FIXED_TENANT_FALLBACK`. Writing the
+        // literal here was a second copy of a decision, and the all-zero UUID
+        // appeared three times in this repo for two answers.
+        const tenantId = getDeploymentProfile(c.env).fixedTenantId!;
+        const slug = body.companyName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+
+        await c.var.services.admin.updateTenantStatus({
+            id: tenantId,
+            name: body.companyName,
+            slug,
+            status: 'active',
+            adminEmail: body.email,
+            adminPasswordHash: passwordHash,
+            adminName: body.adminName,
+        });
+
+        // Auto-seed the FULL starter content library for the new tenant in one
+        // idempotent pass (templates, agreements, canned comments, event types, tags,
+        // recommendations, rating systems, marketplace libraries) — the same canonical
+        // seeder `POST /api/admin/data/install-bundled-content` uses, so /setup yields
+        // a fully populated NEW workspace (no separate post-deploy seed step needed).
+        // Not an EXISTING one — `already_initialized` above refuses forever once a user exists, so content a later release ships arrives only via that route.
+        try {
+            const { seedStarterContent } = await import('../services/starter-content.service');
+            const seeded = await seedStarterContent(c.env.DB, tenantId);
+            logger.info('Auto-seeded starter content during setup', { tenantId, ...seeded });
+        } catch (seedErr) {
+            // Don't block setup if seeding fails — log and continue.
+            logger.error('Auto-seed starter content failed during setup', { tenantId }, seedErr instanceof Error ? seedErr : undefined);
+        }
+
+        // 4. Issue a JWT for the new admin so the caller can authenticate immediately
+        const newUser = await db.select().from(users).where(eq(users.email, body.email)).get().catch(() => null);
+        if (newUser) {
+            const keyring = await c.var.keyringPromise!;
+            const now = Math.floor(Date.now() / 1000);
+            const token = await signJwt({
+                sub: newUser.id,
+                'custom:tenantId': newUser.tenantId,
+                'custom:userRole': newUser.role,
+                role: newUser.role,
+                iat: now,
+                exp: now + 60 * 60 * 24,
+            }, keyring);
+            setCookie(c, AUTH_COOKIE_NAME, token, authCookieOptions());
+        }
+
+        return c.json({
+            success: true,
+            data: { redirect: '/inspections' }
+        }, 200);
+    })
+    .route('/', profileRoutes)
+    .route('/', totpRoutes)
+    .openapi(inviteInfoRoute, async (c) => {
+        const { token } = c.req.valid('query');
+        const info = await c.var.services.auth.getInviteInfo(token);
+        if (!info) return c.json({ success: false as const, error: { code: 'NOT_FOUND', message: 'Invite not found' } }, 404);
+        return c.json({ success: true as const, data: info }, 200);
+    })
+    .openapi(setupStatusRoute, async (c) => {
+        const isSetUp = await c.var.services.auth.isSetUp();
+        return c.json({ success: true as const, data: { isSetUp } }, 200);
+    });
+
+export type CoreAuthApi = typeof coreAuthRoutes;
+
+export default coreAuthRoutes;

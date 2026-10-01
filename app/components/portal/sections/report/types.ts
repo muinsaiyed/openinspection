@@ -1,0 +1,389 @@
+/**
+ * Shared report types + print-layout constants.
+ *
+ * Extracted from <ReportView> so the colocated report sub-components and the
+ * pure helpers can reference them without importing the component module
+ * (avoids a circular import). ReportView re-exports every symbol here, so its
+ * public type/constant surface is unchanged.
+ */
+import type { CourtesyTranslationPayload } from "~/lib/report-translation";
+import type { TenantBrand } from "~/lib/brand";
+import type { ReportMedia } from "../../../../../server/lib/report-video";
+
+/** Plan 7 — a report photo object may carry a resolved media kind (video).
+ *  Commercial PCA Phase P — `photoNo` is the render-order stamp assigned
+ *  server-side (Appendix B back-references + inline numbering); absent when
+ *  the server hasn't assigned one yet. */
+export type ReportPhoto = { key: string; url: string; media?: ReportMedia; photoNo?: number };
+
+/** Commercial PCA Phase P — whether report photos render inline (per-item,
+ *  legacy behavior) or are collected into a numbered Appendix B (server
+ *  resolves this from report_tier + the per-inspection override; app/ cannot
+ *  import server/lib/report-photo-mode, so it's re-declared here). */
+type PhotoMode = "appendix" | "inline";
+
+/** Commercial PCA Phase P — a single Appendix B entry (server produces these
+ *  in render order; app/ cannot import server/lib/pca-photo-appendix). */
+export interface AppendixPhoto {
+  photoNo: number;
+  key: string;
+  url: string;
+  caption: string | null;
+  sectionId: string;
+  sectionTitle: string;
+  itemId: string;
+  itemLabel: string;
+}
+
+/** Commercial PCA Phase F — a resolved Building Profile display row (server produces these). */
+export interface ProfileRow {
+  id: string;
+  group: string;
+  label: string;
+  value: string | number | null;
+  unit: string | null;
+}
+
+export interface ResolvedDefect {
+  id: string;
+  title: string;
+  included: boolean;
+  isCustom?: boolean;
+  effectiveComment: string;
+  effectiveCategory?: string;
+  /** Authoring unification Plan-4 module K — the tenant's configured
+   *  defect_categories.color for effectiveCategory, resolved server-side.
+   *  Undefined → DefectCategoryChip's tokened/muted fallback. */
+  categoryColor?: string;
+  /** Whether this defect's category counts toward the report Summary rollup
+   *  (defect_categories.drivesSummary), resolved server-side. */
+  drivesSummary?: boolean;
+  effectiveLocation?: string | null;
+  /** IA-57 — the inspector-selected trade + timeframe, resolved to their
+   *  human labels server-side (e.g. 'licensed plumber', '1 to 3 years'). These
+   *  were previously only Mustache-interpolated into the comment, so they
+   *  vanished whenever the template author omitted the placeholder. Null when
+   *  the inspector left the dropdown blank. */
+  effectiveTrade?: string | null;
+  effectiveTimeframe?: string | null;
+  defectPhotos?: ReportPhoto[];
+}
+
+export interface ReportItem {
+  id: string;
+  label: string;
+  /**
+   * The item this one nests under, within the same section. Absent or null =
+   * top level, and so is a pointer at an item this list does not contain — the
+   * `defects` filter drops rows, so a child can outlive its parent, and it
+   * becomes a top-level card rather than disappearing into a card that is not
+   * on the page.
+   */
+  parentId?: string | null;
+  type?: string;
+  rating: string | null;
+  ratingColor: string;
+  ratingLabel: string | null;
+  severityBucket: string;
+  /** Commercial PCA Phase F (F1) — NI/NP distinction (null for non-na items). */
+  naKind?: 'not_inspected' | 'not_present' | null;
+  /** Commercial PCA Phase F (F1) — optional limitation reason captured against an NI rating (Phase S renders it). */
+  notInspectedReason?: string | null;
+  notes: string | null;
+  photos: ReportPhoto[];
+  recommendation?: string | null;
+  /** Task 8 — attached repair items snapshotted on this finding (dollars).
+   *  The estimate pair here is a LEGACY READ (null on every finding written
+   *  since repair pricing was withdrawn); there is deliberately no item-level
+   *  estimateMin / estimateMax any more. */
+  repairItems?: {
+    summary: string;
+    estimateMin: number | null;
+    estimateMax: number | null;
+    contractorType: string | null;
+  }[];
+  value?: unknown;
+  unit?: string | null;
+  /** FE-3/B-20 — resolved canned + custom defects (server emits both). */
+  resolvedTabs?: {
+    defects?: ResolvedDefect[];
+  };
+}
+
+export interface ReportSection {
+  id: string;
+  title: string;
+  icon?: string | null;
+  defectCount: number;
+  items: ReportItem[];
+  disclaimerText?: string | null;
+  alwaysPageBreak?: boolean;
+}
+
+export type FilterKey = "all" | "defects" | "summary";
+
+/** Commercial PCA Phase T — the resolved report tier (server produces this;
+ *  app/ cannot import server/lib/report-tier, so it's re-declared here). */
+type ReportTier = 'light_commercial' | 'full_pca';
+
+export {
+    PRINT_CARD_CLASS, PRINT_FIGURE_CLASS, PRINT_SECTION_HEADING_CLASS,
+    DEFECT_PHOTO_GRID_CLASS, ITEM_PHOTO_GRID_CLASS, printThumbWidth,
+    REPORT_HEADING_STYLE,
+} from "./print-layout";
+
+export interface ReportSignature {
+  /**
+   * How the report came to be signed, decided by the service where the record
+   * lives. NOT derivable from the fields below: a report nobody signed and a
+   * report signed without a stored image once arrived here identically, and the
+   * renderer settled the ambiguity by drawing the inspector's name as their
+   * signature (2026-08-15).
+   *
+   *   none             nobody signed. Attribute authorship, use no signing verb.
+   *   manual           the inspector signed.
+   *   authorized_auto  the inspector's own signature, applied at publication
+   *                    under the standing authorisation they enabled.
+   */
+  method: "none" | "manual" | "authorized_auto";
+  signatureBase64: string | null;
+  signedAt: number | null; // epoch ms
+  inspectorName: string | null;
+  inspectorLicense: string | null;
+}
+
+/* Commercial PCA Phase S — report-skeleton types re-declared across the
+   server/app boundary (app/ cannot import server/lib/). Shapes mirror
+   server/lib/pca-narrative.ts, pca-systems-summary.ts, pca-deviations.ts
+   exactly. The section registry has no mirror here on purpose: the client is
+   given the TOC already projected and tier-gated, as `outline`. */
+
+/* Commercial PCA Phase O — TOC projection re-declared across the server/app
+   boundary (app/ cannot import server/lib/report-outline.ts). Shape mirrors
+   server/lib/report-outline.ts's ReportOutlineEntry exactly. */
+export interface ReportOutlineEntry {
+  id: string;
+  level: number;
+  title: string;
+  /** Filled by the PDF measurement pass; undefined/null on the web. */
+  page?: number | null;
+}
+export interface PcaNarrativeData {
+  transmittalLetter: string;
+  summaryGeneralDescription: string;
+  summaryPhysicalCondition: string;
+  summaryRecommendations: string;
+  purpose: string;
+  scopeOfWork: string;
+  limitationsExceptions: string;
+  reconnaissance: string;
+  additionalConsiderations: string;
+}
+export interface SystemsSummaryRow {
+  systemId: string;
+  systemTitle: string;
+  worstSeverity: 'good' | 'marginal' | 'significant' | 'minor';
+  counts: { safety: number; recommendation: number; maintenance: number };
+}
+interface Deviation {
+  id: string;
+  area: string;
+  baselineRequirement: string;
+  deviation: string;
+  reason: string;
+}
+export interface PcaReportData {
+  narrative: PcaNarrativeData;
+  systemsSummary: SystemsSummaryRow[];
+  deviations: Deviation[];
+}
+
+export interface ReportVerification {
+  versionNumber: number;
+  contentHash: string;
+  verifyToken: string;
+  publishedAt: number; // unix seconds
+}
+
+/* Commercial PCA Phase M — compliance-record view types re-declared across the
+   server/app boundary (app/ cannot import server/lib/). Shapes mirror the M7
+   compliance payload (ASTM conformance flag, dual-role signoffs, PSQ,
+   document-review checklist, reliance language) exactly. */
+export interface AstmConformance { standard: 'E2018-24'; conforms: boolean }
+export interface ReportSignoffView {
+  role: 'field_observer' | 'pcr_reviewer';
+  name: string; license: string | null; qualificationsRef: string | null;
+  signedAt: number; dualRole: boolean;
+}
+export interface PsqView { status: 'sent' | 'received' | 'declined'; responses: Record<string, unknown> | null }
+export interface DocReviewView {
+  documentKey: string; label: string;
+  requested: boolean; received: boolean; reviewed: boolean; na: boolean; notes: string | null;
+}
+export interface RelianceText { userReliance: string; pointInTime: string; siteSpecific: string }
+
+/* Commercial PCA Phase U — per-unit matrix types re-declared across the
+   server/app boundary (app/ cannot import server/lib/). Shapes mirror
+   server/lib/unit-scope.ts exactly (same precedent as the Phase S types above). */
+export type Severity = 'good' | 'marginal' | 'significant' | 'minor';
+interface MatrixCell {
+  worst: Severity | null;
+  counts: { safety: number; recommendation: number; maintenance: number };
+}
+export interface UnitMatrixRow {
+  unitId: string;
+  label: string;
+  cells: Record<string, MatrixCell>;
+  isException: boolean;
+}
+interface ReportUnit {
+  id: string;
+  label: string;
+  kind: string;
+  type: string;
+  parentUnitId: string | null;
+  sortOrder: number;
+  attrs: unknown;
+}
+
+/* Commercial PCA Phase C — client-side mirror of server/lib/pca-costs shapes
+   (server lib cannot be imported by app/; these are structural duplicates). */
+export interface CostItemView {
+  id: string; system: string; component: string; location: string;
+  action: 'repair' | 'replace' | 'further_study';
+  costMethod: 'unit' | 'lump_sum';
+  quantity: number | null; uom: string | null;
+  unitCostCents: number | null; lumpSumCents: number | null;
+  eul: number | null; effAge: number | null; rul: number | null;
+  suggestedRemedy: string;
+  bucket: 'immediate' | 'short_term' | 'long_term';
+  sectionRef: string | null; photoRef: string | null; sortOrder: number;
+}
+export interface Table1Row { item: CostItemView; total: number }
+interface Table1 {
+  immediate: Table1Row[]; shortTerm: Table1Row[];
+  immediateTotalCents: number; shortTermTotalCents: number;
+}
+interface ReserveRow {
+  item: CostItemView; placementYear: number; replacementCents: number;
+  /** Commercial PCA Phase P/C seam — resolved appendix photo number for
+   *  `item.photoRef` (server resolves via buildPhotoRefIndex/resolvePhotoRef).
+   *  Optional/absent when the producer skipped resolution; null when the ref
+   *  didn't resolve; the PHOTO NO. cell renders nothing in either case. */
+  photoNo?: number | null;
+}
+interface ReserveSchedule {
+  startYear: number; termYears: number; years: number[]; rows: ReserveRow[];
+  uninflatedByYear: number[]; inflatedByYear: number[]; cumulativeInflatedByYear: number[];
+  totalUninflatedCents: number; totalInflatedCents: number;
+  perSfUninflatedAllYears: number | null; perSfInflatedAllYears: number | null; perSfInflatedPerYear: number | null;
+}
+export interface BucketRollup { immediateCents: number; shortTermCents: number; reserveCents: number }
+export interface CostTables {
+  table1: Table1; reserveSchedule: ReserveSchedule | null;
+  rollup: BucketRollup; droppedCount: number;
+}
+
+/**
+ * The report loader payload shape. Kept here (exported) so both the standalone
+ * route and the portal route can type their loaders against it and feed it to
+ * `reportViewProps()`.
+ */
+/** App-side mirror of the server StyleProfile (Report Style Presets). The report
+ *  payload carries this resolved shape; app/ cannot import server/lib. tokens is a
+ *  flat CSS-var value map consumed by presetTokens(). */
+interface StyleProfileClient {
+  id: string;
+  name: string;
+  schemaVersion: number;
+  colour: string | null;
+  badgeLayout: 'strip' | 'inline';
+  photoColumns: number;
+  tokens: Record<string, string>;
+}
+
+export interface ReportLoaderResult {
+  inspectionId: string;
+  address: string;
+  date: string;
+  inspectorName: string | null;
+  coverPhotoUrl: string | null;
+  stats: { total: number; satisfactory: number; monitor: number; defect: number };
+  sections: ReportSection[];
+  showEstimates: boolean;
+  costTables: CostTables | null;
+  enableCustomerRepairExport: boolean;
+  /** Tenant timezone (IANA) that anchors ALL report times. 'UTC' when unset. */
+  reportTimeZone: string;
+  isDelivered: boolean;
+  brand: TenantBrand;
+  error: string | null;
+  notPublished: boolean;
+  /**
+   * The report IS published and the workspace is holding it for a signed
+   * agreement or an outstanding payment. Distinct from `notPublished`, which
+   * says there is nothing to show yet — the two send a reader to different
+   * places, and only one of them is something the reader can act on.
+   */
+  reportHeld?: boolean;
+  /** IA-36 ⑨ — the link was real but has expired or been revoked (API 410). */
+  linkInactive?: boolean;
+  /**
+   * OI #271 — this recipient has exercised their Art. 21 objection, so the
+   * delivery-view counter is suppressed for them. Optional and defaulting to
+   * false: an unknown answer must render the disclosure's ordinary "you can
+   * turn this off" state, which is true for everyone who has not objected and
+   * harmless for one who has (the control is idempotent, and the counter is
+   * gated on the STORED marker, never on what this page believes).
+   */
+  viewTrackingObjected?: boolean;
+  /** #23 — the courtesy translation, or null (see ~/lib/report-translation). */
+  courtesyTranslation?: CourtesyTranslationPayload | null;
+  styleProfile?: StyleProfileClient;
+  inspectorCredentials?: Array<{ label: string; memberNumber: string | null; imageUrl: string | null }>;
+  initialFilter: FilterKey;
+  printMode: boolean;
+  /* Commercial PCA Task 19a — real TOC page numbers, two-pass Chrome + pdf-lib.
+     Parsed from the `?tocpages=<base64url(JSON)>` param that `generatePdfWithTocPages`
+     appends to the pass-2 render URL (server/lib/pdf.ts): `extractAnchorPages`
+     (server/lib/toc-pages.ts) reads the named PDF destinations Chrome emits for
+     each pass-1 `<a href="#id">` TOC link and resolves them to 1-based page
+     numbers. Undefined on the web and on pass 1 of the PDF render — `<ReportToc>`
+     renders its reserved page-ref slot empty in either case, so the report is
+     byte-identical apart from the filled-in numbers on pass 2. */
+  tocPages?: Record<string, number>;
+  isPublished: boolean;
+  signature: ReportSignature | null;
+  verification: ReportVerification | null;
+  /* Commercial PCA Phase M — compliance record surfaces (ASTM conformance
+     statement, dual-role signoffs, PSQ status, document-review checklist,
+     reliance language). Empty/null-safe in every fallback path. */
+  astmConformance: AstmConformance | null;
+  reportSignoffs: ReportSignoffView[];
+  psq: PsqView | null;
+  documentReview: DocReviewView[];
+  relianceText: RelianceText;
+  ownerPreview: boolean;
+  baseUrl: string;
+  /* Commercial PCA Phase P — photo rendering mode (inline vs. numbered
+     Appendix B) and the resolved appendix entries. Empty/'inline' in every
+     fallback path so non-appendix reports render byte-identically. */
+  photoMode: PhotoMode;
+  photoAppendix: AppendixPhoto[];
+  propertyType: string | null;
+  commercialSubtype: string | null;
+  reportTier: ReportTier | null;
+  buildingProfile: ProfileRow[];
+  pcaReport: PcaReportData | null;
+  /* Commercial PCA Phase U — per-unit inspection mode + the unit tree,
+     units×systems condition matrix, and per-unit defect counts. Matrix + counts
+     are empty in 'tagged' mode so non-per_unit reports render byte-identically. */
+  unitInspectionMode: 'tagged' | 'per_unit';
+  units: ReportUnit[];
+  unitConditionMatrix: UnitMatrixRow[];
+  defectCountsByUnit: Record<string, number>;
+  /* Commercial PCA Phase O — the TOC projection over the tier-gated section
+     registry. Empty for residential/no-tier reports (no PCA front matter to
+     project a TOC over). */
+  outline: ReportOutlineEntry[];
+}

@@ -1,0 +1,337 @@
+/**
+ * Sprint 2 S2-2 — Inspection Request service.
+ *
+ * Owns the lifecycle of `inspection_requests` (parent) and the N inspections
+ * (children) that share a property + schedule. All queries filter by
+ * `tenantId` per the multi-tenant rules in CLAUDE.md.
+ */
+
+import { drizzle } from 'drizzle-orm/d1';
+import { and, eq, inArray } from 'drizzle-orm';
+import {
+    inspectionRequests,
+    inspections,
+    templates,
+    contactRoleProfiles,
+} from '../lib/db/schema';
+import { Errors } from '../lib/errors';
+import { logger } from '../lib/logger';
+import { syncInspectionAssignments } from '../lib/db/assignment-links';
+import { INSPECTION_STATUS } from '../lib/status/inspection-status';
+import { PeopleService } from './people.service';
+import { ContactService } from './contact.service';
+import { listRequests, getRequest, type ListFilter } from './inspection-request/request-read';
+import type { PlanQuotaGuard } from '../features/plan-quota/guard';
+
+export interface CreateRequestInput {
+    clientName:      string;
+    clientEmail?:    string | null;
+    clientPhone?:    string | null;
+    propertyAddress: string;
+    propertyCity?:   string | null;
+    propertyState?:  string | null;
+    propertyZip?:    string | null;
+    scheduledAt:     string;
+    notes?:          string | null;
+    inspectorId?:    string | null;
+    // UC-A-1 — agent referral attribution. Resolved upstream from
+    // `?ref=<agentSlug>` to a contacts.id; copied onto every child
+    // inspection so dashboards + emails can credit the agent.
+    referredByAgentId?: string | null;
+}
+
+export interface CreateSubInspectionInput {
+    templateId: string;
+    price?:     number;
+    notes?:     string | null;
+}
+
+export interface UpdateRequestInput {
+    clientName?:      string;
+    clientEmail?:     string | null;
+    clientPhone?:     string | null;
+    propertyAddress?: string;
+    propertyCity?:    string | null;
+    propertyState?:   string | null;
+    propertyZip?:     string | null;
+    scheduledAt?:     string;
+    notes?:           string | null;
+    status?:          'pending' | 'confirmed' | 'in_progress' | 'completed' | 'cancelled';
+    paymentStatus?:   'unpaid' | 'partial' | 'paid';
+}
+
+export class InspectionRequestService {
+    /**
+     * Free-tier usage-quota guard (optional). Present only in SaaS deploys
+     * with `hasUsageQuota` (see deployment-profile.ts); undefined in
+     * standalone, where request creation stays unlimited. `create` consumes
+     * once per sub-inspection (a request can bundle up to 10); addSubInspection
+     * consumes once for its single new row.
+     */
+    constructor(private db: D1Database, private planQuota?: PlanQuotaGuard) {}
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private getDrizzle() { return drizzle(this.db as any); }
+
+    /**
+     * List parent requests for the tenant, eager-loading child inspections.
+     * Body in `./inspection-request/request-read`.
+     */
+    async list(tenantId: string, filter: ListFilter = {}) {
+        return listRequests(this.getDrizzle(), tenantId, filter);
+    }
+
+    /**
+     * Fetch a single parent request with its children (tenant-scoped), or null.
+     * Stays a method: `create`, `addSubInspection` and `update` all reload
+     * through it, as does `getByInspectionId` below.
+     */
+    async get(tenantId: string, id: string) {
+        return getRequest(this.getDrizzle(), tenantId, id);
+    }
+
+    /**
+     * Resolve the parent request (if any) for an inspection. Used by
+     * inspection-edit and the sub-route shell to render the request switcher.
+     */
+    async getByInspectionId(tenantId: string, inspectionId: string) {
+        const db = this.getDrizzle();
+        const insp = await db.select({ requestId: inspections.requestId })
+            .from(inspections)
+            .where(and(eq(inspections.id, inspectionId), eq(inspections.tenantId, tenantId)))
+            .get();
+        if (!insp || !insp.requestId) return null;
+        return this.get(tenantId, insp.requestId);
+    }
+
+    /**
+     * Create a request and N child inspections in one logical step.
+     * D1 batches are not exposed via Drizzle; we do sequential inserts and
+     * rely on the calling transaction model (Cloudflare D1 auto-commit).
+     */
+    async create(tenantId: string, input: CreateRequestInput, subs: CreateSubInspectionInput[]) {
+        if (subs.length === 0) throw Errors.BadRequest('At least one sub-inspection is required');
+        if (subs.length > 10)  throw Errors.BadRequest('A request cannot exceed 10 inspections');
+
+        const db = this.getDrizzle();
+        const requestId = crypto.randomUUID();
+        const now = new Date();
+
+        // Validate all referenced templates belong to this tenant before any insert.
+        const templateIds = Array.from(new Set(subs.map(s => s.templateId)));
+        const tplRows = await db.select({ id: templates.id, version: templates.version, schema: templates.schema })
+            .from(templates)
+            .where(and(eq(templates.tenantId, tenantId), inArray(templates.id, templateIds)))
+            .all();
+        const tplById = new Map(tplRows.map(t => [t.id, t]));
+        for (const id of templateIds) {
+            if (!tplById.has(id)) throw Errors.BadRequest(`Template not found: ${id}`);
+        }
+
+        // Quota is consumed for the whole batch at once, after every precondition
+        // check above (bounds, template ownership) and BEFORE the parent
+        // request row is inserted — a request row must never be orphaned
+        // (created with zero children) because the tenant hit the cap
+        // partway through. One call, not a loop: the guard counts existing
+        // inspection rows and these are inserted below, so N looped calls would
+        // all read the same count and all pass. See consumeInspection's `count`.
+        await this.planQuota?.consumeInspection(tenantId, subs.length);
+
+        await db.insert(inspectionRequests).values({
+            id:              requestId,
+            tenantId,
+            clientName:      input.clientName,
+            clientEmail:     input.clientEmail ?? null,
+            clientPhone:     input.clientPhone ?? null,
+            propertyAddress: input.propertyAddress,
+            propertyCity:    input.propertyCity ?? null,
+            propertyState:   input.propertyState ?? null,
+            propertyZip:     input.propertyZip ?? null,
+            scheduledAt:     new Date(input.scheduledAt),
+            notes:           input.notes ?? null,
+            status:          'pending',
+            createdAt:       now,
+            updatedAt:       now,
+        });
+
+        const subRows = subs.map(s => {
+            const tpl = tplById.get(s.templateId);
+            return {
+                id:                       crypto.randomUUID(),
+                tenantId,
+                inspectorId:              input.inspectorId ?? null,
+                propertyAddress:          input.propertyAddress,
+                templateId:               s.templateId,
+                templateSnapshot:         tpl ? tpl.schema : null,
+                templateSnapshotVersion:  tpl ? tpl.version : 1,
+                date:                     input.scheduledAt,
+                status:                   INSPECTION_STATUS.REQUESTED,
+                paymentStatus:            'unpaid' as const,
+                price:                    s.price ?? 0,
+                requestId,
+                createdAt:                now,
+            };
+        });
+
+        await db.insert(inspections).values(subRows);
+        // DB-8: mirror assignments into inspection_inspectors for each sub-inspection.
+        for (const row of subRows) {
+            await syncInspectionAssignments(db, tenantId, row.id, { inspectorId: row.inspectorId });
+        }
+
+        // Task 7b/7c (people-role-profiles) — mirror the client AND the agent
+        // referral into inspection_people for EVERY sub-inspection this
+        // request created. Task 13 dropped the legacy clientName/clientEmail/
+        // referredByAgentId columns from inspections, so this is now the ONLY
+        // persistence of WHO. The client contact is resolved via the same idempotent upsert
+        // booking.service/core.ts use (matches by tenant + normalized email),
+        // so getInspection/listInspections (Task 9c-reads), which resolve the
+        // client ONLY via inspection_people, always find one for a
+        // request-created inspection. Non-fatal: a people-write failure must
+        // never roll back an already-committed inspection row.
+        try {
+            const roleRows = await db.select({ id: contactRoleProfiles.id, key: contactRoleProfiles.key })
+                .from(contactRoleProfiles)
+                .where(and(eq(contactRoleProfiles.tenantId, tenantId), eq(contactRoleProfiles.active, true)));
+            const roleIdByKey = new Map(roleRows.map(r => [r.key, r.id]));
+            const people = new PeopleService({ DB: this.db });
+
+            // input.clientName is a required field on CreateRequestInput, so
+            // this upsert always runs — mirrors ConciergeService.createBooking.
+            const { id: clientContactId } = await new ContactService(this.db).upsertClientContact(tenantId, {
+                name: input.clientName,
+                ...(input.clientEmail ? { email: input.clientEmail } : {}),
+                ...(input.clientPhone ? { phone: input.clientPhone } : {}),
+                type: 'client',
+            });
+
+            const links: Array<[string | null, string | undefined]> = [
+                [clientContactId, roleIdByKey.get('client')],
+                [input.referredByAgentId ?? null, roleIdByKey.get('buyer_agent')],
+            ];
+            for (const row of subRows) {
+                for (const [contactId, roleProfileId] of links) {
+                    if (contactId && roleProfileId) {
+                        await people.addPerson(tenantId, row.id, contactId, roleProfileId);
+                    }
+                }
+            }
+        } catch (err) {
+            logger.error('inspection-people write from inspection-request create failed', { requestId }, err instanceof Error ? err : undefined);
+        }
+
+        logger.info('inspection-request.created', { requestId, tenantId, subCount: subs.length });
+
+        const detail = await this.get(tenantId, requestId);
+        if (!detail) throw Errors.Internal('Failed to load newly created request');
+        return detail;
+    }
+
+    /**
+     * Append a new sub-inspection to an existing request.
+     */
+    async addSubInspection(tenantId: string, requestId: string, sub: CreateSubInspectionInput) {
+        const db = this.getDrizzle();
+        const req = await db.select().from(inspectionRequests)
+            .where(and(eq(inspectionRequests.id, requestId), eq(inspectionRequests.tenantId, tenantId)))
+            .get();
+        if (!req) throw Errors.NotFound('Inspection request not found');
+
+        const tpl = await db.select({ id: templates.id, version: templates.version, schema: templates.schema })
+            .from(templates)
+            .where(and(eq(templates.id, sub.templateId), eq(templates.tenantId, tenantId)))
+            .get();
+        if (!tpl) throw Errors.BadRequest(`Template not found: ${sub.templateId}`);
+
+        // Quota is consumed only after both precondition checks above (request
+        // exists, template exists) and immediately before the insert that
+        // actually creates the new sub-inspection.
+        await this.planQuota?.consumeInspection(tenantId);
+
+        const id = crypto.randomUUID();
+        const now = new Date();
+        await db.insert(inspections).values({
+            id,
+            tenantId,
+            propertyAddress:          req.propertyAddress,
+            templateId:               sub.templateId,
+            templateSnapshot:         tpl.schema,
+            templateSnapshotVersion:  tpl.version,
+            date:                     req.scheduledAt.toISOString(),
+            status:                   INSPECTION_STATUS.REQUESTED,
+            paymentStatus:            'unpaid' as const,
+            price:                    sub.price ?? 0,
+            requestId,
+            createdAt:                now,
+        });
+
+        await db.update(inspectionRequests)
+            .set({ updatedAt: now })
+            .where(and(eq(inspectionRequests.id, requestId), eq(inspectionRequests.tenantId, tenantId)));
+
+        // Task 7c (people-role-profiles fix) — mirror the client (inherited
+        // from the parent request — this call site carries no separate
+        // client input) into inspection_people for the new sub-inspection.
+        // Task 13 dropped the legacy clientName/clientEmail columns from
+        // inspections, so this is now the ONLY persistence of the client. No
+        // agent referral is captured on CreateSubInspectionInput, so only
+        // the client role is written.
+        // Non-fatal: a people-write failure must never roll back an
+        // already-committed inspection row.
+        try {
+            const { id: clientContactId } = await new ContactService(this.db).upsertClientContact(tenantId, {
+                name: req.clientName,
+                ...(req.clientEmail ? { email: req.clientEmail } : {}),
+                ...(req.clientPhone ? { phone: req.clientPhone } : {}),
+                type: 'client',
+            });
+            const roleRows = await db.select({ id: contactRoleProfiles.id, key: contactRoleProfiles.key })
+                .from(contactRoleProfiles)
+                .where(and(eq(contactRoleProfiles.tenantId, tenantId), eq(contactRoleProfiles.active, true)));
+            const clientRoleId = roleRows.find(r => r.key === 'client')?.id;
+            if (clientRoleId) {
+                await new PeopleService({ DB: this.db }).addPerson(tenantId, id, clientContactId, clientRoleId);
+            }
+        } catch (err) {
+            logger.error('inspection-people write from addSubInspection failed', { requestId, inspectionId: id }, err instanceof Error ? err : undefined);
+        }
+
+        const detail = await this.get(tenantId, requestId);
+        if (!detail) throw Errors.Internal('Failed to load updated request');
+        return detail;
+    }
+
+    /**
+     * Patch a request's top-level fields. Sub-inspections are edited via the
+     * existing inspection.service endpoints — no cascading updates here.
+     */
+    async update(tenantId: string, id: string, patch: UpdateRequestInput) {
+        const db = this.getDrizzle();
+        const existing = await db.select().from(inspectionRequests)
+            .where(and(eq(inspectionRequests.id, id), eq(inspectionRequests.tenantId, tenantId)))
+            .get();
+        if (!existing) throw Errors.NotFound('Inspection request not found');
+
+        // Build a typed patch object — Drizzle dislikes `undefined` keys under
+        // exactOptionalPropertyTypes.
+        const update: Partial<typeof inspectionRequests.$inferInsert> = { updatedAt: new Date() };
+        if (patch.clientName      !== undefined) update.clientName      = patch.clientName;
+        if (patch.clientEmail     !== undefined) update.clientEmail     = patch.clientEmail;
+        if (patch.clientPhone     !== undefined) update.clientPhone     = patch.clientPhone;
+        if (patch.propertyAddress !== undefined) update.propertyAddress = patch.propertyAddress;
+        if (patch.propertyCity    !== undefined) update.propertyCity    = patch.propertyCity;
+        if (patch.propertyState   !== undefined) update.propertyState   = patch.propertyState;
+        if (patch.propertyZip     !== undefined) update.propertyZip     = patch.propertyZip;
+        if (patch.scheduledAt     !== undefined) update.scheduledAt     = new Date(patch.scheduledAt);
+        if (patch.notes           !== undefined) update.notes           = patch.notes;
+        if (patch.status          !== undefined) update.status          = patch.status;
+
+        await db.update(inspectionRequests)
+            .set(update)
+            .where(and(eq(inspectionRequests.id, id), eq(inspectionRequests.tenantId, tenantId)));
+
+        const detail = await this.get(tenantId, id);
+        if (!detail) throw Errors.Internal('Failed to reload updated request');
+        return detail;
+    }
+}

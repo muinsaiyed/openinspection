@@ -1,0 +1,379 @@
+// Admin → Canned Comments library sub-router (Phase 1.3 split of
+// server/api/admin.ts).
+//
+// Canned-comment CRUD + search/filter/pagination + per-user usage counter.
+// Route definitions are co-located with their `.openapi()` handlers; bodies are
+// byte-identical to the original admin.ts. Mounted at `/` by the admin
+// aggregator, preserving the original paths.
+import { createRoute, z } from '@hono/zod-openapi';
+import { createApiRouter } from '../../lib/openapi-router';
+import { eq, and, or, like, asc as ascDz, desc as descDz, sql as sqlTpl } from 'drizzle-orm';
+import { buildMeta } from '../../lib/validations/pagination.schema';
+import { requireRole } from '../../lib/middleware/rbac';
+import { auditFromContext } from '../../lib/audit';
+import { safeISODate } from '../../lib/date';
+import { escapeLikePattern } from '../../lib/db/like-escape';
+import { Errors } from '../../lib/errors';
+import {
+    CommentSchema,
+    CommentResponseSchema,
+    UpdateCommentSchema,
+    ListCommentsQuerySchema,
+    CommentTouchResponseSchema,
+} from '../../lib/validations/admin.schema';
+import { comments } from '../../lib/db/schema';
+import { commentUsage } from '../../lib/db/schema/inspection';
+import { withMcpMetadata } from "../../lib/route-metadata-standards";
+import { getDrizzle } from '../../lib/route-helpers';
+
+
+// --- Comments Library ---
+
+// Module F (2026-07) — narrow Drizzle's generic `string | null` for
+// `severity` down to the Zod enum shape the OpenAPI response schema
+// declares. The DB column is just TEXT (column constraint isn't enforced
+// at the SQLite layer), so we cast at the response boundary. `severity` is the
+// only severity a comment has: the older `ratingBucket` was retired and its
+// column has since been removed, so the row type below cannot carry it.
+type SeverityResp = 'good' | 'marginal' | 'significant' | 'minor' | null;
+function commentRowToResponse(r: typeof comments.$inferSelect) {
+    // #348 — `importHash` is an internal edit marker, not API surface: it exists
+    // so a marketplace re-import can tell a rewritten row from an untouched one,
+    // and a client has no use for it. `editedAt` is the half a client DOES want.
+    const { importHash, ...rest } = r;
+    void importHash; // read so the strip is deliberate rather than an unused binding
+    return {
+        ...rest,
+        severity: (r.severity as SeverityResp) ?? null,
+        createdAt: safeISODate(r.createdAt),
+        editedAt: r.editedAt ? safeISODate(r.editedAt) : null,
+    };
+}
+
+const listCommentsRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/comments',
+    tags: ["admin"],
+    summary: 'List comment library entries',
+    // Inspectors need read access so the inspection-edit picker (T7+1) can
+    // populate. Create/delete remain admin-only further below.
+    middleware: [requireRole('owner', 'manager', 'inspector')],
+    request: { query: ListCommentsQuerySchema.describe('TODO describe query field for the OpenInspection MCP integration') },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration'), data: z.array(CommentResponseSchema).describe('TODO describe data field for the OpenInspection MCP integration') }) } },
+            description: 'Success',
+        },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "listTenantComments",
+    description: "Auto-generated placeholder for listTenantComments (GET /comments, admin domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['admin'], tier: 'extended' }));
+
+
+const createCommentRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/comments',
+    tags: ["admin"],
+    summary: 'Create a comment library entry',
+    middleware: [requireRole('owner', 'manager')],
+    request: { body: { content: { 'application/json': { schema: CommentSchema.describe('TODO describe schema field for the OpenInspection MCP integration') } } } },
+    responses: {
+        201: {
+            content: { 'application/json': { schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration'), data: z.object({ comment: CommentResponseSchema.describe('TODO describe comment field for the OpenInspection MCP integration') }).describe('TODO describe data field for the OpenInspection MCP integration') }) } },
+            description: 'Created',
+        },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "createTenantComments",
+    description: "Auto-generated placeholder for createTenantComments (POST /comments, admin domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['admin'], tier: 'extended' }));
+
+
+const deleteCommentRoute = createRoute(withMcpMetadata({
+    method: 'delete',
+    path: '/comments/{id}',
+    tags: ["admin"],
+    summary: 'Delete a comment library entry',
+    middleware: [requireRole('owner', 'manager')],
+    request: { params: z.object({ id: z.string().trim().min(1).describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration') },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: z.object({ success: z.boolean().describe('TODO describe success field for the OpenInspection MCP integration') }).describe('TODO describe schema field for the OpenInspection MCP integration') } },
+            description: 'Deleted',
+        },
+        404: { description: 'Not found' },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "deleteTenantComment",
+    description: "Auto-generated placeholder for deleteTenantComment (DELETE /comments/{id}, admin domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['admin'], tier: 'extended' }));
+
+
+const updateCommentRoute = createRoute(withMcpMetadata({
+    method: 'put',
+    path: '/comments/{id}',
+    tags: ["admin"],
+    summary: 'Update a comment library entry',
+    middleware: [requireRole('owner', 'manager')],
+    request: {
+        params: z.object({ id: z.string().trim().min(1).describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration'),
+        body: { content: { 'application/json': { schema: UpdateCommentSchema.describe('TODO describe schema field for the OpenInspection MCP integration') } } },
+    },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration'), data: z.object({ comment: CommentResponseSchema.describe('TODO describe comment field for the OpenInspection MCP integration') }).describe('TODO describe data field for the OpenInspection MCP integration') }) } },
+            description: 'Updated',
+        },
+        404: { description: 'Not found' },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "updateTenantComment",
+    description: "Auto-generated placeholder for updateTenantComment (PUT /comments/{id}, admin domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['admin'], tier: 'extended' }));
+
+
+// Comments Library Upgrade — per-user usage counter. Inspectors call this
+// after dropping a snippet into a report; the count drives the "frequent"
+// sort + AUTO filter mode in the Library drawer.
+const touchCommentRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path:   '/comments/{id}/touch',
+    tags:   ['admin'],
+    summary: "Record an inspector's use of a snippet (per-user counter)",
+    middleware: [requireRole('owner', 'manager', 'inspector')] as const,
+    request: { params: z.object({ id: z.string().min(1).describe('Comment library entry identifier') }) },
+    responses: {
+        200: {
+            description: 'Updated usage row',
+            content: { 'application/json': { schema: CommentTouchResponseSchema } },
+        },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "touchTenantComment",
+    description: "Increment per-user usage counter for a comment library entry.",
+}, { scopes: ['admin'], tier: 'extended' }));
+
+
+const adminCommentsRoutes = createApiRouter()
+    .openapi(listCommentsRoute, async (c) => {
+        const tenantId = c.get('tenantId');
+        const { severity, section, sectionId, triggerCode, search, sort, filterMode, itemLabel, page, pageSize } = c.req.valid('query');
+        // Per-user usage join — needs the JWT subject (same convention as the
+        // touch endpoint above and the rest of admin.ts).
+        const userId = c.get('user')?.sub ?? '';
+        const auto = filterMode === 'auto';
+        const db = getDrizzle(c);
+        // Filters layered defensively: tenantId always first (multi-tenant
+        // isolation rule from CLAUDE.md). `sectionId` / `triggerCode` are
+        // explicit user-typed filters and always apply; `severity` / `section`
+        // / `itemLabel` are context-derived and only apply when filterMode=auto
+        // (filterMode=all means "ignore inspection context, show everything").
+        const conditions = [eq(comments.tenantId, tenantId)];
+        if (sectionId) {
+            conditions.push(like(comments.sectionIds, `%"${escapeLikePattern(sectionId)}"%`));
+        }
+        if (triggerCode) {
+            conditions.push(eq(comments.triggerCode, triggerCode));
+        }
+        // Track H: `severity` applies whenever the caller sends it — the library
+        // modal's severity chips pass it explicitly in `all` mode too (it used to
+        // be auto-gated like section/itemLabel, which left the chips dead).
+        if (severity) conditions.push(eq(comments.severity, severity));
+        if (auto && section) conditions.push(eq(comments.section, section));
+        if (auto && itemLabel) conditions.push(eq(comments.itemLabel, itemLabel));
+        // Track H (IA-5): search is pushed down to SQL so pagination + count
+        // are correct. (The old behavior filtered in JS AFTER the limit, so a
+        // match beyond the first page silently never surfaced.) Matches text
+        // OR the curated search_keywords column; SQLite LIKE is ASCII
+        // case-insensitive, which is what the library content needs.
+        if (search && search.trim().length >= 2) {
+            const needle = `%${escapeLikePattern(search.trim())}%`;
+            conditions.push(or(like(comments.text, needle), like(comments.searchKeywords, needle))!);
+        }
+
+        // ORDER BY by sort. SQLite treats NULL as smaller than any value, so
+        // descDz(commentUsage.lastUsedAt) naturally puts user-touched rows first
+        // and untouched rows last — matches the `recent` / `frequent` specs.
+        const orderByExpr =
+            sort === 'recent'   ? [descDz(commentUsage.lastUsedAt)]
+          : sort === 'created'  ? [descDz(comments.createdAt)]
+          : sort === 'frequent' ? [descDz(commentUsage.useCount), descDz(commentUsage.lastUsedAt)]
+          : sort === 'alpha'    ? [ascDz(comments.text)]
+          :                       [ascDz(comments.severity), descDz(comments.createdAt)];
+
+        const rows = await db.select({
+            id:             comments.id,
+            tenantId:       comments.tenantId,
+            text:           comments.text,
+            category:       comments.category,
+            section:        comments.section,
+            sectionIds:     comments.sectionIds,
+            itemLabels:     comments.itemLabels,
+            itemLabel:      comments.itemLabel,
+            triggerCode:    comments.triggerCode,
+            searchKeywords: comments.searchKeywords,
+            libraryId:      comments.libraryId,
+            severity:       comments.severity,
+            repairSummary:               comments.repairSummary,
+            recommendedContractorTypeId: comments.recommendedContractorTypeId,
+            createdAt:      comments.createdAt,
+            editedAt:       comments.editedAt,
+            importHash:     comments.importHash,
+            useCount:       commentUsage.useCount,
+            lastUsedAt:     commentUsage.lastUsedAt,
+        })
+            .from(comments)
+            .leftJoin(commentUsage, and(
+                eq(commentUsage.commentId, comments.id),
+                eq(commentUsage.tenantId,  tenantId),
+                eq(commentUsage.userId,    userId),
+            ))
+            .where(and(...conditions))
+            .orderBy(...orderByExpr)
+            .limit(pageSize)
+            .offset((page - 1) * pageSize)
+            .all();
+
+        // Total count for pagination meta — exact now that search lives in the
+        // WHERE clause (Track H).
+        const totalRow = await db
+            .select({ c: sqlTpl<number>`count(*)` })
+            .from(comments)
+            .where(and(...conditions))
+            .get();
+        const total = totalRow?.c ?? 0;
+        // `commentRowToResponse` is exported via the local helper above and used
+        // by the create / update routes — we extend in-place at the route to
+        // avoid touching the create / update signatures.
+        const data = rows.map(r => ({
+            ...commentRowToResponse(r),
+            useCount:   r.useCount ?? 0,
+            lastUsedAt: r.lastUsedAt != null ? r.lastUsedAt.toISOString() : null,
+        }));
+        return c.json({
+            success: true as const,
+            data,
+            meta: buildMeta({ total, page, pageSize }),
+        }, 200);
+    })
+    .openapi(createCommentRoute, async (c) => {
+        const tenantId = c.get('tenantId');
+        const { text, category, severity, section, repairSummary, recommendedContractorTypeId } = c.req.valid('json');
+        const db = getDrizzle(c);
+        const row = {
+            id: crypto.randomUUID(),
+            tenantId,
+            text,
+            category: category ?? null,
+            section: section ?? null,
+            // S2-7 — libraryId tracks marketplace provenance; null for tenant-authored.
+            libraryId: null as string | null,
+            sectionIds: null as string | null,
+            itemLabels: null as string | null,
+            triggerCode: null as string | null,
+            searchKeywords: null as string | null,
+            itemLabel: null as string | null,
+            severity: severity ?? null,
+            repairSummary: repairSummary ?? null,
+            recommendedContractorTypeId: recommendedContractorTypeId ?? null,
+            createdAt: new Date(),
+            // #348 — a tenant-authored comment has no import to differ from, and
+            // has not been edited since being written.
+            editedAt: null as Date | null,
+            importHash: null as string | null,
+        };
+        await db.insert(comments).values(row);
+        auditFromContext(c, 'comment.created', 'comment', {
+            entityId: row.id,
+            metadata: { textPreview: text.slice(0, 80) },
+        });
+        return c.json({ success: true as const, data: { comment: commentRowToResponse(row) } }, 201);
+    })
+    .openapi(deleteCommentRoute, async (c) => {
+        const tenantId = c.get('tenantId');
+        const { id } = c.req.valid('param');
+        const db = getDrizzle(c);
+        const existing = await db.select().from(comments)
+            .where(and(eq(comments.id, id), eq(comments.tenantId, tenantId))).get();
+        if (!existing) throw Errors.NotFound('Comment not found');
+        await db.delete(comments).where(and(eq(comments.id, id), eq(comments.tenantId, tenantId)));
+        auditFromContext(c, 'comment.deleted', 'comment', {
+            entityId: id,
+            metadata: { textPreview: (existing.text as string).slice(0, 80) },
+        });
+        return c.json({ success: true }, 200);
+    })
+    .openapi(updateCommentRoute, async (c) => {
+        const tenantId = c.get('tenantId');
+        const { id } = c.req.valid('param');
+        const { text, category, severity, section, repairSummary, recommendedContractorTypeId } = c.req.valid('json');
+        const db = getDrizzle(c);
+        const existing = await db.select().from(comments)
+            .where(and(eq(comments.id, id), eq(comments.tenantId, tenantId))).get();
+        if (!existing) throw Errors.NotFound('Comment not found');
+        const patch: Partial<typeof comments.$inferInsert> = {
+            text,
+            category: category ?? null,
+            severity: severity ?? null,
+            section: section ?? null,
+            // #348 — display marker ("edited 12 March"). Whether a marketplace
+            // re-import may overwrite this row is decided by comparing its text
+            // against comments.import_hash, not by this field, so a write path
+            // that forgets to set it cannot cause an edit to be silently lost.
+            editedAt: new Date(),
+        };
+        if (repairSummary !== undefined) patch.repairSummary = repairSummary ?? null;
+        if (recommendedContractorTypeId !== undefined) patch.recommendedContractorTypeId = recommendedContractorTypeId ?? null;
+        await db.update(comments)
+            .set(patch)
+            .where(and(eq(comments.id, id), eq(comments.tenantId, tenantId)));
+        const updated = { ...existing, ...patch } as typeof comments.$inferSelect;
+        auditFromContext(c, 'comment.updated', 'comment', {
+            entityId: id,
+            metadata: {
+                category: category ?? null,
+                severity: severity ?? null,
+                section: section ?? null,
+                textPreview: text.slice(0, 80),
+            },
+        });
+        return c.json({ success: true as const, data: { comment: commentRowToResponse(updated) } }, 200);
+    })
+    .openapi(touchCommentRoute, async (c) => {
+        const { id } = c.req.valid('param');
+        const tenantId = c.get('tenantId');
+        // Convention in this file: auth middleware stashes the decoded JWT under
+        // the 'user' key with `.sub` as the user id (see lines ~866, ~2169).
+        const userId = c.get('user')?.sub ?? '';
+        if (!userId) throw Errors.Unauthorized();
+        const now = new Date();
+        const db = getDrizzle(c);
+
+        const existing = await db.select().from(commentUsage)
+            .where(and(
+                eq(commentUsage.tenantId,  tenantId),
+                eq(commentUsage.userId,    userId),
+                eq(commentUsage.commentId, id),
+            ))
+            .get();
+
+        if (existing) {
+            const nextCount = existing.useCount + 1;
+            await db.update(commentUsage)
+                .set({ useCount: nextCount, lastUsedAt: now })
+                .where(and(
+                    eq(commentUsage.tenantId,  tenantId),
+                    eq(commentUsage.userId,    userId),
+                    eq(commentUsage.commentId, id),
+                ));
+            return c.json({ success: true as const, data: { commentId: id, useCount: nextCount } }, 200);
+        }
+
+        await db.insert(commentUsage).values({
+            tenantId, userId, commentId: id, useCount: 1, lastUsedAt: now,
+        });
+        return c.json({ success: true as const, data: { commentId: id, useCount: 1 } }, 200);
+    });
+
+export default adminCommentsRoutes;

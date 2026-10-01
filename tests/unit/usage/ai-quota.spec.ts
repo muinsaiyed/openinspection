@@ -1,0 +1,391 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { AIService } from '../../../server/services/ai.service';
+import { createTestDb, setupSchema, toRawD1 } from '../db';
+import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import * as schema from '../../../server/lib/db/schema';
+
+vi.mock('drizzle-orm/d1', () => ({ drizzle: vi.fn() }));
+
+import { drizzle as mockDrizzle } from 'drizzle-orm/d1';
+import { PlanQuotaGuard } from '../../../server/features/plan-quota/guard';
+import { FREE_TIER_CAPS, type AiTierCaps } from '../../../server/features/plan-quota/policy';
+import { buildAiQuotaPreflight } from '../../../server/lib/ai/metering';
+import { MeteringService } from '../../../server/services/metering.service';
+import { aiUsageMetric } from '../../../server/lib/usage/period';
+import { resolveAi, isRefusal } from '../../../server/lib/ai/resolve-provider';
+import { OpenAiCompatibleProvider } from '../../../server/lib/ai/providers/openai-compatible';
+
+/** A real adapter over the mocked `fetch`. The service builds none of its own;
+ *  a construction that omits this refuses to run rather than reaching out. */
+const ADAPTER = () => new OpenAiCompatibleProvider({
+    apiKey: 'a-key', model: 'a-model', baseUrl: 'https://api.example.test/v1',
+});
+import { SAAS_PROFILE } from '../../../server/lib/deployment-profile';
+import { Errors } from '../../../server/lib/errors';
+
+/**
+ * Managed-AI metering and its (currently unconfigured) enforcement path.
+ *
+ * The load-bearing risk here is a false green: with no cap configured, every
+ * `checkAiQuota` call resolves, so a suite that only asserts "resolves" would
+ * pass just as happily against a guard that cannot read the meter at all.
+ * Each no-block assertion below is therefore paired with a configured-cap case
+ * proving the guard DOES see the counter it claims to be ignoring.
+ */
+describe('AI quota + metering', () => {
+    let testDb: BetterSQLite3Database<typeof schema>;
+    let testD1: D1Database;
+    const T = 'tenant-ai';
+
+    beforeEach(async () => {
+        const setup = createTestDb();
+        testDb = setup.db;
+        await setupSchema(setup.sqlite);
+        (mockDrizzle as never as { mockReturnValue: (v: unknown) => void }).mockReturnValue(testDb);
+        testD1 = toRawD1(setup.sqlite);
+    });
+
+    /** Seed in an ADVERSE order — the metric under test written last, and
+     *  interleaved across period buckets — so no assertion can pass by reading
+     *  whichever row happens to come back first. */
+    async function seedAdversely(m: MeteringService) {
+        await m.record(T, 'ai_translate_byo', '2026-06', 9_000);
+        await m.record(T, 'ai_assist', '2026-07', 7_000);
+        await m.record(T, 'ai_assist_byo', '2026-06', 8_000);
+        await m.record(T, 'ai_translate', '2026-05', 4_000);
+        await m.record(T, 'ai_translate', '2026-07', 6_000);
+    }
+
+    describe('metric selection', () => {
+        it('splits translate and assist, and platform from bring-your-own', () => {
+            expect(aiUsageMetric('translate', 'managed')).toBe('ai_translate');
+            expect(aiUsageMetric('translate', 'byo')).toBe('ai_translate_byo');
+            expect(aiUsageMetric('assist', 'managed')).toBe('ai_assist');
+            expect(aiUsageMetric('assist', 'byo')).toBe('ai_assist_byo');
+        });
+
+        it('tags the metric from the same resolver the runtime runs on', () => {
+            // Not a second "is this managed?" test that could disagree with the
+            // credential actually used.
+            const r = resolveAi({ profile: SAAS_PROFILE, aiEnabled: true, tenantKey: 'own-key', managedKey: 'plat', managedEntitled: true, underCap: true, model: 'm' });
+            if (isRefusal(r)) throw new Error('unexpected refusal');
+            expect(aiUsageMetric('assist', r.source)).toBe('ai_assist_byo');
+        });
+    });
+
+    describe('checkAiQuota', () => {
+        it('meters paid managed usage without blocking it — no cap is configured', async () => {
+            // Metering ships before enforcement: any cap chosen today would be
+            // invented, and the metric is cheap to record and expensive to guess.
+            await seedAdversely(new MeteringService(testD1));
+            const g = new PlanQuotaGuard(testD1, { enforced: true, billingPortalUrl: null });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).resolves.toBeUndefined();
+            await expect(g.checkAiQuota(T, 'pro', 'ai_assist')).resolves.toBeUndefined();
+        });
+
+        it('DOES block once a cap is configured — proving the guard can read the meter', async () => {
+            // The control for the test above. Without this, "resolves" proves
+            // nothing: a guard wired to the wrong table would also resolve.
+            await seedAdversely(new MeteringService(testD1));
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: true, billingPortalUrl: 'https://x/billing',
+                aiCaps: { pro: { ai_translate: 10_000 } },
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).rejects.toMatchObject({
+                status: 402,
+                code: 'QUOTA_EXHAUSTED',
+                // 4_000 + 6_000 across two period buckets — the lifetime total,
+                // not whichever bucket sorted first.
+                details: { metric: 'ai_translate', used: 10_000, cap: 10_000 },
+            });
+        });
+
+        it('never counts BYO usage against a configured cap', async () => {
+            // 9_000 of BYO translate volume against a cap of 10 — this can only
+            // pass if the guard reads `ai_translate`, not `ai_translate_byo`.
+            await new MeteringService(testD1).record(T, 'ai_translate_byo', '2026-06', 9_000);
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: true, billingPortalUrl: null, aiCaps: { pro: { ai_translate: 10 } },
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).resolves.toBeUndefined();
+        });
+
+        it('keeps translate and assist independent', async () => {
+            // A shared metric would force one cap to govern two workloads whose
+            // cost profiles differ by an order of magnitude.
+            await seedAdversely(new MeteringService(testD1));
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: true, billingPortalUrl: null, aiCaps: { pro: { ai_assist: 100 } },
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_assist')).rejects.toMatchObject({ code: 'QUOTA_EXHAUSTED' });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).resolves.toBeUndefined();
+        });
+
+        it('applies a cap only to the tier it was configured for', async () => {
+            await seedAdversely(new MeteringService(testD1));
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: true, billingPortalUrl: null, aiCaps: { pro: { ai_translate: 10 } },
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).rejects.toMatchObject({ code: 'QUOTA_EXHAUSTED' });
+            await expect(g.checkAiQuota(T, 'enterprise', 'ai_translate')).resolves.toBeUndefined();
+        });
+
+        it('does not block when enforcement is off (standalone), even with a cap', async () => {
+            await seedAdversely(new MeteringService(testD1));
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: false, billingPortalUrl: null, aiCaps: { pro: { ai_translate: 1 } },
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).resolves.toBeUndefined();
+        });
+
+        /**
+         * The DELIVERED path. Every case above hands the guard a caps OBJECT,
+         * which no production site does — the seven construction sites pass a
+         * LOADER, because two of them (the per-request DI middleware and the
+         * cron tick reused across tenants) must not resolve one tenant's caps
+         * eagerly and hand them to another tenant's check.
+         *
+         * Without these two cases the object-shaped suite above stays green
+         * against a guard that silently ignores a function.
+         */
+        it('enforces caps that arrived as a LOADER, not just as an object', async () => {
+            await seedAdversely(new MeteringService(testD1));
+            const loader = vi.fn(async (tenantId: string) =>
+                tenantId === T ? { pro: { ai_translate: 10_000 } } : undefined);
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: true, billingPortalUrl: null, aiCaps: loader,
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).rejects.toMatchObject({
+                code: 'QUOTA_EXHAUSTED',
+                details: { metric: 'ai_translate', used: 10_000, cap: 10_000 },
+            });
+            // Resolved per check, with the tenant being checked — not once at
+            // construction. This is the assertion that makes the shared cron
+            // guard safe.
+            expect(loader).toHaveBeenCalledWith(T);
+        });
+
+        it('a loader that reports nothing configured enforces nothing', async () => {
+            // The unconfigured production state today: the deployment has been
+            // given no allowance, so AI metering runs and AI enforcement does
+            // not. FREE_TIER_CAPS is untouched by any of this — it governs
+            // inspections/sms/email and carries no AI entry at all, which is
+            // what keeps "no managed allowance" from silently inheriting one.
+            await seedAdversely(new MeteringService(testD1));
+            const g = new PlanQuotaGuard(testD1, {
+                enforced: true, billingPortalUrl: null, aiCaps: async () => undefined,
+            });
+            await expect(g.checkAiQuota(T, 'pro', 'ai_translate')).resolves.toBeUndefined();
+            expect(FREE_TIER_CAPS).not.toHaveProperty('ai_translate');
+            expect(FREE_TIER_CAPS).not.toHaveProperty('ai_assist');
+        });
+    });
+
+    describe('call-site metering', () => {
+        const fetchMock = vi.fn();
+        let originalFetch: typeof globalThis.fetch;
+
+        beforeEach(() => {
+            originalFetch = globalThis.fetch;
+            globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+            fetchMock.mockReset();
+        });
+        afterEach(() => { globalThis.fetch = originalFetch; });
+
+        function service(meter?: { record(kind: 'translate' | 'assist'): Promise<void> }) {
+            // The tenant's own key with a confirmation on file — the only picture
+            // the capability gate lets through, and the service defaults to
+            // fail-closed, so these metering cases must say it. The provenance
+            // sink is supplied for the same reason: the chokepoint refuses a
+            // call it cannot record, and a case that omitted it would stop
+            // saying anything about the METER (see provenance.spec.ts).
+            return new AIService(
+                {} as D1Database, 'a-key', 'saas', 'a-model', meter,
+                { source: 'byo', tenantKeyAttested: true },
+                { record: async () => 'ai-call-row' },
+                undefined,
+                ADAPTER(),
+            );
+        }
+
+        it('records exactly once per successful call, tagged by workload', async () => {
+            fetchMock.mockResolvedValue(new Response(
+                JSON.stringify({ choices: [{ message: { content: 'x' } }] }), { status: 200 },
+            ));
+            const record = vi.fn(async () => {});
+            await service({ record }).generateProfessionalComment('note');
+            expect(record).toHaveBeenCalledTimes(1);
+            expect(record).toHaveBeenCalledWith('assist');
+        });
+
+        it('does NOT meter a failed model call', async () => {
+            // Meter after success, check before: a provider failure must never
+            // consume an allowance it did not spend. AI calls fail more often
+            // than sends, so this ordering matters more here, not less.
+            fetchMock.mockResolvedValue({ ok: false, text: async () => 'rate limited' } as Response);
+            const record = vi.fn(async () => {});
+            await expect(service({ record }).generateProfessionalComment('note')).rejects.toThrow();
+            expect(record).not.toHaveBeenCalled();
+        });
+
+        it('a metering failure never fails the inspector operation', async () => {
+            fetchMock.mockResolvedValue(new Response(
+                JSON.stringify({ choices: [{ message: { content: 'kept' } }] }), { status: 200 },
+            ));
+            const record = vi.fn(async () => { throw new Error('d1 down'); });
+            await expect(service({ record }).generateProfessionalComment('note'))
+                .resolves.toMatchObject({ text: 'kept' });
+        });
+    });
+
+    /**
+     * ENFORCEMENT, at the same chokepoint as the meter.
+     *
+     * `checkAiQuota` was written, tested and delivered caps — and had zero
+     * production callers, so a configured allowance was inert with nothing
+     * anywhere reporting that it was. These cases pin the call itself: check
+     * BEFORE the send, meter AFTER success, and a refusal that reaches the
+     * inspector rather than dissolving into "the model had nothing to say".
+     */
+    describe('enforcement at the chokepoint', () => {
+        const fetchMock = vi.fn();
+        let originalFetch: typeof globalThis.fetch;
+
+        beforeEach(() => {
+            originalFetch = globalThis.fetch;
+            globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+            fetchMock.mockReset();
+            fetchMock.mockResolvedValue(new Response(
+                JSON.stringify({ choices: [{ message: { content: 'x' } }] }), { status: 200 },
+            ));
+        });
+        afterEach(() => { globalThis.fetch = originalFetch; });
+
+        type Kind = 'translate' | 'assist';
+        function service(
+            quota?: { preflight(kind: Kind): Promise<void> },
+            record: (kind: Kind) => Promise<void> = async () => {},
+        ) {
+            return new AIService(
+                {} as D1Database, 'a-key', 'saas', 'a-model', { record },
+                { source: 'byo', tenantKeyAttested: true },
+                { record: async () => 'ai-call-row' },
+                quota,
+                ADAPTER(),
+            );
+        }
+
+        const overAllowance = async () => {
+            throw Errors.QuotaExhausted({ metric: 'ai_assist', used: 10, cap: 10, billingPortalUrl: null });
+        };
+
+        it('runs the pre-flight on every call, and meters only after the send succeeded', async () => {
+            // The POSITIVE control, and the one that actually proves the call
+            // site exists: a suite that only asserted the refusal would pass
+            // against a chokepoint that swallowed the pre-flight entirely.
+            const preflight = vi.fn(async () => {});
+            const record = vi.fn(async () => {});
+            await expect(service({ preflight }, record).generateProfessionalComment('note'))
+                .resolves.toMatchObject({ text: 'x' });
+            expect(preflight).toHaveBeenCalledWith('assist');
+            expect(record).toHaveBeenCalledWith('assist');
+        });
+
+        it('refuses before anything leaves the process when the allowance is spent', async () => {
+            // Check before, meter after — so an over-cap tenant neither reaches
+            // the provider nor consumes a further unit of the allowance.
+            const record = vi.fn(async () => {});
+            await expect(service({ preflight: overAllowance }, record).generateProfessionalComment('note'))
+                .rejects.toMatchObject({ code: 'QUOTA_EXHAUSTED' });
+            expect(fetchMock).not.toHaveBeenCalled();
+            expect(record).not.toHaveBeenCalled();
+        });
+
+        it('a quota refusal reaches the inspector instead of degrading to an empty suggestion list', async () => {
+            // `suggestComment` turns RUNTIME failures into `[]`. A spent
+            // allowance is not a runtime failure, and an empty popover reads as
+            // "the model had nothing to say" — the same invisibility the
+            // configuration check was hoisted out of this try/catch to avoid.
+            await expect(service({ preflight: overAllowance })
+                .suggestComment({ itemName: 'Roof', sectionName: 'Exterior' }))
+                .rejects.toMatchObject({ code: 'QUOTA_EXHAUSTED' });
+        });
+
+        it('no pre-flight supplied — standalone — blocks nothing', async () => {
+            const record = vi.fn(async () => {});
+            await expect(service(undefined, record).generateProfessionalComment('note'))
+                .resolves.toMatchObject({ text: 'x' });
+            expect(record).toHaveBeenCalledWith('assist');
+        });
+    });
+
+    /**
+     * The far end of the same chain: what the chokepoint's pre-flight actually
+     * resolves to. The cases above prove `callGemini` calls it; these prove the
+     * thing it calls reads the delivered allowance for the right tier, off the
+     * right counter.
+     */
+    describe('buildAiQuotaPreflight', () => {
+        const PAID = { tier: 'pro', status: 'active' };
+
+        function guard(aiCaps?: AiTierCaps) {
+            return new PlanQuotaGuard(testD1, { enforced: true, billingPortalUrl: null, aiCaps });
+        }
+
+        it('checks MANAGED volume against the cap configured for the tenant own tier', async () => {
+            await seedAdversely(new MeteringService(testD1));
+            const p = buildAiQuotaPreflight({
+                guard: guard({ pro: { ai_translate: 10_000 } }), tenantId: T, source: 'managed', plan: PAID,
+            });
+            await expect(p!.preflight('translate')).rejects.toMatchObject({
+                code: 'QUOTA_EXHAUSTED',
+                details: { metric: 'ai_translate', used: 10_000, cap: 10_000 },
+            });
+            // The other workload is independent, on the same tenant and the
+            // same seeded counters — so this is not "the guard refuses
+            // everything".
+            await expect(p!.preflight('assist')).resolves.toBeUndefined();
+        });
+
+        it('builds NOTHING for bring-your-own volume — the tenant own bill has no deployment cap', async () => {
+            // Asserting absence, not a permissive answer: a pre-flight that
+            // existed and always passed would look identical from the
+            // chokepoint and would start enforcing the day someone "fixed" it.
+            expect(buildAiQuotaPreflight({
+                guard: guard({ pro: { ai_translate: 1 } }), tenantId: T, source: 'byo', plan: PAID,
+            })).toBeUndefined();
+        });
+
+        it('builds nothing without a guard (standalone) or without a resolved plan', async () => {
+            expect(buildAiQuotaPreflight({
+                guard: undefined, tenantId: T, source: 'managed', plan: PAID,
+            })).toBeUndefined();
+            expect(buildAiQuotaPreflight({
+                guard: guard({ pro: { ai_translate: 1 } }), tenantId: T, source: 'managed', plan: null,
+            })).toBeUndefined();
+        });
+    });
+
+    describe('the free tier', () => {
+        it('never offers managed AI at all — so there is nothing to cap', () => {
+            // The free tier's boundary, expressed where it is actually enforced:
+            // no entitlement, hence no managed credential, hence no platform
+            // cost and no quota machinery.
+            const r = resolveAi({
+                profile: SAAS_PROFILE, aiEnabled: true, tenantKey: null, managedKey: 'plat',
+                managedEntitled: false, underCap: true, model: 'm',
+            });
+            // The refusal NAMES itself now. `unavailable_here` rather than a
+            // cap reason is the point: there is no allowance to be over,
+            // because the free tier is never offered the managed path at all.
+            expect(isRefusal(r) && r.refused).toBe('unavailable_here');
+        });
+
+        it('carries no ai_* entry in FREE_TIER_CAPS', () => {
+            // Assert on the ABSENCE of the keys, not on the object's value:
+            // an equality check would still pass if a cap were added under a
+            // name this test does not mention.
+            expect(Object.keys(FREE_TIER_CAPS).some(k => k.startsWith('ai_'))).toBe(false);
+        });
+    });
+});

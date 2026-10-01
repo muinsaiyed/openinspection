@@ -1,0 +1,350 @@
+/**
+ * Trial Sample-Data Mode (2026-05-20 spec) — starter content seeding.
+ *
+ * Called from the portal's OnboardingWorkflow once a new tenant is
+ * provisioned, this service idempotently populates the tenant with the
+ * tools-only starter content described in the spec:
+ *
+ *   - 3 inspection templates  (Residential / Pre-Listing / Sewer Scope)
+ *   - 1 agreement template    (generic pre-inspection w/ disclaimer)
+ *   - 250 canned comments     (from starter-content/fixtures/canned-comments)
+ *   - 7 event_types           (main visits + the radon pair, mold and water tests)
+ *   - 4 tags                  (Safety concern / Needs maintenance / Cosmetic / Follow-up needed)
+ *   - 80 recommendations      (from server/data/recommendation-seeds.ts)
+ *   - 4 rating systems        (from server/data/rating-system-seeds.ts)
+ *   - 10 contractor types     (standard repair-contractor taxonomy)
+ *   - 7 services              (the catalogue a tenant can actually sell from)
+ *   - N marketplace libraries (global; idempotent at the libraries table)
+ *
+ * "Idempotent" means: safe to call twice — the second call inserts 0 rows
+ * everywhere. Per-table uniqueness key:
+ *
+ *   templates                → (tenantId, name)
+ *   agreements               → (tenantId, name)
+ *   comments                 → (tenantId, category, text)            (text is the natural body)
+ *   event_types              → (tenantId, slug)
+ *   tags                     → (tenantId, name)                       (enforced by uniqueIndex)
+ *   recommendations          → (tenantId, category, name)
+ *   rating_systems           → (tenantId, slug)                       (enforced by uniqueIndex)
+ *   contractor_types         → (tenantId, name)
+ *   services                 → (tenantId, name)
+ *   marketplace_libraries    → (name)                                  (global table — name unique;
+ *                                                                       UPSERT, so a pack whose semver
+ *                                                                       moved is refreshed, not skipped)
+ *
+ * The function never throws on individual-row insert failure unless the
+ * failure indicates a programming bug (schema mismatch, etc.). Existence
+ * checks happen first; insert paths are unconditional.
+ */
+
+import { drizzle } from 'drizzle-orm/d1';
+import { and, eq, isNotNull } from 'drizzle-orm';
+import {
+    templates,
+    agreements,
+    comments,
+    eventTypes,
+    tags,
+    ratingSystems,
+    contractorTypes,
+} from '../lib/db/schema';
+import { logger } from '../lib/logger';
+
+// Spec 4F + design-alignment B+C fix — the "bare" INSPECTION_TEMPLATES
+// fixture in starter-content/fixtures/templates.ts seeds section
+// scaffolding with `items: []`, which leaves users staring at templates
+// that look broken (the templates list shows "0 items" for every row).
+// Swap to the same rich JSON files TemplateSeedService.bulkSeed uses so
+// portal-onboarded tenants get the 40-item Standard Residential, the
+// 21-item Pre-Listing, the 9-item Sewer Scope, etc. Same shape (name +
+// schema), just populated. Idempotent — the loop below skips names that
+// already exist on the tenant.
+import residentialSeed         from '../data/seed-templates/residential.json';
+import preListingSeed          from '../data/seed-templates/pre-listing.json';
+import newConstructionSeed     from '../data/seed-templates/new-construction.json';
+import newConstructionFinalSeed from '../data/seed-templates/new-construction-final.json';
+import sewerScopeSeed          from '../data/seed-templates/sewer-scope.json';
+import radonSeed               from '../data/seed-templates/radon.json';
+import moldInspectionSeed      from '../data/seed-templates/mold-inspection.json';
+const INSPECTION_TEMPLATES = [
+    residentialSeed,
+    preListingSeed,
+    newConstructionSeed,
+    newConstructionFinalSeed,
+    sewerScopeSeed,
+    radonSeed,
+    moldInspectionSeed,
+] as ReadonlyArray<{ name: string; schema: unknown }>;
+import { AGREEMENT_TEMPLATE } from './starter-content/fixtures/agreement-template';
+import { CANNED_COMMENTS } from './starter-content/fixtures/canned-comments';
+import { EVENT_TYPES } from './starter-content/fixtures/event-types';
+import { seedServices } from './starter-content/seed-services';
+import { batchInsert } from './starter-content/batch-insert';
+import { TAGS } from './starter-content/fixtures/tags';
+import { RECOMMENDATIONS } from './starter-content/fixtures/recommendations';
+import { RATING_SYSTEMS } from './starter-content/fixtures/rating-systems';
+import { seedMarketplaceLibraries } from './starter-content/seed-marketplace-libraries';
+import { seedRoleProfiles } from './seed/seed-role-profiles';
+
+import { CONTRACTOR_TYPES } from './starter-content/fixtures/contractor-types';
+
+export interface StarterContentResult {
+    inspectionTemplatesSeeded: number;
+    agreementTemplatesSeeded:  number;
+    cannedCommentsSeeded:      number;
+    eventTypesSeeded:          number;
+    tagsSeeded:                number;
+    recommendationsSeeded:     number;
+    ratingSystemsSeeded:       number;
+    marketplaceLibrariesSeeded: number;
+    contractorTypesSeeded:     number;
+    servicesSeeded:            number;
+}
+
+/**
+ * Idempotently seed starter content into a tenant. Safe to call multiple
+ * times — existing rows (matched per the uniqueness key documented in the
+ * module header) are not duplicated.
+ *
+ * @returns counts of NEW rows inserted (zero on idempotent re-run).
+ */
+export async function seedStarterContent(
+    db: D1Database,
+    tenantId: string,
+): Promise<StarterContentResult> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d = drizzle(db as any);
+
+    // Spec 1 — tenant-configurable people role profiles (idempotent).
+    await seedRoleProfiles(d, tenantId);
+
+    // ── inspection templates ────────────────────────────────────────────
+    let inspectionTemplatesSeeded: number;
+    {
+        const existing = await d.select({ name: templates.name }).from(templates)
+            .where(eq(templates.tenantId, tenantId)).all();
+        const existingNames = new Set(existing.map(r => r.name as string));
+        const rows = INSPECTION_TEMPLATES.filter(t => !existingNames.has(t.name)).map(t => ({
+            id:        crypto.randomUUID(),
+            tenantId,
+            name:      t.name,
+            version:   1,
+            schema:    JSON.stringify(t.schema),
+            createdAt: new Date(),
+        }));
+        await batchInsert(d, templates, rows);
+        inspectionTemplatesSeeded = rows.length;
+    }
+
+    // ── agreement templates ─────────────────────────────────────────────
+    let agreementTemplatesSeeded = 0;
+    {
+        const existing = await d.select({ name: agreements.name }).from(agreements)
+            .where(and(eq(agreements.tenantId, tenantId), eq(agreements.name, AGREEMENT_TEMPLATE.name))).get();
+        if (!existing) {
+            await d.insert(agreements).values({
+                id:        crypto.randomUUID(),
+                tenantId,
+                name:      AGREEMENT_TEMPLATE.name,
+                content:   AGREEMENT_TEMPLATE.content,
+                version:   1,
+                createdAt: new Date(),
+            }).run();
+            agreementTemplatesSeeded = 1;
+        }
+    }
+
+    // ── canned comments ─────────────────────────────────────────────────
+    // Uniqueness key: (category, text) within tenant. The combination is
+    // stable across re-seeds because both fields are immutable in the
+    // fixture.
+    let cannedCommentsSeeded: number;
+    {
+        const existing = await d.select({ category: comments.category, text: comments.text }).from(comments)
+            .where(eq(comments.tenantId, tenantId)).all();
+        const existingKeys = new Set(existing.map(r => `${r.category ?? ''}::${r.text}`));
+        const now = new Date();
+        const rows = CANNED_COMMENTS
+            .filter(c => !existingKeys.has(`${c.category ?? ''}::${c.text}`))
+            .map(c => ({
+                id:           crypto.randomUUID(),
+                tenantId,
+                text:         c.text,
+                category:     c.category,
+                severity:     c.severity,
+                section:      c.category,
+                sectionIds:   null,
+                itemLabels:   null,
+                itemLabel:    c.itemLabel || null,
+                triggerCode:  null,
+                searchKeywords: null,
+                createdAt:    now,
+            }));
+        await batchInsert(d, comments, rows);
+        cannedCommentsSeeded = rows.length;
+    }
+
+    // ── event types ─────────────────────────────────────────────────────
+    let eventTypesSeeded: number;
+    {
+        const existing = await d.select({ slug: eventTypes.slug }).from(eventTypes)
+            .where(eq(eventTypes.tenantId, tenantId)).all();
+        const existingSlugs = new Set(existing.map(r => r.slug as string));
+        const rows = EVENT_TYPES.filter(e => !existingSlugs.has(e.slug)).map(e => ({
+            id:                 crypto.randomUUID(),
+            tenantId,
+            name:               e.name,
+            slug:               e.slug,
+            defaultDurationMin: e.defaultDurationMin,
+            defaultPriceCents:  e.defaultPriceCents,
+            color:              e.color,
+            sortOrder:          e.sortOrder,
+            active:             true,
+            createdAt:          new Date(),
+        }));
+        await batchInsert(d, eventTypes, rows);
+        eventTypesSeeded = rows.length;
+    }
+
+    // ── service catalogue ───────────────────────────────────────────────
+    // Deliberately AFTER templates: each entry resolves its template by name.
+    // Extracted to keep this file under the size ratchet.
+    const servicesSeeded = await seedServices(d, tenantId);
+
+    // ── tags ────────────────────────────────────────────────────────────
+    let tagsSeeded: number;
+    {
+        const existing = await d.select({ name: tags.name }).from(tags)
+            .where(eq(tags.tenantId, tenantId)).all();
+        const existingNames = new Set(existing.map(r => r.name as string));
+        const now = new Date();
+        const rows = TAGS.filter(tag => !existingNames.has(tag.name)).map(tag => ({
+            id:        crypto.randomUUID(),
+            tenantId,
+            name:      tag.name,
+            color:     tag.color,
+            isSeed:    1,
+            createdAt: now,
+        }));
+        await batchInsert(d, tags, rows);
+        tagsSeeded = rows.length;
+    }
+
+    // ── recommendations (repair-item comments) ──────────────────────────
+    // Comments-repair fold (2026-06-12): recommendations are now comments with
+    // repair fields (the `recommendations` table was dropped). Seed them as
+    // repair-item comments — same predicate RecommendationService reads back
+    // (repair_summary IS NOT NULL). Idempotent on (category, text).
+    let recommendationsSeeded: number;
+    {
+        const existing = await d.select({ category: comments.category, name: comments.text })
+            .from(comments).where(and(eq(comments.tenantId, tenantId), isNotNull(comments.repairSummary))).all();
+        const existingKeys = new Set(existing.map(r => `${r.category ?? ''}::${r.name}`));
+        const rows = RECOMMENDATIONS
+            .filter(r => !existingKeys.has(`${r.category ?? ''}::${r.name}`))
+            .map(r => ({
+                id:                crypto.randomUUID(),
+                tenantId,
+                text:              r.name,
+                category:          r.category,
+                severity:          r.severity,
+                repairSummary:     r.defaultRepairSummary,
+                createdAt:         new Date(),
+            }));
+        await batchInsert(d, comments, rows);
+        recommendationsSeeded = rows.length;
+    }
+
+    // ── rating systems ──────────────────────────────────────────────────
+    let ratingSystemsSeeded: number;
+    {
+        const existing = await d.select({ slug: ratingSystems.slug }).from(ratingSystems)
+            .where(eq(ratingSystems.tenantId, tenantId)).all();
+        const existingSlugs = new Set(existing.map(r => r.slug as string));
+        const now = new Date();
+        const rows = RATING_SYSTEMS.filter(rs => !existingSlugs.has(rs.slug)).map(rs => {
+            const levels = rs.levels.map((lvl, idx) => ({
+                id:           crypto.randomUUID(),
+                abbreviation: lvl.abbreviation,
+                label:        lvl.label,
+                color:        lvl.color,
+                severity:     lvl.severity,
+                isDefect:     lvl.isDefect,
+                ...(lvl.pausesAdvance ? { pausesAdvance: true } : {}),
+                ...(lvl.hotkey ? { hotkey: lvl.hotkey } : {}),
+                order: idx,
+            }));
+            return {
+                id:          crypto.randomUUID(),
+                tenantId,
+                name:        rs.name,
+                slug:        rs.slug,
+                description: rs.description,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                levels:      levels as any,
+                isDefault:   rs.isDefault,
+                isSeed:      true,
+                createdAt:   now,
+                updatedAt:   now,
+            };
+        });
+        await batchInsert(d, ratingSystems, rows);
+        ratingSystemsSeeded = rows.length;
+    }
+
+    // ── contractor types ────────────────────────────────────────────────
+    // Standard contractor taxonomy (e.g. "Licensed Electrician") backing the
+    // repair-item contractor dropdown. Idempotent row-by-row, but on TWO
+    // different keys: canonical rows on `trade_slug`, the extras on `name`,
+    // because only the canonical ones have a slug to be keyed on.
+    let contractorTypesSeeded: number;
+    {
+        const existing = await d
+            .select({ name: contractorTypes.name, tradeSlug: contractorTypes.tradeSlug })
+            .from(contractorTypes).where(eq(contractorTypes.tenantId, tenantId)).all();
+        const existingNames = new Set(existing.map(r => r.name as string));
+        // Canonical rows are matched by SLUG, not by name (#277). A workspace that
+        // renamed "Licensed Electrician" to "Our Sparky" still HAS that trade, and
+        // keying on name would seed a second row for it on the next run.
+        // `uq_contractor_types_tenant_trade` now rejects that second row rather
+        // than letting it through, so the cost of getting this wrong is a failed
+        // re-seed, not a silently doubled dropdown. Match on the slug anyway: the
+        // index is the backstop, not the check.
+        const existingSlugs = new Set(existing.map(r => r.tradeSlug).filter(Boolean) as string[]);
+        const now = new Date();
+        const rows = CONTRACTOR_TYPES.filter(ct =>
+            // Extras have no slug to match on, so they fall back to the name.
+            ct.tradeSlug ? !existingSlugs.has(ct.tradeSlug) : !existingNames.has(ct.name),
+        ).map(ct => ({
+            id:        crypto.randomUUID(),
+            tenantId,
+            name:      ct.name,
+            sortOrder: ct.sortOrder,
+            createdAt: now,
+            tradeSlug: ct.tradeSlug,
+        }));
+        await batchInsert(d, contractorTypes, rows);
+        contractorTypesSeeded = rows.length;
+    }
+
+    // ── marketplace libraries (GLOBAL table) ────────────────────────────
+    // The one block with no tenant: `marketplace_libraries` has no `tenant_id`.
+    // It is an UPSERT, not an insert-if-missing, and the reasoning lives beside
+    // the code in `starter-content/seed-marketplace-libraries.ts`.
+    const marketplaceLibrariesSeeded = await seedMarketplaceLibraries(d);
+
+    const result: StarterContentResult = {
+        inspectionTemplatesSeeded,
+        agreementTemplatesSeeded,
+        cannedCommentsSeeded,
+        eventTypesSeeded,
+        tagsSeeded,
+        recommendationsSeeded,
+        ratingSystemsSeeded,
+        marketplaceLibrariesSeeded,
+        contractorTypesSeeded,
+        servicesSeeded,
+    };
+    logger.info('starter-content.seeded', { tenantId, ...result });
+    return result;
+}

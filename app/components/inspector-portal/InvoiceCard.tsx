@@ -1,0 +1,199 @@
+import { useState } from "react";
+import { Card, Button, Modal } from "@core/shared-ui";
+import { BlockHeading } from "./BlockHeading";
+import { GateToggle } from "./GateToggle";
+import { MoneyInput } from "~/components/MoneyInput";
+import { formatCents, type PillTone } from "~/lib/hub-blocks";
+import { useGuardedSubmit } from "~/hooks/useGuardedSubmit";
+import { m } from "~/paraglide/messages";
+import type { action } from "~/routes/inspector-portal";
+
+/**
+ * What this inspection costs and whether it has been paid.
+ *
+ * IA-87 ② — the card showed an amount it could not change. The money authority
+ * chain is invoice > Σ service lines > `inspections.price`, so the editable
+ * thing depends on which tier is in force: with service lines booked, the
+ * Services card owns the figure and this card says so; without them, the base
+ * price is what gets billed, and it is editable here. Offering a "set price"
+ * box that silently loses to a service line would be worse than not offering
+ * one, which is roughly what the report editor's settings sheet was doing.
+ */
+export function InvoiceCard({
+    pill,
+    amountCents,
+    currency,
+    paid,
+    sent,
+    payUrl,
+    hasServiceLines,
+    paymentRequired,
+    basePriceCents,
+    canManagePrice,
+    onRequestPayment,
+}: {
+    /** `detail` carries the one-line money sentence a pill has no room for. */
+    pill: { tone: PillTone; label: string; detail?: string };
+    /** IA-95 — undefined when the caller lacks the `financial` capability. */
+    amountCents: number | undefined;
+    /** The invoice's own ISO 4217 snapshot; every figure on this card uses it. */
+    currency: string | undefined;
+    paid: boolean;
+    sent: boolean;
+    payUrl: string | null | undefined;
+    hasServiceLines: boolean;
+    paymentRequired: boolean;
+    /** IA-95 — undefined when money is redacted. */
+    basePriceCents: number | undefined;
+    canManagePrice: boolean;
+    onRequestPayment: () => void;
+}) {
+    const [priceOpen, setPriceOpen] = useState(false);
+    const [cents, setCents] = useState<number | null>(basePriceCents ?? null);
+    // #106 — this writes the order price, which is what the client is billed.
+    const { fetcher: priceFetcher, submit: submitPrice, busy: pricing } =
+        useGuardedSubmit<typeof action>();
+
+    // The base price only reaches the client when nothing outranks it. Once an
+    // invoice exists the amount is frozen by the invoice; once services are
+    // booked they are the source.
+    const basePriceEditable = canManagePrice && !paid && !sent && !hasServiceLines;
+
+    const priceError =
+        priceFetcher.state === "idle" && priceFetcher.data?.intent === "save-order" && !priceFetcher.data.ok
+            ? priceFetcher.data.error
+            : undefined;
+
+    return (
+        <Card className="p-5">
+            <BlockHeading title={m.inspections_hub_block_invoice()} pill={pill} />
+            {/* IA-95 — an inspector without the financial capability sees the
+                invoice exists and its status, but not the figure. Saying so beats
+                rendering $0.00, which reads as "nothing owed". */}
+            <p className="text-[15px] font-medium text-ih-fg-1 mb-1">
+                {amountCents === undefined ? m.inspections_hub_invoice_hidden() : formatCents(amountCents, { currency })}
+            </p>
+            {/* A partially paid invoice's outstanding balance. The total above is
+                what was billed; this is what is still owed, and without it the
+                only thing the card could say about a partial payment was that one
+                had happened. Absent whenever the number is not knowable. */}
+            {pill.detail && (
+                <p className="text-[12px] font-medium text-ih-watch-fg mb-1">{pill.detail}</p>
+            )}
+            {hasServiceLines && (
+                <p className="text-[11px] text-ih-fg-3 mb-3">{m.inspections_hub_invoice_from_services()}</p>
+            )}
+            {!hasServiceLines && <div className="mb-3" />}
+
+            {priceError && <p className="text-[12px] text-ih-bad-fg mb-2">{priceError}</p>}
+
+            {paid ? (
+                // Paid is terminal — read-only (the pill already shows "Paid").
+                <p className="text-[12px] text-ih-fg-3">{m.inspections_hub_invoice_paid()}</p>
+            ) : (
+                <div className="flex items-center gap-2 flex-wrap">
+                    {/* Asking a client to pay zero is not an action, so it is not
+                        offered. A $0 INVOICE is legitimate — Stripe finalizes a
+                        zero total straight to `paid` without collecting, ISN
+                        stamps PAID on one, and comped work is real — but a
+                        REQUEST to pay nothing is a dead end, and the modal
+                        behind this button gated only on the recipient's email,
+                        never on the amount. Say what to do instead rather than
+                        present a button that goes nowhere.
+
+                        `undefined` is NOT folded in with 0: it means money is
+                        redacted for this viewer (see the prop's own note), and
+                        who may request payment is a permission question this
+                        does not answer. */}
+                    {amountCents === 0 ? (
+                        <p className="text-[12px] text-ih-fg-3">
+                            {m.inspections_hub_invoice_nothing_to_request()}
+                        </p>
+                    ) : (
+                        <Button variant="secondary" size="sm" onClick={onRequestPayment}>
+                            {sent ? m.inspections_hub_invoice_resend() : m.inspections_hub_invoice_request()}
+                        </Button>
+                    )}
+                    {/* IA-34 — the pay page is token-gated; copy the tokenized link the
+                        server built, never a bare `/invoice/:id` (which now 401s). No
+                        link when no primary client email exists to bind a token to. */}
+                    {sent && payUrl && <CopyLinkButton url={payUrl} />}
+                    {basePriceEditable && (
+                        <Button variant="secondary" size="sm" onClick={() => setPriceOpen(true)}>
+                            {m.inspections_hub_invoice_set_amount()}
+                        </Button>
+                    )}
+                </div>
+            )}
+
+            {!paid && (
+                <GateToggle
+                    field="paymentRequired"
+                    checked={paymentRequired}
+                    label={m.inspections_hub_gate_payment()}
+                    testId="hub-gate-payment"
+                />
+            )}
+
+            <Modal
+                open={priceOpen}
+                onClose={() => setPriceOpen(false)}
+                title={m.inspections_hub_invoice_amount_title()}
+                size="sm"
+                footer={
+                    <>
+                        <Button variant="secondary" size="sm" onClick={() => setPriceOpen(false)}>
+                            {m.common_cancel()}
+                        </Button>
+                        <Button
+                            variant="primary"
+                            size="sm"
+                            disabled={pricing}
+                            onClick={() => {
+                                // Close only on a call the guard accepted.
+                                if (
+                                    submitPrice(
+                                        {
+                                            intent: "save-order",
+                                            payload: JSON.stringify({ price: cents ?? 0 }),
+                                        },
+                                        { method: "post" },
+                                    )
+                                ) {
+                                    setPriceOpen(false);
+                                }
+                            }}
+                        >
+                            {m.common_save()}
+                        </Button>
+                    </>
+                }
+            >
+                <MoneyInput
+                    cents={cents}
+                    onChange={setCents}
+                    className="w-full h-10 px-3 rounded-md border border-ih-border bg-ih-bg-card text-ih-fg-1 text-[14px] font-medium focus:border-ih-primary focus:shadow-ih-focus outline-none"
+                    ariaLabel={m.inspections_hub_invoice_amount_title()}
+                />
+                <p className="mt-2 text-[11px] text-ih-fg-3">{m.inspections_hub_invoice_amount_hint()}</p>
+            </Modal>
+        </Card>
+    );
+}
+
+/** Copies a public link to the clipboard with a transient "Copied" state. */
+function CopyLinkButton({ url }: { url: string }) {
+    const [copied, setCopied] = useState(false);
+    const onCopy = () => {
+        const absolute = typeof window !== "undefined" ? `${window.location.origin}${url}` : url;
+        void navigator.clipboard?.writeText(absolute).then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+        });
+    };
+    return (
+        <Button variant="secondary" size="sm" onClick={onCopy}>
+            {copied ? m.inspections_hub_copied() : m.inspections_hub_copy_link()}
+        </Button>
+    );
+}

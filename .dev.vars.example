@@ -1,0 +1,69 @@
+# Copy this file to .dev.vars for local development
+# .dev.vars is gitignored and must never be committed
+
+# Required for first-time setup: the code you enter at /setup to create the first
+# admin account. Choose any value with AT LEAST 6 characters. In the one-click
+# deploy wizard this shows up as a secret field — set it there. You can also add
+# or change it later in the dashboard (Settings -> Variables and Secrets) or via
+# `wrangler secret put SETUP_CODE`.
+SETUP_CODE=change-me-6-chars-min
+
+# Optional: JWT signing secret. On deploy it is auto-generated if unset
+# (scripts/ensure-jwt-secrets.mjs); set this only to pin a specific value.
+JWT_SECRET=your-jwt-secret-here
+
+# Optional: signing secret for the React Router `__session` cookie. Left unset,
+# it is DERIVED from JWT_SECRET (PBKDF2, distinct salt), so there is nothing to
+# configure for a normal deploy. Set it only to rotate the cookie secret
+# independently of JWT_SECRET. There is no default value: if neither this nor
+# JWT_SECRET is available, signing a session cookie is refused rather than
+# falling back to a constant.
+# SESSION_SECRET=
+
+# Optional: Resend API key for sending report emails to clients
+RESEND_API_KEY=re_your_api_key_here
+
+# Optional: The "from" address for outgoing report emails
+# Must be a verified sender domain in your Resend account
+SENDER_EMAIL=Your Business <reports@yourdomain.com>
+
+# AI-assisted report writing (Google Gemini) is bring-your-own-key: configure it
+# per workspace inside the app under Settings → Advanced → AI. It is NOT read from
+# an env var — each workspace binds its own Gemini key (SaaS and standalone alike).
+
+# Optional: Stripe keys for real payment checkout on inspection reports
+# Leave blank or use the placeholder value to use the mock checkout in local dev
+STRIPE_SECRET_KEY=sk_test_your_stripe_secret_key_here
+STRIPE_WEBHOOK_SECRET=whsec_your_stripe_webhook_secret_here
+
+# Optional: Cloudflare Turnstile bot protection on the public booking form
+# Get your keys at dash.cloudflare.com → Turnstile
+# The values below are Cloudflare's official test keys (always pass in local dev)
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+
+# Optional: Google Calendar OAuth — lets inspectors sync availability from Google Calendar
+# Create credentials at console.cloud.google.com → APIs & Services → Credentials → OAuth 2.0 Client
+# Authorized redirect URI: https://your-core-domain.workers.dev/api/calendar/callback
+GOOGLE_CLIENT_ID=your_google_client_id_here
+GOOGLE_CLIENT_SECRET=your_google_client_secret_here
+
+# Optional: Public base URL for this worker (OAuth redirects, email links,
+# hosted Privacy/Terms absolute URLs, sidebar legal links). Must match the
+# origin you open in the browser — including port (wrangler often uses 8787
+# or 8788). Without this, in-process API calls may emit `http://localhost/...`
+# without a port and TFV / footer links break locally.
+APP_BASE_URL=http://127.0.0.1:8787
+
+# Optional: Legal document links (self-host operators). When either URL is set, account-creating
+# public forms (agent signup, guest join) require an acceptance checkbox, and the acceptance blob
+# (URL + timestamp + IP + country) is stored on the user row. Unset = feature is entirely off.
+# TERMS_URL / PRIVACY_URL removed — configure per-tenant Privacy & Terms in
+# Settings → Compliance (hosted /legal/:slug/… or custom website URLs).
+
+# Integration tests only: a pre-obtained Google OAuth refresh token for a test Google account.
+# Used by npm run test:integration to seed the DB and test POST /api/calendar/sync end-to-end.
+# Obtain by completing the Google OAuth flow (/api/calendar/connect) — credentials
+# are stored encrypted in calendar_connections (not on the users row).
+# For integration tests, set INTEGRATION_GOOGLE_REFRESH_TOKEN directly (see core.integration.spec.ts).
+INTEGRATION_GOOGLE_REFRESH_TOKEN=your_test_google_refresh_token_here

@@ -1,0 +1,122 @@
+#!/usr/bin/env node
+/**
+ * i18n formatting gate.
+ *
+ * Phase A routed every user-facing date/time/number/currency render through the
+ * shared locale-aware formatter (app/lib/format.ts + server/lib/format.ts), driven
+ * by the viewer's effective locale/timezone/currency. This gate stops NEW hardcoded
+ * `en-US` formatting from creeping back in: such a call ignores the tenant/user
+ * locale, so a Spanish viewer silently gets English output.
+ *
+ * Flags a hardcoded English locale passed to a runtime formatter:
+ *   `.toLocaleDateString('en-US', …)` / `.toLocaleTimeString('en-US', …)` /
+ *   `.toLocaleString('en-US', …)` and `Intl.DateTimeFormat('en-US', …)` /
+ *   `Intl.NumberFormat('en-US', …)`.
+ *
+ * AND the mirror-image defect (#270): a date formatted with NO locale at all —
+ * `d.toLocaleDateString()` / `(undefined, …)`. An earlier revision of this file
+ * called that "already viewer-responsive; not this gate's target". It is not:
+ * the argument-less form reads `navigator.language` AND the browser's timezone,
+ * neither of which is the tenant's or the user's configured preference, so such
+ * a call renders a date that disagrees with every other date on the same page.
+ * That is not theoretical — `SmsConsentBlock` printed a Chinese date inside an
+ * otherwise-English page, caught only in Chrome. Both halves of the rule live
+ * here rather than one of them living in `lint:tz`, because two gates demanding
+ * different things of one line is how a fix gets reverted by the other gate.
+ *
+ * A line opts out with a trailing — or immediately preceding — `// i18n-lint-ok:
+ * <reason>` comment (e.g. a locale-neutral offset computation).
+ */
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+
+const TO_LOCALE = /\.toLocale(Date|Time|)String\(\s*['"]en-US['"]/;
+const INTL = /Intl\.(DateTime|Number)Format\(\s*['"]en-US['"]/;
+
+// `.toLocaleDateString()` / `.toLocaleTimeString(undefined, …)` — unambiguously
+// a date, and unambiguously nobody's configured locale.
+const NO_LOCALE_DATE = /\.toLocale(Date|Time)String\(\s*(\)|undefined\b)/;
+// `.toLocaleString()` is overloaded: on a Number it is currency/number
+// formatting, which is a different gate's concern. Anchoring on the `new Date(…)`
+// receiver keeps `(cents / 100).toLocaleString()` out of it. The cost is that a
+// Date held in a variable slips through — the receiver's type is not knowable
+// from a line of text, and a false positive on every number would get the whole
+// rule switched off.
+const NO_LOCALE_DATE_OBJ = /new Date\(.*\)\.toLocaleString\(\s*(\)|undefined\b)/;
+
+/** Prose describing the bad pattern is not the bad pattern. */
+const COMMENT_LINE = /^\s*(\/\/|\*|\/\*)/;
+
+/** @returns {string[]} human-readable violation messages */
+export function findI18nViolations(source, filename) {
+  const out = [];
+  const lines = source.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/i18n-lint-ok:/.test(line) || /i18n-lint-ok:/.test(lines[i - 1] ?? '')) continue;
+    if (TO_LOCALE.test(line) || INTL.test(line)) {
+      out.push(
+        `${filename}:${i + 1} hardcodes the 'en-US' locale in a formatter; ` +
+          `route through the shared formatter with the viewer's effective locale ` +
+          `(useDisplayLocale / resolveLocale), or annotate '// i18n-lint-ok: <reason>'`,
+      );
+      continue;
+    }
+    if (COMMENT_LINE.test(line)) continue;
+    if (NO_LOCALE_DATE.test(line) || NO_LOCALE_DATE_OBJ.test(line)) {
+      out.push(
+        `${filename}:${i + 1} formats a date with no locale, so it reads the ` +
+          `BROWSER's locale and timezone rather than the tenant's or the user's ` +
+          `(#270); use app/lib/format-date.ts (formatShapedDate / ` +
+          `formatShapedDateTime / formatInspectionDateTime) with a resolved ` +
+          `locale, zone and shape, or annotate '// i18n-lint-ok: <reason>'`,
+      );
+    }
+  }
+  return out;
+}
+
+// Scan app/ + server/. Exclude the formatter modules themselves (the canonical
+// en-US default lives there), the tz-offset picker labels (locale-neutral by
+// design), and tz.ts (Intl.DateTimeFormat('en-US') is offset math, not content).
+const SCOPE = ['app', 'server'];
+const EXCLUDE = [
+  'app/lib/format.ts',
+  'app/lib/format-date.ts',
+  'server/lib/format.ts',
+  'server/lib/tz.ts',
+  'app/lib/timezones.ts',
+];
+
+function collectFiles(path) {
+  const out = [];
+  let stat;
+  try {
+    stat = statSync(path);
+  } catch {
+    return out;
+  }
+  if (stat.isFile()) {
+    const norm = path.replace(/\\/g, '/');
+    if (!/\.(ts|tsx)$/.test(path)) return out;
+    if (/\.(test|spec)\.(ts|tsx)$/.test(path)) return out;
+    if (EXCLUDE.some((e) => norm.endsWith(e))) return out;
+    out.push(path);
+    return out;
+  }
+  for (const entry of readdirSync(path)) out.push(...collectFiles(join(path, entry)));
+  return out;
+}
+
+// CLI
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  const files = SCOPE.flatMap(collectFiles);
+  let violations = [];
+  for (const f of files) violations = violations.concat(findI18nViolations(readFileSync(f, 'utf8'), f));
+  if (violations.length) {
+    console.error('i18n gate FAILED:\n' + violations.join('\n'));
+    process.exit(1);
+  }
+  console.log(`i18n gate OK (${files.length} files scanned)`);
+}

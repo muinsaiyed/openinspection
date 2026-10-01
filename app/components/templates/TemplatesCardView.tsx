@@ -1,0 +1,126 @@
+import { Link } from "react-router";
+import { Icon } from "@core/shared-ui";
+import { TemplateIcon } from "./TemplateIcon";
+import { countItems, type Template } from "./types";
+import { importEntryHref } from "~/lib/import-entry-points";
+import { m } from "~/paraglide/messages";
+
+interface TemplatesCardViewProps {
+  filtered: Template[];
+  searchQuery: string;
+  setCreateOpen: (open: boolean) => void;
+  handleDuplicate: (t: Template) => void;
+  setDeleteConfirm: (id: string | null) => void;
+  /** Same three the list view takes, from the same source (#307). The two views
+   *  are the pair this repo keeps half-fixing, so they change together. */
+  canCreate: boolean;
+  /** Whether to offer the import entrance at all — the wizard link is
+   *  hidden rather than disabled, matching the page header. */
+  canImport: boolean;
+  canDelete: boolean;
+}
+
+export function TemplatesCardView({
+  filtered,
+  searchQuery,
+  setCreateOpen,
+  handleDuplicate,
+  setDeleteConfirm,
+  canCreate,
+  canImport,
+  canDelete,
+}: TemplatesCardViewProps) {
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      {filtered.length === 0 ? (
+        <div className="col-span-full py-16 bg-ih-bg-card rounded-lg border border-ih-border flex flex-col items-center gap-4">
+          {searchQuery ? (
+            <>
+              <p className="font-semibold text-ih-fg-2">{m.templates_card_empty_search_title()}</p>
+              <p className="text-[13px] text-ih-fg-3">{m.templates_card_empty_search_body()}</p>
+            </>
+          ) : (
+            <>
+              <div className="w-12 h-12 rounded-xl bg-ih-primary-tint flex items-center justify-center text-ih-primary-text">
+                <TemplateIcon size="lg" />
+              </div>
+              <div className="text-center">
+                <p className="text-[15px] font-bold text-ih-fg-1">{m.templates_empty_title()}</p>
+                <p className="text-[13px] text-ih-fg-3 mt-1 max-w-xs">
+                  {m.templates_empty_body()}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {canImport && (
+                  // Same address as the page header's control, from the same
+                  // builder. This empty state is where a person with no
+                  // templates starts, so it is the entrance most likely to be
+                  // the FIRST one used and the one most easily left behind.
+                  <Link
+                    to={importEntryHref("templates.create")}
+                    className="h-9 px-4 rounded-md bg-ih-primary text-ih-fg-inverse font-bold text-[13px] hover:bg-ih-primary-600 inline-flex items-center gap-2"
+                  >
+                    <Icon name="download" size={16} strokeWidth={1.75} />
+                    {m.templates_action_import()}
+                  </Link>
+                )}
+                {canCreate && (
+                  <button
+                    onClick={() => setCreateOpen(true)}
+                    className="h-9 px-3 rounded-md border border-ih-border text-[13px] font-bold text-ih-fg-3 hover:bg-ih-bg-muted inline-flex items-center gap-2"
+                  >
+                    {m.templates_empty_new()}
+                  </button>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      ) : (
+        filtered.map((t) => {
+          const items = countItems(t);
+          return (
+            <div
+              key={t.id}
+              className="bg-ih-bg-card border border-ih-border rounded-lg p-3 flex flex-col gap-2 hover:border-ih-primary transition-colors"
+            >
+              <div>
+                <Link to={`/templates/${t.id}/edit`} className="text-[14px] font-bold text-ih-fg-1 hover:text-ih-primary-text transition-colors">
+                  {t.name}
+                </Link>
+                {t.description && (
+                  <p className="text-[11px] text-ih-fg-3 line-clamp-2 mt-1">{t.description}</p>
+                )}
+              </div>
+              <div className="flex items-center gap-2 text-[10px] font-mono text-ih-fg-3">
+                <span className="inline-flex items-center rounded border border-ih-primary/20 px-1.5 py-0.5 bg-ih-primary-tint text-ih-primary-text">
+                  v{t.version || 1}.0
+                </span>
+                <span>{m.templates_row_items({ count: items })}</span>
+                <span>{m.templates_card_used({ count: t.usageCount || 0 })}</span>
+                {t.source === "marketplace" && (
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-ih-info-fg bg-ih-info-bg px-1 py-0.5 rounded">{m.templates_card_badge_mp()}</span>
+                )}
+              </div>
+              <div className="flex items-center gap-3 pt-1 border-t border-ih-border mt-auto">
+                <Link to={`/templates/${t.id}/edit`} className="text-[11px] font-bold text-ih-primary-text hover:text-ih-primary-text transition-colors">
+                  {m.common_edit()}
+                </Link>
+                {canCreate && (
+                  <button onClick={() => handleDuplicate(t)} className="text-[11px] font-bold text-ih-fg-3 hover:text-ih-primary-text transition-colors">
+                    {m.templates_action_duplicate()}
+                  </button>
+                )}
+                {canDelete && (
+                  <button onClick={() => setDeleteConfirm(t.id)} className="text-[11px] font-bold text-ih-fg-3 hover:text-ih-bad-fg transition-colors ml-auto">
+                    {m.common_delete()}
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}

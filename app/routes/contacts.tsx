@@ -1,0 +1,318 @@
+import { useState, useEffect } from "react";
+import { Link, useLoaderData, useFetcher, useSearchParams } from "react-router";
+import { parseWithZod } from "@conform-to/zod/v4";
+import type { Route } from "./+types/contacts";
+import { requireToken } from "~/lib/session.server";
+import { createApi } from "~/lib/api-client.server";
+import { makeAddContactSchema } from "~/lib/forms/contacts.schema";
+import { importEntryHref } from "~/lib/import-entry-points";
+import { PageHeader, Button, Select } from "@core/shared-ui";
+import type { Contact } from "~/components/contacts/contacts-helpers";
+import { ContactModal } from "~/components/contacts/ContactModal";
+import { ContactsTable } from "~/components/contacts/ContactsTable";
+import { ConfirmDialog } from "~/components/ConfirmDialog";
+import { useGuardedSubmit } from "~/hooks/useGuardedSubmit";
+import { ROLE_KINDS, type RoleKind } from "../../server/lib/people/role-kinds";
+import { m } from "~/paraglide/messages";
+
+/**
+ * The filter dropdown's label per contact type.
+ *
+ * A `Record<RoleKind, …>`, so a fourth kind is a COMPILE error here rather than
+ * an option quietly missing from the filter — which is the shape of the bug
+ * IA-96 fixed the last time this list and `contact_role_profiles.kind`
+ * disagreed: a person filed under a contractor/other role showed up as a
+ * Client because the type had only two values. Labels cannot be derived (each
+ * is its own translated string), but completeness can be enforced.
+ */
+const TYPE_FILTER_LABEL: Record<RoleKind, () => string> = {
+  client: () => m.contacts_label_clients(),
+  agent: () => m.contacts_label_agents(),
+  other: () => m.contacts_label_other(),
+};
+
+export function meta() {
+  return [{ title: m.contacts_meta_title() }];
+}
+
+export async function loader({ request, context }: Route.LoaderArgs) {
+  const token = await requireToken(context, request);
+  const url = new URL(request.url);
+  const filterType = url.searchParams.get("type") || "";
+  // IA-120 — a SERVER-side axis, unlike `?type=` below: archived rows are not
+  // in the default payload at all, so switching this genuinely needs a refetch.
+  const archivedView = url.searchParams.get("archived") === "only";
+  const api = createApi(context, { token });
+
+  try {
+    // Always fetch the FULL contact list regardless of the URL `?type=`
+    // filter: the dropdown narrows it client-side, so a server-side filter
+    // would make switching the dropdown a round trip that returns nothing for
+    // the other types. `filterType` seeds the dropdown so a deep link still
+    // lands where it promised.
+    const contactsRes = await api.contacts.index.$get({
+      query: archivedView ? { archived: "only" } : {},
+    });
+    const contactsBody = contactsRes.ok ? ((await contactsRes.json()) as Record<string, unknown>) : { data: [] };
+    return { contacts: (contactsBody.data ?? []) as Contact[], filterType, archivedView };
+  } catch {
+    return { contacts: [] as Contact[], filterType: "", archivedView };
+  }
+}
+
+/**
+ * IA-100 — the archive dialog fetches the contact's live-link count when it
+ * opens, rather than the list loading one per row up front. A contacts page
+ * with 200 rows would otherwise pay 200 queries to answer a question asked
+ * about one of them.
+ */
+function useLiveAccess(contact: Contact | null) {
+  const fetcher = useFetcher<{ access?: unknown[]; archiveRevokesAccess?: boolean }>();
+  const id = contact?.id;
+  useEffect(() => {
+    if (id) fetcher.load(`/resources/contact-access?id=${id}`);
+    // fetcher is stable per instance; re-running on it would loop.
+  }, [id]);
+  return {
+    count: id ? (fetcher.data?.access?.length ?? 0) : 0,
+    revokesOnArchive: fetcher.data?.archiveRevokesAccess ?? false,
+  };
+}
+
+export async function action({ request, context }: Route.ActionArgs) {
+  const token = await requireToken(context, request);
+  const form = await request.formData();
+  const intent = form.get("intent") as string;
+
+  const api = createApi(context, { token });
+
+  if (intent === "create" || intent === "update") {
+    const id = form.get("id") as string | null;
+    const submission = parseWithZod(form, { schema: makeAddContactSchema() });
+    if (submission.status !== "success") {
+      return submission.reply();
+    }
+    const { type, name, email, phone, agency, locale } = submission.value;
+    const body = {
+      name,
+      email: email ?? null,
+      phone: phone || null,
+      agency: agency || null,
+      type,
+      // The modal always renders the whole record, so an empty selection here
+      // is a deliberate "not set" and has to travel as an explicit null —
+      // omitting the key would leave a stored preference in place and make the
+      // control look broken. The API only clears when the key is present.
+      locale: locale || null,
+    };
+    const res = id
+      ? await api.contacts[":id"].$put({ param: { id }, json: body })
+      : await api.contacts.index.$post({ json: body });
+    return { ok: res.ok };
+  }
+
+  if (intent === "delete") {
+    const id = form.get("id") as string;
+    const res = await api.contacts[":id"].$delete({ param: { id } });
+    return { ok: res.ok };
+  }
+
+  if (intent === "restore") {
+    const id = form.get("id") as string;
+    const restore = api.contacts[":id"].restore.$post as unknown as
+      (args: { param: { id: string } }) => Promise<Response>;
+    const res = await restore({ param: { id } });
+    return { ok: res.ok };
+  }
+
+  // The `csv-import` and `csv-preview` intents are gone with the modal that
+  // was their only caller. Bringing a contact list over is one run at
+  // `/settings/imports?intent=contacts.import`: the operator says which column
+  // holds what instead of a header match guessing it, and the run can be
+  // reviewed, repaired and undone. The mapping helper this page used to call
+  // went with them.
+
+  // The `role-*` intents moved to routes/settings-inspection-roles.tsx with
+  // the table itself (IA-96). They are gone from here rather than kept as
+  // dead branches: this route is reachable by any authenticated user, and the
+  // new home gates on `requireAdminLoader`.
+
+  return { ok: false };
+}
+
+export default function ContactsPage() {
+  const { contacts, filterType, archivedView } = useLoaderData<typeof loader>();
+  const contactList = contacts as Contact[];
+  const [searchParams, setSearchParams] = useSearchParams();
+  // F65 — `?new=1` opens the add-contact dialog. The command palette's "New
+  // Contact" action has addressed this page that way all along and nothing read
+  // the parameter, so the action landed on the list and stopped. Read at mount
+  // rather than in an effect, so the dialog is there in the first paint instead
+  // of appearing a frame later.
+  const [modalOpen, setModalOpen] = useState(searchParams.get("new") === "1");
+  const [editContact, setEditContact] = useState<Contact | null>(null);
+  const [typeFilter, setTypeFilter] = useState(filterType || "");
+  const [pendingArchive, setPendingArchive] = useState<Contact | null>(null);
+  // #106 - archiving a contact can revoke every report they can still open,
+  // and restore puts it back. One guard: both fire from row controls that
+  // are disabled while it is busy.
+  const { submit: submitArchive, busy: archiveBusy } = useGuardedSubmit<{ ok?: boolean }>();
+  // IA-100 — how many reports this person can still open, fetched only for the
+  // contact actually being archived, plus whether this tenant treats archiving
+  // as revoking.
+  const { count: pendingAccessCount, revokesOnArchive: archiveRevokesAccess } = useLiveAccess(pendingArchive);
+
+  const openEdit = (c: Contact) => { setEditContact(c); setModalOpen(true); };
+  const restore = (c: Contact) =>
+    submitArchive({ intent: "restore", id: c.id }, { method: "post" });
+  const confirmArchive = () => {
+    if (pendingArchive) {
+      // Keep the confirmation open when the guard refuses.
+      if (submitArchive({ intent: "delete", id: pendingArchive.id }, { method: "post" })) {
+        setPendingArchive(null);
+      }
+    }
+  };
+
+  const filtered = typeFilter
+    ? contactList.filter((c) => c.type === typeFilter)
+    : contactList;
+
+  // IA-96 — the page used to carry three tabs. "Agents" was the same list as
+  // "Contacts" narrowed to `type === 'agent'`, which the type dropdown beside
+  // it already did — a superset and its own subset presented as peers, with a
+  // filter whose scope nobody could guess. "Roles" was not a list of people at
+  // all; it moved to Settings → Inspection roles.
+  //
+  // What is left is one list and one filter. The count follows the filter, so
+  // the meta line says what is being shown AND out of how many — otherwise a
+  // filtered page just looks like a small address book.
+  // "1 contacts" read off the page. Two keys rather than a `{plural}` suffix:
+  // Spanish changes the stem on some of these nouns, not just the tail, and the
+  // /invoices header already settled on this shape.
+  const totalLabel = `${contactList.length} ${
+    contactList.length === 1 ? m.contacts_list_meta_count_singular() : m.contacts_list_meta_count_plural()
+  }`;
+  const metaLine = typeFilter
+    ? `${m.contacts_list_meta_showing({ count: filtered.length })} · ${totalLabel}`
+    : totalLabel;
+
+  return (
+    <div className="space-y-ih-list">
+      <PageHeader
+        title={m.contacts_label_contacts()}
+        meta={metaLine}
+        actions={
+          <>
+            {/* IA-120 — Active/Archived is a SERVER round trip (archived rows
+                are not in the default payload), so it drives the URL rather
+                than local state. The type dropdown beside it stays client-side;
+                two filters, two mechanisms, because they are two different
+                questions. */}
+            <div className="w-[120px]">
+              <Select
+                bare
+                aria-label={m.contacts_filter_status_aria()}
+                value={archivedView ? "only" : ""}
+                onChange={(e) => {
+                  const next = new URLSearchParams(searchParams);
+                  if (e.target.value === "only") next.set("archived", "only");
+                  else next.delete("archived");
+                  setSearchParams(next);
+                }}
+                options={[
+                  { value: "", label: m.contacts_filter_status_active() },
+                  { value: "only", label: m.contacts_filter_status_archived() },
+                ]}
+              />
+            </div>
+            <div className="w-[130px]">
+              <Select
+                bare
+                aria-label={m.contacts_filter_type_aria()}
+                value={typeFilter}
+                onChange={(e) => setTypeFilter(e.target.value)}
+                options={[
+                  { value: "", label: m.contacts_filter_all_types() },
+                  // Offered in vocabulary order, from the vocabulary itself —
+                  // see TYPE_FILTER_LABEL above for why the labels sit in a
+                  // Record rather than being listed here.
+                  ...ROLE_KINDS.map((kind) => ({ value: kind, label: TYPE_FILTER_LABEL[kind]() })),
+                ]}
+              />
+            </div>
+            {/* One front door, addressed through `importEntryHref` so this
+                control and every other entrance to the wizard cannot drift
+                into two spellings of the same query string. It is a LINK, not
+                a button: what it opens is a page with its own address that
+                survives a reload, which the modal it replaced did not. */}
+            <Link
+              to={importEntryHref("contacts.import")}
+              className="h-9 px-3 rounded-md border border-ih-border text-[13px] font-medium text-ih-fg-2 hover:bg-ih-bg-muted inline-flex items-center"
+            >
+              {m.contacts_action_import()}
+            </Link>
+            <Button variant="primary" onClick={() => { setEditContact(null); setModalOpen(true); }} icon={<PlusIcon />}>
+              {m.contacts_action_add()}
+            </Button>
+          </>
+        }
+      />
+
+      <ContactsTable
+        filtered={filtered}
+        onEdit={openEdit}
+        onArchive={setPendingArchive}
+        onRestore={restore}
+        archivedView={archivedView}
+      />
+
+      {/* Closing drops `?new=1` with it: the parameter is an instruction that
+          has been carried out, and leaving it in the address reopens the dialog
+          on every reload and on Back. */}
+      <ContactModal
+        open={modalOpen}
+        onClose={() => {
+          setModalOpen(false);
+          if (searchParams.get("new")) {
+            const next = new URLSearchParams(searchParams);
+            next.delete("new");
+            setSearchParams(next, { replace: true, preventScrollReset: true });
+          }
+        }}
+        contact={editContact}
+      />
+
+      {/* IA-100 — say what archiving does and does not withdraw. A report link
+          is a per-inspection token that works with no account, so archiving
+          the contact does not touch it unless the tenant opted in. Operators
+          were reading "archive" as "cut off", which it was not. */}
+      <ConfirmDialog
+        open={pendingArchive !== null}
+        title={m.contacts_archive_title()}
+        message={
+          pendingAccessCount > 0
+            ? `${m.contacts_archive_confirm()} ${
+                archiveRevokesAccess
+                  ? m.contacts_archive_access_warning_revoking({ count: pendingAccessCount })
+                  : m.contacts_archive_access_warning({ count: pendingAccessCount })
+              }`
+            : m.contacts_archive_confirm()
+        }
+        confirmLabel={m.contacts_action_archive()}
+        tone="default"
+        busy={archiveBusy}
+        onConfirm={confirmArchive}
+        onCancel={() => setPendingArchive(null)}
+      />
+    </div>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+    </svg>
+  );
+}

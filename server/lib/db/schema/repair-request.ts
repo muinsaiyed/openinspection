@@ -1,0 +1,131 @@
+import { sqliteTable, text, integer, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { REPAIR_ACTION_TAGS } from '../../repair-action-tag';
+import { REPAIR_CREATOR_KINDS } from '../../people/role-kinds';
+
+/** A buyer/agent/inspector-built repair-request list for a published report.
+ * Multiple lists may exist per inspection (one+ per creator) — Spectora parity. */
+export const repairRequests = sqliteTable('repair_requests', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull(),
+  inspectionId: text('inspection_id').notNull(),
+  // With `created_by_ref`, the list's OWNER identity: `listMine` filters on the
+  // pair and `assertCanEdit` refuses on a mismatch of either, so this is an
+  // authorization input, not a label. Also the Pill on the inspector's log entry.
+  //
+  // `REPAIR_CREATOR_KINDS` and not `ROLE_KINDS`: this vocabulary crosses the
+  // two axes on purpose (two contact-party kinds plus the staff seat) and
+  // omits `other` on purpose (`repair-access.ts` gives an attorney/title-company
+  // grant no builder role at all). The reason lives at the declaration in
+  // `server/lib/people/role-kinds.ts`; do not widen it here.
+  createdByKind: text('created_by_kind', { enum: REPAIR_CREATOR_KINDS }).notNull(),
+  // WHO built this list, as resolved by `repair-access.ts`. NOT an opaque id:
+  // on the portal-token path (how a client always arrives, and most agents) it
+  // is the recipient's EMAIL ADDRESS. It is a userId only for the owner-preview
+  // inspector and for an agent on a logged-in agent-portal session, and the raw
+  // token string for the legacy KV agent link. Personal data in the common
+  // case, which is why it carries an erasure rule (erasure-manifest.ts).
+  createdByRef: text('created_by_ref').notNull(),
+  // Document-level intro the creator writes (set and cleared by `setIntro`),
+  // shown above the item list on the public share page and in the inspector's
+  // repair-request log. NULL = the list opens straight into items.
+  customIntro: text('custom_intro'),
+  // The bearer credential for `/repair-request/<token>`: the share view, its PDF
+  // and the share email authenticate on this ALONE — no session, no tenant in
+  // the path — which is why it is uniquely indexed and gated by the pair below.
+  shareToken: text('share_token').notNull(),
+  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+  // IA-37 — share-token lifecycle (mirrors agreement_signers). Appended at the
+  // table end (reference_d1_add_column_at_end). NULL expiresAt = never expires;
+  // revokedAt set = link killed. Public share resolution fails closed on either.
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
+  revokedAt: integer('revoked_at', { mode: 'timestamp_ms' }),
+}, (t) => ({
+  idxInspection: index('idx_repair_requests_inspection').on(t.tenantId, t.inspectionId),
+  uqShare: uniqueIndex('idx_repair_requests_share_token').on(t.shareToken),
+}));
+
+export const repairRequestItems = sqliteTable('repair_request_items', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull(),
+  repairRequestId: text('repair_request_id').notNull(),
+  // `unitId:sectionId:itemId` (`lib/finding-key.ts`; `_default` when the template
+  // has no units) — one item's entry in `inspection_results.data`, the same key
+  // shape `cost_items.finding_key` points at. Also `addItem`'s idempotency key:
+  // (repair_request_id, finding_key) is matched before insert, so re-toggling a
+  // defect updates the row instead of double-counting its requested credit.
+  findingKey: text('finding_key').notNull(),
+  // Snapshots of the report's `section.title` / `item.label` at add time, so a
+  // contractor reading the shared list still knows where the defect is after the
+  // template or the report has been edited under it.
+  sectionTitle: text('section_title').notNull(),
+  itemLabel: text('item_label').notNull(),   // add-time snapshot of item.label, beside section_title
+  commentSnapshot: text('comment_snapshot'),
+  requestedCreditCents: integer('requested_credit_cents'),
+  // The REQUESTER's own words on this line (buyer or agent, quick-phrase
+  // assisted) — the inspector's text is `comment_snapshot`. Rendered on the
+  // public share page; one of the three fields `updateItem` will PATCH.
+  note: text('note'),
+  sortOrder: integer('sort_order').notNull().default(0),
+  // IA-55 — defect title / location / category snapshots so the public share
+  // page shows a locatable, distinguishable, priority-tagged list that stays
+  // stable after the report changes. Appended at the table end (D1 can't add a
+  // column mid-table on a referenced table — reference_d1_add_column_at_end).
+  defectTitleSnapshot: text('defect_title_snapshot'),
+  locationSnapshot: text('location_snapshot'),
+  categorySnapshot: text('category_snapshot'),
+  // IA-57 — the recommended trade ("who fixes this"), snapshotted at add time
+  // so the contractor reading the shared list knows which trade to send. Stores
+  // the RESOLVED LABEL ("licensed roofer"), not the DEFECT_TRADES slug: the
+  // label is what the report card shows, so both surfaces read identically, and
+  // a snapshot must not depend on a lookup table that can change under it.
+  // Appended at the table end (reference_d1_add_column_at_end).
+  tradeSnapshot: text('trade_snapshot'),
+  // #275 — WHAT THE BUYER IS ASKING FOR on this line: repair it, replace it,
+  // give me the money (`fund`), or something else. NULLABLE, and null is not a
+  // defect: every item added before this column existed has no tag, and an
+  // untagged item stays a valid item forever. Authored by the buyer or their
+  // agent only — never the inspector, whose "replace it" would be a
+  // professional scope recommendation inside a document the buyer negotiates
+  // with (`lib/repair-action-tag.ts` owns both the vocabulary and that rule).
+  // Appended at the table end (reference_d1_add_column_at_end).
+  //
+  // ⚠️ TWO NEIGHBOURING ENUMS LOOK LIKE THIS ONE AND MUST NOT BE MERGED INTO IT:
+  //  (a) `cost_items.action` (`schema/inspection/cost-items.ts`) keeps its own
+  //      ['repair','replace','further_study']. That is the ASSESSOR classifying
+  //      a commercial finding, where `further_study` is a real professional
+  //      outcome; this is the buyer stating what they want, where it is not.
+  //  (b) our severity vocabulary ['good','marginal','significant','minor'] is a
+  //      CONDITION axis. This is the product's first ACTION axis. A condition
+  //      and a requested remedy are different statements about a defect, so the
+  //      two do not line up and neither can be derived from the other.
+  //
+  // ⚠️ THE FOUR VALUES ARE A PRODUCT CHOICE, NOT AN INDUSTRY DERIVATION, AND
+  // THE ONE VENDOR WITH A PUBLISHED ANSWER PUTS THEM ON THE OTHER SIDE.
+  // The plan that introduced this column cited "the union of HIP and ISN" for
+  // the vocabulary. Checking that afterwards: ISN's help centre describes the
+  // same four as something the reviewing AGENT selects — verbatim, "as a
+  // response to the request item" — and Home Inspector Pro's page carries no
+  // role label at all, so it settles nothing. Nobody was found putting these
+  // four on the requester.
+  //
+  // The column stays on the REQUEST axis anyway, deliberately: "I want it
+  // repaired / replaced / funded" is a coherent and useful thing for a buyer
+  // to say, and HIP revealing a money field only under `fund` supports hanging
+  // the amount off it. Both facts are recorded here because one of them is
+  // evidence and the other is a decision, and a later reader must not mistake
+  // the second for the first.
+  //
+  // ⚠️ A RESPONSE AXIS, IF IT IS EVER BUILT, MUST NOT REUSE THIS COLUMN OR ITS
+  // VOCABULARY. Same four words on the same row for two different actors is
+  // unreadable a year later — nothing would say whether `fund` was asked for
+  // or offered. Name the roles in the columns (`requested_action` vs
+  // `responded_action`) and give the response its own enum, even if the
+  // members happen to coincide.
+  repairActionTag: text('repair_action_tag', { enum: REPAIR_ACTION_TAGS }),
+}, (t) => ({
+  idxRr: index('idx_repair_request_items_rr').on(t.repairRequestId),
+}));
+
+export type RepairRequest = typeof repairRequests.$inferSelect;
+export type RepairRequestItem = typeof repairRequestItems.$inferSelect;

@@ -1,0 +1,371 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { AgentService } from '../../../server/services/agent.service';
+import { createTestDb, setupSchema } from '../db';
+import * as schema from '../../../server/lib/db/schema';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type { EmailService } from '../../../server/services/email.service';
+import { eq } from 'drizzle-orm';
+import { seedRoleProfiles } from '../../../server/services/seed/seed-role-profiles';
+import { PeopleService } from '../../../server/services/people.service';
+
+const roleProfileId = (tenantId: string, key: string) => `crp_${tenantId}_${key}`;
+
+vi.mock('drizzle-orm/d1', () => ({ drizzle: vi.fn() }));
+import { drizzle as mockDrizzle } from 'drizzle-orm/d1';
+import { asD1Db } from '../helpers/test-db';
+
+const T1 = '00000000-0000-0000-0000-000000000001';
+const T2 = '00000000-0000-0000-0000-000000000002';
+const AGENT_USER = '00000000-0000-0000-0000-000000000a01';
+const OTHER_AGENT_USER = '00000000-0000-0000-0000-000000000a02';
+const INSPECTOR_T1 = '00000000-0000-0000-0000-00000000ab01';
+const INSPECTOR_T2 = '00000000-0000-0000-0000-00000000ab02';
+
+describe('AgentService.listReferrals — A2', () => {
+    let svc: AgentService;
+    let testDb: BetterSQLite3Database<typeof schema>;
+
+    beforeEach(async () => {
+        const fixture = createTestDb();
+        testDb = fixture.db;
+        await setupSchema(fixture.sqlite);
+
+        await testDb.insert(schema.tenants).values([
+            { id: T1, slug: 'acme', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date() },
+            { id: T2, slug: 'bobs', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date() },
+        ]);
+        // Tenant display tz lives on tenant_configs (branding.default_timezone).
+        // T1 configures NY; T2 has NO config row -> listReferrals falls back to
+        // 'UTC' (the leftJoin yields null there).
+        // The company name lives here now — `tenants.name` is gone, so a tenant
+        // with no config row displays its slug instead.
+        await testDb.insert(schema.tenantConfigs).values([
+            { tenantId: T1, companyName: 'Acme Inspections', defaultTimezone: 'America/New_York', updatedAt: new Date() },
+            { tenantId: T2, companyName: 'BobsInsp', updatedAt: new Date() },
+        ]);
+        await seedRoleProfiles(asD1Db(testDb), T1, new Date(1));
+        await seedRoleProfiles(asD1Db(testDb), T2, new Date(1));
+
+        await testDb.insert(schema.users).values([
+            { id: AGENT_USER, tenantId: null, email: 'jane@realty.com', role: 'agent', name: 'Jane', createdAt: new Date(), passwordHash: 'h' },
+            { id: OTHER_AGENT_USER, tenantId: null, email: 'other@realty.com', role: 'agent', name: 'Other', createdAt: new Date(), passwordHash: 'h' },
+            { id: INSPECTOR_T1, tenantId: T1, email: 'mike@acme.com', role: 'inspector', name: 'Mike', createdAt: new Date(), passwordHash: 'h' },
+            { id: INSPECTOR_T2, tenantId: T2, email: 'bob@bobs.com', role: 'inspector', name: 'Bob', createdAt: new Date(), passwordHash: 'h' },
+        ]);
+
+        // Two agent contact rows in T1 + T2 representing Jane (one per tenant).
+        // contact-IDs become referredByAgentId on inspections so the query can
+        // resolve agent ownership.
+        await testDb.insert(schema.contacts).values([
+            { id: 'jane-c1', tenantId: T1, type: 'agent', name: 'Jane', email: 'jane@realty.com', createdAt: new Date() },
+            { id: 'jane-c2', tenantId: T2, type: 'agent', name: 'Jane', email: 'jane@realty.com', createdAt: new Date() },
+            { id: 'other-c1', tenantId: T1, type: 'agent', name: 'Other', email: 'other@realty.com', createdAt: new Date() },
+            // Task 9c — client contact backing i-1's inspection_people 'client'
+            // row (see beforeEach below); listReferrals now sources clientName
+            // from here, not the legacy inspections.client_name column.
+            { id: 'client-i1', tenantId: T1, type: 'client', name: 'Sarah', email: 'sarah@example.com', createdAt: new Date() },
+        ]);
+
+        // IA-104 — bind each account to its contact. Note OTHER_AGENT_USER
+        // shares tenant T1 with AGENT_USER: that is the isolation case.
+        await testDb.update(schema.contacts).set({ agentUserId: AGENT_USER, agentLinkedAt: new Date() }).where(eq(schema.contacts.id, 'jane-c1'));
+        await testDb.update(schema.contacts).set({ agentUserId: AGENT_USER, agentLinkedAt: new Date() }).where(eq(schema.contacts.id, 'jane-c2'));
+        await testDb.update(schema.contacts).set({ agentUserId: OTHER_AGENT_USER, agentLinkedAt: new Date() }).where(eq(schema.contacts.id, 'other-c1'));
+
+        await testDb.insert(schema.inspections).values([
+            { id: 'i-1', tenantId: T1, inspectorId: INSPECTOR_T1, propertyAddress: '1 Main', date: '2026-06-01', status: 'confirmed', paymentStatus: 'paid', price: 0, createdAt: new Date() },
+            { id: 'i-2', tenantId: T1, inspectorId: INSPECTOR_T1, propertyAddress: '2 Oak', date: '2026-06-02', status: 'completed', reportStatus: 'published', paymentStatus: 'paid', price: 0, createdAt: new Date() },
+            { id: 'i-3', tenantId: T2, inspectorId: INSPECTOR_T2, propertyAddress: '3 Elm', date: '2026-06-03', status: 'requested', paymentStatus: 'unpaid', price: 0, createdAt: new Date() },
+            { id: 'other-agent-inspection', tenantId: T1, inspectorId: INSPECTOR_T1, propertyAddress: '99 Pine', date: '2026-06-04', status: 'requested', paymentStatus: 'unpaid', price: 0, createdAt: new Date() },
+            { id: 'no-referral-inspection', tenantId: T1, inspectorId: INSPECTOR_T1, propertyAddress: '11 Pine', date: '2026-06-05', status: 'requested', paymentStatus: 'unpaid', price: 0, createdAt: new Date() },
+        ]);
+
+        // Buyer-agent attribution now lives on inspection_people (Task 9c) —
+        // every fixture inspection that carries a legacy referredByAgentId
+        // must ALSO get the matching inspection_people row, or the
+        // post-rewrite queries (which read inspection_people, not the
+        // legacy column) will no longer see it as referred.
+        const people = new PeopleService({ DB: {} as D1Database });
+        (mockDrizzle as unknown as ReturnType<typeof vi.fn>).mockReturnValue(testDb);
+        await people.addPerson(T1, 'i-1', 'jane-c1', roleProfileId(T1, 'buyer_agent'));
+        await people.addPerson(T1, 'i-2', 'jane-c1', roleProfileId(T1, 'buyer_agent'));
+        await people.addPerson(T2, 'i-3', 'jane-c2', roleProfileId(T2, 'buyer_agent'));
+        await people.addPerson(T1, 'other-agent-inspection', 'other-c1', roleProfileId(T1, 'buyer_agent'));
+        // 'no-referral-inspection' intentionally gets NO inspection_people row.
+        // Task 9c — client role for i-1, backing the clientName assertion below.
+        await people.addPerson(T1, 'i-1', 'client-i1', roleProfileId(T1, 'client'));
+        const stubEmail: Pick<EmailService, 'sendAgentInvite'> = {
+            sendAgentInvite: vi.fn().mockResolvedValue(undefined),
+        };
+        svc = new AgentService({} as D1Database);
+    });
+
+    it('returns inspections from all tenants the agent has active links with', async () => {
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 50 });
+        expect(refs.length).toBe(3);
+        const tenantIds = refs.map((r) => r.tenantId).sort();
+        expect(tenantIds).toEqual([T1, T1, T2].sort());
+    });
+
+    it('does not leak inspections from other agents within the same tenants', async () => {
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 50 });
+        expect(refs.find((r) => r.id === 'other-agent-inspection')).toBeUndefined();
+        expect(refs.find((r) => r.id === 'no-referral-inspection')).toBeUndefined();
+    });
+
+    it('revoking the binding removes that tenant from the agent view', async () => {
+        await testDb.update(schema.contacts)
+            .set({ agentRevokedAt: new Date() })
+            .where(eq(schema.contacts.id, 'jane-c1'));
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 50 });
+        expect(refs.find((r) => r.tenantId === T1)).toBeUndefined();
+        expect(refs.length).toBe(1);
+        expect(refs[0]?.tenantId).toBe(T2);
+    });
+
+    it('exposes tenantName, address, status, paymentStatus on each row', async () => {
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 50 });
+        const r1 = refs.find((r) => r.id === 'i-1');
+        expect(r1).toBeDefined();
+        expect(r1?.tenantName).toBe('Acme Inspections');
+        expect(r1?.propertyAddress).toBe('1 Main');
+        expect(r1?.clientName).toBe('Sarah');
+        expect(r1?.status).toBe('confirmed');
+        expect(r1?.paymentStatus).toBe('paid');
+        // Owning-tenant display tz (T1 configured NY); the agent dashboard
+        // renders each referral date in this zone unless the agent overrides it.
+        expect(r1?.tenantTimezone).toBe('America/New_York');
+        const r3 = refs.find((r) => r.id === 'i-3'); // T2, no configured tz
+        expect(r3?.tenantTimezone).toBe('UTC');
+    });
+
+    it('respects opts.limit', async () => {
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 1 });
+        expect(refs.length).toBe(1);
+    });
+
+    it('Task 9c — legacy referredByAgentId NULL, buyer_agent inspection_people row present — still resolves as a referral', async () => {
+        await testDb.insert(schema.inspections).values({
+            id: 'i-people-only', tenantId: T1, inspectorId: INSPECTOR_T1, propertyAddress: '77 Birch', date: '2026-06-06', status: 'requested', paymentStatus: 'unpaid', price: 0, createdAt: new Date(),
+        });
+        const people = new PeopleService({ DB: {} as D1Database });
+        await people.addPerson(T1, 'i-people-only', 'jane-c1', roleProfileId(T1, 'buyer_agent'));
+
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 50 });
+        expect(refs.find((r) => r.id === 'i-people-only')).toBeDefined();
+    });
+
+    it('ANTI-LEAK (Task 9c) — after GDPR erasure deletes the client\'s inspection_people + contacts rows, ' +
+        'listReferrals reports no client rather than a stale one', async () => {
+        // Mirrors erasure-orchestrator.ts: the subject's contacts row and
+        // inspection_people row are DELETED outright (not anonymized).
+        //
+        // ⚠️ THE ORIGINAL LEAK VECTOR IS GONE AT THE SCHEMA LEVEL. This test was
+        // written when `inspections.client_name` was a denormalized cache the
+        // erasure job never touched, and it seeded that column with a sentinel
+        // ('LEAKED-PII-SHOULD-NOT-APPEAR') to prove the read did not fall back
+        // to it. The column has since been DROPPED (see
+        // server/lib/db/schema/inspection/core.ts), so the seed was writing a
+        // key drizzle silently discarded — the sentinel could not appear, and
+        // the assertion against it had stopped proving anything. What remains
+        // IS still real: the post-erasure state (buyer_agent row present, no
+        // client row) must surface a null client, not an invented one.
+        await testDb.insert(schema.inspections).values({
+            id: 'i-erased', tenantId: T1, inspectorId: INSPECTOR_T1, propertyAddress: '5 Cedar', date: '2026-06-07', status: 'requested',
+            paymentStatus: 'unpaid', price: 0, createdAt: new Date(),
+        });
+        const people = new PeopleService({ DB: {} as D1Database });
+        await people.addPerson(T1, 'i-erased', 'jane-c1', roleProfileId(T1, 'buyer_agent'));
+        // No client inspection_people row is added — simulates post-erasure state.
+
+        const refs = await svc.listReferrals(AGENT_USER, { limit: 50 });
+        const erased = refs.find((r) => r.id === 'i-erased');
+        expect(erased).toBeDefined();
+        expect(erased?.clientName).toBeNull();
+    });
+});
+
+describe('AgentService.listInspectors — A2', () => {
+    let svc: AgentService;
+    let testDb: BetterSQLite3Database<typeof schema>;
+
+    beforeEach(async () => {
+        const fixture = createTestDb();
+        testDb = fixture.db;
+        await setupSchema(fixture.sqlite);
+
+        await testDb.insert(schema.tenants).values([
+            { id: T1, slug: 'acme', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date() },
+            { id: T2, slug: 'bobs', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date() },
+        ]);
+        // The company name lives in tenant_configs now.
+        await testDb.insert(schema.tenantConfigs).values([
+            { tenantId: T1, companyName: 'Acme Inspections', updatedAt: new Date() },
+            { tenantId: T2, companyName: 'BobsInsp', updatedAt: new Date() },
+        ]);
+
+        await testDb.insert(schema.users).values([
+            { id: AGENT_USER, tenantId: null, email: 'jane@realty.com', role: 'agent', name: 'Jane', createdAt: new Date(), passwordHash: 'h' },
+            { id: INSPECTOR_T1, tenantId: T1, email: 'mike@acme.com', role: 'inspector', name: 'Mike', slug: 'mike', photoUrl: 'https://r2/me.jpg', createdAt: new Date(), passwordHash: 'h' },
+            { id: INSPECTOR_T2, tenantId: T2, email: 'bob@bobs.com', role: 'inspector', name: 'Bob', slug: 'bob', createdAt: new Date(), passwordHash: 'h' },
+        ]);
+
+        await testDb.insert(schema.contacts).values([
+            { id: 'jane-c1', tenantId: T1, type: 'agent', name: 'Jane', email: 'jane@realty.com', createdByUserId: INSPECTOR_T1, createdAt: new Date() },
+            { id: 'jane-c2', tenantId: T2, type: 'agent', name: 'Jane', email: 'jane@realty.com', createdByUserId: INSPECTOR_T2, createdAt: new Date() },
+        ]);
+
+        // IA-104 — the inviting inspector now comes from contacts.createdByUserId,
+        // which the contact fixtures above already set.
+        await testDb.update(schema.contacts).set({ agentUserId: AGENT_USER, agentLinkedAt: new Date() }).where(eq(schema.contacts.id, 'jane-c1'));
+        await testDb.update(schema.contacts).set({ agentUserId: AGENT_USER, agentLinkedAt: new Date() }).where(eq(schema.contacts.id, 'jane-c2'));
+
+        (mockDrizzle as unknown as ReturnType<typeof vi.fn>).mockReturnValue(testDb);
+        const stubEmail: Pick<EmailService, 'sendAgentInvite'> = {
+            sendAgentInvite: vi.fn().mockResolvedValue(undefined),
+        };
+        svc = new AgentService({} as D1Database);
+    });
+
+    it('returns one row per active link with inspector contact info', async () => {
+        const rows = await svc.listInspectors(AGENT_USER);
+        expect(rows.length).toBe(2);
+        const tenantNames = rows.map((r) => r.tenantName).sort();
+        expect(tenantNames).toEqual(['Acme Inspections', 'BobsInsp']);
+    });
+
+    it('omits revoked links', async () => {
+        await testDb.update(schema.contacts)
+            .set({ agentRevokedAt: new Date() })
+            .where(eq(schema.contacts.id, 'jane-c1'));
+        const rows = await svc.listInspectors(AGENT_USER);
+        expect(rows.length).toBe(1);
+        expect(rows[0]?.tenantId).toBe(T2);
+    });
+
+    it('exposes inspector slug + photo + name + tenant slug', async () => {
+        const rows = await svc.listInspectors(AGENT_USER);
+        const acme = rows.find((r) => r.tenantId === T1);
+        expect(acme?.inspectorSlug).toBe('mike');
+        expect(acme?.inspectorPhotoUrl).toBe('https://r2/me.jpg');
+        expect(acme?.inspectorName).toBe('Mike');
+        expect(acme?.tenantSlug).toBe('acme');
+    });
+
+    it('falls back to null inspector fields when invitedByUserId missing', async () => {
+        // Add a link with no invitedByUserId (auto-link path).
+        await testDb.insert(schema.tenants).values({
+            id: 'T3', slug: 'no', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date(),
+        });
+        // IA-104 — a contact with NO createdByUserId is the auto-link shape
+        // this case is about: bound to the account, but with no inspector
+        // recorded as having brought them in.
+        await testDb.insert(schema.contacts).values({
+            id: 'jane-c3', tenantId: 'T3', type: 'agent', name: 'Jane', email: 'jane@realty.com',
+            agentUserId: AGENT_USER, agentLinkedAt: new Date(), createdAt: new Date(),
+        });
+        const rows = await svc.listInspectors(AGENT_USER);
+        const noRow = rows.find((r) => r.tenantId === 'T3');
+        expect(noRow).toBeDefined();
+        expect(noRow?.inspectorName).toBeNull();
+        expect(noRow?.inspectorSlug).toBeNull();
+    });
+});
+
+describe('AgentService.revokeLink — A2', () => {
+    let svc: AgentService;
+    let testDb: BetterSQLite3Database<typeof schema>;
+
+    beforeEach(async () => {
+        const fixture = createTestDb();
+        testDb = fixture.db;
+        await setupSchema(fixture.sqlite);
+
+        await testDb.insert(schema.tenants).values({
+            id: T1, slug: 'acme', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date(),
+        });
+        await testDb.insert(schema.users).values({
+            id: AGENT_USER, tenantId: null, email: 'jane@realty.com', role: 'agent', name: 'Jane', createdAt: new Date(), passwordHash: 'h',
+        });
+        await testDb.insert(schema.contacts).values({
+            id: 'jane-c1', tenantId: T1, type: 'agent', name: 'Jane', email: 'jane@realty.com',
+            agentUserId: AGENT_USER, agentLinkedAt: new Date(), createdAt: new Date(),
+        });
+
+        (mockDrizzle as unknown as ReturnType<typeof vi.fn>).mockReturnValue(testDb);
+        const stubEmail: Pick<EmailService, 'sendAgentInvite'> = {
+            sendAgentInvite: vi.fn().mockResolvedValue(undefined),
+        };
+        svc = new AgentService({} as D1Database);
+    });
+
+    it('stamps agentRevokedAt without archiving the contact', async () => {
+        await svc.revokeLink('jane-c1', T1);
+        const row = await testDb.select().from(schema.contacts)
+            .where(eq(schema.contacts.id, 'jane-c1')).get();
+        expect(row?.agentRevokedAt).toBeTruthy();
+        // The person is still a real buyer agent on real inspections — only
+        // the cross-inspector portal view is withdrawn.
+        expect(row?.archivedAt).toBeNull();
+        expect(row?.agentUserId).toBe(AGENT_USER);
+    });
+
+    it('rejects revoke when the contact belongs to a different tenant', async () => {
+        await expect(svc.revokeLink('jane-c1', 'wrong-tenant')).rejects.toThrow();
+        const row = await testDb.select().from(schema.contacts)
+            .where(eq(schema.contacts.id, 'jane-c1')).get();
+        expect(row?.agentRevokedAt).toBeNull();
+    });
+});
+
+describe('AgentService.updateProfile — A2', () => {
+    let svc: AgentService;
+    let testDb: BetterSQLite3Database<typeof schema>;
+
+    beforeEach(async () => {
+        const fixture = createTestDb();
+        testDb = fixture.db;
+        await setupSchema(fixture.sqlite);
+
+        await testDb.insert(schema.users).values({
+            id: AGENT_USER, tenantId: null, email: 'jane@realty.com', role: 'agent', name: 'Jane', createdAt: new Date(), passwordHash: 'h',
+        });
+
+        (mockDrizzle as unknown as ReturnType<typeof vi.fn>).mockReturnValue(testDb);
+        const stubEmail: Pick<EmailService, 'sendAgentInvite'> = {
+            sendAgentInvite: vi.fn().mockResolvedValue(undefined),
+        };
+        svc = new AgentService({} as D1Database);
+    });
+
+    it('persists the profile fields it is given', async () => {
+        // Notification preferences used to be part of this patch, as three
+        // booleans on `users`. They now live in `notification_preferences` and
+        // are written by their own route — see
+        // `tests/unit/notifications/preferences-api.spec.ts`.
+        await svc.updateProfile(AGENT_USER, { slug: 'jane', name: 'Jane R.' });
+        const row = await testDb.select().from(schema.users)
+            .where(eq(schema.users.id, AGENT_USER)).get();
+        expect(row?.slug).toBe('jane');
+        expect(row?.name).toBe('Jane R.');
+    });
+
+    it('rejects slug taken by another global agent user', async () => {
+        await testDb.insert(schema.users).values({
+            id: 'other-agent', tenantId: null, email: 'x@x.com', role: 'agent', name: 'X', slug: 'jane', createdAt: new Date(), passwordHash: 'h',
+        });
+        await expect(svc.updateProfile(AGENT_USER, { slug: 'jane' })).rejects.toThrow();
+    });
+
+    it('does not write fields that were not provided', async () => {
+        // A patch names what changed. A later call that names something else
+        // must leave the first alone — otherwise editing a display name would
+        // silently drop the referral link the slug backs.
+        await svc.updateProfile(AGENT_USER, { slug: 'jane' });
+        await svc.updateProfile(AGENT_USER, { name: 'Jane R.' });
+        const row = await testDb.select().from(schema.users)
+            .where(eq(schema.users.id, AGENT_USER)).get();
+        expect(row?.slug).toBe('jane');
+        expect(row?.name).toBe('Jane R.');
+    });
+});

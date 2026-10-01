@@ -1,0 +1,152 @@
+// @vitest-environment node
+import { describe, it, expect } from 'vitest';
+import {
+    isReportShipped,
+    canPublish,
+    latestPublishedAt,
+    invoiceFromParty,
+    lifecycleState,
+    type HubPayload,
+} from '~/lib/hub-blocks';
+
+function hub(overrides: {
+    inspection?: Partial<HubPayload['inspection']>;
+    publishReadiness?: HubPayload['publishReadiness'];
+} = {}): HubPayload {
+    return {
+        inspection: {
+            status: 'requested',
+            reportStatus: 'in_progress',
+            paymentRequired: false,
+            agreementRequired: false,
+            ...overrides.inspection,
+        },
+        agreementRequests: [],
+        invoice: null,
+        publishReadiness: overrides.publishReadiness ?? { ready: false, blockingCount: 0 },
+    } as HubPayload;
+}
+
+describe('isReportShipped', () => {
+    it('published → true', () => {
+        expect(isReportShipped(hub({ inspection: { reportStatus: 'published' } }))).toBe(true);
+    });
+    it('in_progress → false', () => {
+        expect(isReportShipped(hub({ inspection: { reportStatus: 'in_progress' } }))).toBe(false);
+    });
+    it('submitted → false', () => {
+        expect(isReportShipped(hub({ inspection: { reportStatus: 'submitted' } }))).toBe(false);
+    });
+});
+
+// canPublish reads the report axis and nothing else. The order lifecycle
+// (requested → … → completed) tracks the job, not the report, and the server
+// stopped gating publication on it — a UI gate here would only re-create the
+// mismatch where the hub hides an action the API would have accepted.
+describe('canPublish — report axis only', () => {
+    it('allows publishing from every point in the order lifecycle', () => {
+        for (const status of ['requested', 'scheduled', 'confirmed', 'completed', 'cancelled'] as const) {
+            expect(canPublish(hub({ inspection: { status, reportStatus: 'in_progress' } }))).toBe(true);
+        }
+    });
+    it('allows publishing a submitted report, bypassing review', () => {
+        expect(canPublish(hub({ inspection: { status: 'confirmed', reportStatus: 'submitted' } }))).toBe(true);
+    });
+    it('does not offer publishing for an already published report', () => {
+        expect(canPublish(hub({ inspection: { status: 'confirmed', reportStatus: 'published' } }))).toBe(false);
+    });
+});
+
+/**
+ * The Report card used to say "Report delivered to the client." whenever
+ * `isReportShipped` was true — which is only `reportStatus === 'published'`.
+ * Publication is not delivery: whether the client was emailed is the workspace's
+ * `report.published` automation rules' business, and nothing in this payload
+ * records their outcome. The card also offered a "Send report" button directly
+ * beneath that sentence, which is the contradiction that gives the lie away.
+ *
+ * Publication time is a fact the hub does have — the report_versions rows carry
+ * `publishedAt` — so the card can state that instead of inventing a delivery.
+ */
+describe('latestPublishedAt', () => {
+    it('returns the newest publish instant, whatever order the versions arrive in', () => {
+        expect(latestPublishedAt([
+            { publishedAt: 1_700_000_000 },
+            { publishedAt: 1_800_000_000 },
+            { publishedAt: 1_750_000_000 },
+        ])).toBe(1_800_000_000);
+    });
+
+    it('ignores versions with no recorded instant', () => {
+        expect(latestPublishedAt([{ publishedAt: null }, { publishedAt: 1_700_000_000 }])).toBe(1_700_000_000);
+    });
+
+    it('is null when nothing has been published, so the copy omits the date rather than guessing one', () => {
+        expect(latestPublishedAt([])).toBeNull();
+        expect(latestPublishedAt([{ publishedAt: null }])).toBeNull();
+    });
+});
+
+/*
+ * The `publishNotified` suite that sat here is gone with the helper (F79). It
+ * asserted that an unticked pair reads as 'none' — true of the form, and false of
+ * the world: the flags reached a service that never read them, so the automation
+ * rules mailed the client regardless. Its absence is covered by the publish
+ * modal's own spec (no notify switches) and by
+ * `tests/unit/inspections/publish-audit-notify-flags.spec.ts` (no notify flag in
+ * the audit row).
+ */
+
+/**
+ * The invoice's FROM field showed "Your inspector" when the invoice carried no
+ * inspector name. FROM on an invoice is the party owed money; a placeholder there
+ * reads as a real answer and is not one. The company name is the correct
+ * substitute, and an em dash — matching the sibling BILL TO field — is what is
+ * left when neither exists.
+ */
+describe('invoiceFromParty', () => {
+    it('prefers the inspector named on the invoice', () => {
+        expect(invoiceFromParty('Dana Reyes', 'Reyes Home Inspection')).toBe('Dana Reyes');
+    });
+
+    it('falls back to the company, not to a placeholder', () => {
+        expect(invoiceFromParty(null, 'Reyes Home Inspection')).toBe('Reyes Home Inspection');
+        expect(invoiceFromParty('', 'Reyes Home Inspection')).toBe('Reyes Home Inspection');
+        expect(invoiceFromParty('   ', 'Reyes Home Inspection')).toBe('Reyes Home Inspection');
+    });
+
+    it('shows an em dash when the document names nobody', () => {
+        expect(invoiceFromParty(null, null)).toBe('—');
+        expect(invoiceFromParty('', '')).toBe('—');
+    });
+});
+
+/**
+ * Batch D — the hub's status card rendered its heading and its status badge, and
+ * then, for a completed or cancelled inspection, nothing at all: a card whose
+ * whole content was a title and a pill above empty space. The "Mark fieldwork
+ * complete" button is hidden in those states (correctly — they are terminal), and
+ * nothing took its place, so the card read as broken rather than finished.
+ *
+ * Three states, three things to render, never a blank one.
+ */
+describe("lifecycleState", () => {
+    it("is actionable while the fieldwork can still be marked complete", () => {
+        expect(lifecycleState("requested")).toBe("actionable");
+        expect(lifecycleState("scheduled")).toBe("actionable");
+        expect(lifecycleState("confirmed")).toBe("actionable");
+        expect(lifecycleState("in_progress")).toBe("actionable");
+    });
+
+    it("distinguishes the two terminal states, which mean different things", () => {
+        // Completed: the visit happened. Cancelled: it will not.
+        expect(lifecycleState("completed")).toBe("completed");
+        expect(lifecycleState("cancelled")).toBe("cancelled");
+    });
+
+    it("treats an unrecognised status as actionable rather than hiding the control", () => {
+        // Failing closed here would leave the card blank again, and hide the only
+        // action on it, for any status added later.
+        expect(lifecycleState("something_new")).toBe("actionable");
+    });
+});

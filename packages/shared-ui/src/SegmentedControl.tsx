@@ -1,0 +1,147 @@
+import React from "react";
+import { cn } from "./cn";
+
+export interface SegmentedControlOption {
+  value: string;
+  label: React.ReactNode;
+  icon?: React.ReactNode;
+  /** Native tooltip (`title` attribute) for the segment. */
+  title?: string;
+}
+
+interface SegmentedControlProps {
+  options: SegmentedControlOption[];
+  value: string;
+  onChange: (value: string) => void;
+  /** `sm` (default, compact 11px) or `md` (12px). */
+  size?: "sm" | "md";
+  /** Accessible name for the radiogroup track. */
+  ariaLabel?: string;
+  className?: string;
+}
+
+/**
+ * Generic single-select segmented control. A rounded track (`bg-ih-bg-muted`)
+ * holding segment buttons; the selected segment lifts onto a card surface
+ * (`bg-ih-bg-card text-ih-primary-text shadow-ih-card`). Not theme-coupled — works
+ * for any option set (view mode, filters, theme, …).
+ *
+ * Accessibility follows the WAI-ARIA radiogroup pattern: `role="radiogroup"`
+ * on the track, `role="radio"` + `aria-checked` on each segment, a roving
+ * tabindex (only the selected segment is tab-focusable), and Arrow/Home/End
+ * keys that move the selection (and focus) between segments.
+ */
+export function SegmentedControl({
+  options,
+  value,
+  onChange,
+  size = "sm",
+  ariaLabel,
+  className = "",
+}: SegmentedControlProps) {
+  const btnRefs = React.useRef<(HTMLButtonElement | null)[]>([]);
+
+  const activeIndex = options.findIndex((o) => o.value === value);
+  // If value matches nothing, keep the first segment tab-focusable so the
+  // control is always reachable by keyboard.
+  const focusIndex = activeIndex < 0 ? 0 : activeIndex;
+
+  function select(index: number) {
+    const n = options.length;
+    if (n === 0) return;
+    const clamped = ((index % n) + n) % n;
+    onChange(options[clamped].value);
+    btnRefs.current[clamped]?.focus();
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLButtonElement>, index: number) {
+    switch (e.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        e.preventDefault();
+        select(index + 1);
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        e.preventDefault();
+        select(index - 1);
+        break;
+      case "Home":
+        e.preventDefault();
+        select(0);
+        break;
+      case "End":
+        e.preventDefault();
+        select(options.length - 1);
+        break;
+    }
+  }
+
+  const sizeClass = size === "md" ? "py-1.5 text-[12px]" : "py-1 text-[11px]";
+
+  /**
+   * The 44×44 floor, applied where a FINGER is the pointer.
+   *
+   * Measured on the mobile theme sheet: the four segments came out 27×25 CSS px
+   * each, 31px apart centre to centre. That is the surface a finger uses, and
+   * 44×44 is the floor this repository already applies by hand elsewhere
+   * (`min-h-11` in CannedCommentRow, `min-h-[44px] min-w-[44px]` in the media
+   * studio). The segments were below it because the button carried `py-1` and NO
+   * horizontal padding at all -- each one was exactly as wide as its own word.
+   *
+   * -- WHY A POINTER QUERY AND NOT A `size="touch"` PROP ----------------------
+   * A prop would put the floor behind something every touch surface has to
+   * REMEMBER to pass, and forgetting is silent -- the control would look fine on
+   * the desk it was built at. This control already has ten call sites. The
+   * question "is a finger doing the pointing" is answerable by the browser, so
+   * it is answered there and nobody has to carry it.
+   *
+   * Mouse density is deliberately unchanged: `pointer-coarse` does not match a
+   * desktop, so every existing surface renders exactly as it did.
+   */
+  const touchClass = "pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:px-3";
+
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      className={cn("inline-flex gap-1 p-1 bg-ih-bg-muted rounded-ih-button", className)}
+    >
+      {options.map((o, i) => {
+        const active = o.value === value;
+        return (
+          <button
+            key={o.value}
+            ref={(el) => {
+              btnRefs.current[i] = el;
+            }}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            tabIndex={i === focusIndex ? 0 : -1}
+            title={o.title}
+            onClick={() => onChange(o.value)}
+            onKeyDown={(e) => onKeyDown(e, i)}
+            className={`flex-1 inline-flex items-center justify-center gap-1.5 px-2 rounded-ih-pill font-bold transition-colors focus:outline-none focus:shadow-ih-focus ${sizeClass} ${touchClass} ${
+              active
+                // The ring is what makes the selection legible on a card
+                // surface: the lifted segment is itself `bg-ih-bg-card`, so on a
+                // popover or card the control read as four plain words with one
+                // of them coloured — the strongest cue, the surface change,
+                // cancelled out against its own container.
+                ? "bg-ih-bg-card text-ih-primary-text shadow-ih-card ring-1 ring-ih-border"
+                : "bg-transparent text-ih-fg-3 hover:text-ih-fg-1"
+            }`}
+          >
+            {o.icon != null && (
+              <span className="shrink-0" aria-hidden="true">
+                {o.icon}
+              </span>
+            )}
+            <span>{o.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}

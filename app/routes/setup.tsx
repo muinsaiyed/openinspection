@@ -1,0 +1,214 @@
+import { Form, useActionData, useNavigation, redirect, useLoaderData } from "react-router";
+import { useForm } from "@conform-to/react";
+import { parseWithZod } from "@conform-to/zod/v4";
+import type { Route } from "./+types/setup";
+import { getToken, createSessionWithToken } from "~/lib/session.server";
+import { createApi } from "~/lib/api-client.server";
+import { makeSetupSchema } from "~/lib/forms/auth.schema";
+import { Input, Button } from "@core/shared-ui";
+import { m } from "~/paraglide/messages";
+
+export function meta() {
+  return [{ title: m.auth_setup_meta_title() }];
+}
+
+export async function loader({ request, context }: Route.LoaderArgs) {
+  // If already authenticated, skip setup
+  const token = await getToken(context, request);
+  if (token) return redirect("/inspections");
+
+  // Check if workspace is already set up
+  try {
+    const api = createApi(context);
+    const res = await api.auth["setup-status"].$get();
+    const body = res.ok ? await res.json() : {};
+    const d = ((body as Record<string, unknown>).data ?? {}) as Record<string, unknown>;
+    if (d?.isSetUp) {
+      return redirect("/login");
+    }
+  } catch {
+    // API unreachable — show setup form anyway
+  }
+  return { ready: true };
+}
+
+export async function action({ request, context }: Route.ActionArgs) {
+  const formData = await request.formData();
+  const submission = parseWithZod(formData, { schema: makeSetupSchema() });
+  if (submission.status !== "success") {
+    return submission.reply();
+  }
+  const { workspaceName, adminName, email, password, setupCode } = submission.value;
+
+  try {
+    const api = createApi(context);
+    const res = await api.auth.setup.$post({
+      json: {
+        companyName: workspaceName,
+        adminName,
+        email,
+        password,
+        verificationCode: setupCode,
+      },
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const message =
+        (body as Record<string, Record<string, string>>)?.error?.message ??
+        m.auth_setup_error_failed();
+      return submission.reply({ formErrors: [message] });
+    }
+
+    // Extract JWT from Set-Cookie header
+    const setCookieHeader = res.headers.get("set-cookie") || "";
+    const tokenMatch = setCookieHeader.match(
+      /(?:inspector_token|__Host-inspector_token)=([^;]+)/,
+    );
+    const jwt = tokenMatch?.[1];
+
+    if (jwt) {
+      return createSessionWithToken(context, jwt, "/inspections");
+    }
+
+    return submission.reply({ formErrors: [m.auth_setup_error_no_session()] });
+  } catch {
+    return submission.reply({ formErrors: [m.auth_login_error_network()] });
+  }
+}
+
+export default function SetupPage() {
+  const lastResult = useActionData<typeof action>();
+  const navigation = useNavigation();
+  const isSubmitting = navigation.state === "submitting";
+  useLoaderData<typeof loader>();
+
+  const [form, fields] = useForm({
+    lastResult,
+    onValidate({ formData }) {
+      return parseWithZod(formData, { schema: makeSetupSchema() });
+    },
+    shouldValidate: "onBlur",
+    shouldRevalidate: "onInput",
+  });
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-ih-bg-app">
+      <div className="w-full max-w-md p-8">
+        <div className="flex items-center gap-3 mb-8">
+          <img src="/logo.svg" alt="" className="w-8 h-8" width={32} height={32} />
+          <span className="text-lg font-bold text-ih-fg-1">
+            OpenInspection
+          </span>
+        </div>
+
+        <h1 className="text-2xl font-bold text-ih-fg-1 mb-2">
+          {m.auth_setup_heading()}
+        </h1>
+        <p className="text-sm text-ih-fg-3 mb-6">
+          {m.auth_setup_subtitle()}
+        </p>
+
+        <Form
+          method="post"
+          id={form.id}
+          onSubmit={form.onSubmit}
+          noValidate
+          className="space-y-4"
+        >
+          <Input
+            id={fields.workspaceName.id}
+            name={fields.workspaceName.name}
+            type="text"
+            autoFocus
+            placeholder={m.auth_setup_company_placeholder()}
+            label={m.auth_setup_company_label()}
+            aria-invalid={fields.workspaceName.errors ? true : undefined}
+            error={fields.workspaceName.errors?.[0]}
+          />
+          <Input
+            id={fields.adminName.id}
+            name={fields.adminName.name}
+            type="text"
+            autoComplete="name"
+            placeholder={m.auth_setup_name_placeholder()}
+            label={m.auth_setup_name_label()}
+            aria-invalid={fields.adminName.errors ? true : undefined}
+            hint={m.auth_setup_name_help()}
+            error={fields.adminName.errors?.[0]}
+          />
+          <Input
+            id={fields.email.id}
+            name={fields.email.name}
+            type="email"
+            label={m.auth_setup_email_label()}
+            aria-invalid={fields.email.errors ? true : undefined}
+            error={fields.email.errors?.[0]}
+          />
+          <Input
+            id={fields.password.id}
+            name={fields.password.name}
+            type="password"
+            label={m.auth_login_password_label()}
+            aria-invalid={fields.password.errors ? true : undefined}
+            error={fields.password.errors?.[0]}
+          />
+          <Input
+            id={fields.setupCode.id}
+            name={fields.setupCode.name}
+            type="text"
+            placeholder={m.auth_setup_code_placeholder()}
+            label={m.auth_setup_code_label()}
+            className="font-mono"
+            aria-invalid={fields.setupCode.errors ? true : undefined}
+            error={fields.setupCode.errors?.[0]}
+            hint={
+              <>
+                <span className="font-medium text-ih-fg-2">{m.auth_setup_code_help_required()}</span>{" "}
+                {m.auth_setup_code_help_enter_prefix()}{" "}
+                <code className="px-1 py-0.5 bg-ih-bg-muted rounded text-ih-fg-2 font-mono text-[10px]">SETUP_CODE</code>{" "}
+                {m.auth_setup_code_help_middle()}{" "}
+                <span className="font-medium text-ih-fg-2">{m.auth_setup_code_help_settings_path()}</span>{" "}
+                {m.auth_setup_code_help_suffix()}{" "}
+                <a
+                  href="https://developers.cloudflare.com/workers/configuration/environment-variables/#add-environment-variables-via-the-dashboard"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-ih-primary-text hover:text-ih-primary-600 underline underline-offset-2"
+                >
+                  {m.auth_setup_code_help_link()}
+                </a>
+              </>
+            }
+          />
+
+          {form.errors && (
+            <div className="px-3 py-2 rounded-lg bg-ih-bad-bg border border-ih-bad text-sm text-ih-bad-fg">
+              {form.errors[0]}
+            </div>
+          )}
+
+          <Button type="submit" variant="primary" size="lg" disabled={isSubmitting} className="w-full">
+            {isSubmitting ? m.auth_setup_submit_pending() : m.auth_setup_submit()}
+          </Button>
+        </Form>
+
+        {/* F74 — publishing agent terms is a manual, deployment-level step in
+            BOTH modes: the gate does not branch on APP_MODE, no workspace
+            administrator can supply the document, and until it exists agents
+            reach "Agent sign-up is not available yet" with no way forward. It is
+            documented thoroughly in docs/operate/deploy.md and nowhere an
+            operator who only runs this wizard would see it. A note, not a step:
+            the terms are published from the command line, so nothing here waits
+            on it. */}
+        <p className="mt-6 pt-4 border-t border-ih-border text-[12px] text-ih-fg-3">
+          {m.auth_setup_agent_terms_note()}{" "}
+          {/* i18n-literal-ok: a shell command. Translating it would produce a
+              command that does not exist. */}
+          <code className="px-1 py-0.5 bg-ih-bg-muted rounded text-ih-fg-2 font-mono text-[10px]">npm run agent-terms:publish</code>{" "}
+          {m.auth_setup_agent_terms_docs()}
+        </p>
+      </div>
+    </div>
+  );
+}

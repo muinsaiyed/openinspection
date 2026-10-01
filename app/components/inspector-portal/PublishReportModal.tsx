@@ -1,0 +1,209 @@
+import { Link, type useFetcher } from "react-router";
+import { Modal } from "@core/shared-ui";
+import type { action } from "~/routes/inspector-portal";
+import { m } from "~/paraglide/messages";
+
+/* ------------------------------------------------------------------ */
+/*  Publish-report modal                                              */
+/* ------------------------------------------------------------------ */
+
+const FORM_ID = "ih-publish-report-form";
+
+export function PublishReportModal({
+  open,
+  agreementRequired,
+  paymentRequired,
+  isAmendment,
+  courtesyTranslationEnabled,
+  courtesyTranslationLocale,
+  clientPrefersTranslation,
+  blockingCount,
+  fetcher,
+  submitting,
+  error,
+  onClose,
+}: {
+  open: boolean;
+  agreementRequired: boolean;
+  paymentRequired: boolean;
+  /** IA-40 — this publish creates versionNumber > 1; ask what changed. */
+  isAmendment: boolean;
+  /**
+   * #23 — whether this workspace may PRODUCE a courtesy translation.
+   *
+   * The opt-in renders only when it may. Offering a control that the server
+   * would refuse is the "a page must never offer an action the API refuses"
+   * rule, and here the refusal costs a publish's worth of confusion.
+   */
+  courtesyTranslationEnabled: boolean;
+  /** The locale a translation would be produced in, e.g. `es-419`. */
+  courtesyTranslationLocale: string;
+  /**
+   * True when the client's own preferred language is the one a translation
+   * would be produced in.
+   *
+   * A NUDGE and nothing more. It never pre-ticks the box: producing a
+   * translation spends money, and a default that spends it is a decision the
+   * product made on somebody's behalf.
+   */
+  clientPrefersTranslation: boolean;
+  /**
+   * How many items the report-status gate still counts as unresolved.
+   *
+   * SHOWN, NEVER ENFORCED. The hub card beside the Publish button already
+   * counted these, but the modal that performs the publish said nothing about
+   * them — so the last screen before an outward-facing act was the one screen
+   * with the least information, while publishing from the editor showed a list.
+   *
+   * It does not disable the submit. Of five established products surveyed
+   * 2026-09-07, four never block publishing on report completeness and the one
+   * that does ships it off by default; Horizon's tutorial states outright that
+   * its equivalent check "will not force you to make an entry. It is simply a
+   * gentle reminder."
+   *
+   * A count and not a list because a count is all the hub has: its payload
+   * carries `{ ready, blockingCount }`. The defects themselves come from a
+   * separate endpoint the editor calls.
+   */
+  blockingCount: number;
+  fetcher: ReturnType<typeof useFetcher<typeof action>>;
+  submitting: boolean;
+  error: string | undefined;
+  onClose: () => void;
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={m.hub_publish_title()}
+      footer={
+        <>
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3 py-1.5 rounded-md border border-ih-border text-[12px] font-bold text-ih-fg-2 hover:bg-ih-bg-muted"
+          >
+            {m.common_cancel()}
+          </button>
+          <button
+            type="submit"
+            form={FORM_ID}
+            disabled={submitting}
+            className="px-3 py-1.5 rounded-md bg-ih-primary text-ih-fg-inverse text-[12px] font-bold hover:bg-ih-primary-600 disabled:opacity-60"
+          >
+            {submitting ? m.hub_publish_pending() : m.hub_publish_submit()}
+          </button>
+        </>
+      }
+    >
+      <fetcher.Form id={FORM_ID} method="post" className="space-y-3">
+        <input type="hidden" name="intent" value="publish" />
+        {blockingCount > 0 && (
+          <p className="rounded-md border border-ih-watch bg-ih-watch-bg px-3 py-2 text-[12px] text-ih-watch-fg">
+            {m.hub_publish_unresolved({ count: blockingCount })}
+          </p>
+        )}
+        {/* No theme picker — rides the editor's effective default (server
+            'modern'); the action sends theme:"modern" explicitly. */}
+
+        {/* F79 — this STATES who will be told, where two switches used to ask.
+            `notifyClient` / `notifyAgent` were posted, accepted, and read by
+            nothing: delivery is the workspace's `report.published` automation
+            rules' decision, and the publish audit row recorded the flag as given,
+            so a publish ticked "notify nobody" was written down as one that
+            notified nobody while every rule fired anyway.
+            Dropping the switches silently would leave the question they asked
+            unanswered, so the answer — and the address that decides it — is said
+            plainly instead. Sentence, not a disabled control: there is nothing
+            here to operate. */}
+        <p
+          data-testid="publish-notify-automation"
+          className="rounded-md border border-ih-border bg-ih-bg-muted px-3 py-2 text-[12px] text-ih-fg-2"
+        >
+          {m.hub_publish_notify_automation()}{" "}
+          <Link to="/settings/automations" className="font-bold text-ih-primary hover:underline">
+            {m.hub_publish_notify_automation_link()}
+          </Link>
+        </p>
+
+        <ToggleRow
+          name="requireSignature"
+          label={m.hub_publish_require_signature()}
+          defaultChecked={agreementRequired}
+        />
+        <ToggleRow
+          name="requirePayment"
+          label={m.hub_publish_require_payment()}
+          defaultChecked={paymentRequired}
+        />
+
+        {/* #23 — the per-publish opt-in. DEFAULT OFF, and it is a checkbox
+            rather than a default because producing a translation spends money
+            and the decision stays with whoever incurs it. The value posted is
+            the LOCALE, so the server is told what was asked for rather than
+            having to guess from a boolean. */}
+        {courtesyTranslationEnabled && (
+          <div>
+            <label className="flex items-center gap-2.5 text-[13px] text-ih-fg-1 cursor-pointer">
+              <input
+                type="checkbox"
+                name="translateTo"
+                value={courtesyTranslationLocale}
+                defaultChecked={false}
+                className="rounded border-ih-border text-ih-primary focus:ring-ih-primary"
+              />
+              <span>{m.courtesy_translation_publish_optin()}</span>
+            </label>
+            {/* The nudge. A fact about the recipient, stated once, next to the
+                control it is relevant to — never a pre-ticked box. */}
+            {clientPrefersTranslation && (
+              <p className="text-[12px] text-ih-fg-3 mt-1 ml-6" data-testid="courtesy-translation-nudge">
+                {m.courtesy_translation_publish_nudge()}
+              </p>
+            )}
+          </div>
+        )}
+
+        {isAmendment && (
+          <label className="block">
+            <span className="block text-[13px] font-medium text-ih-fg-1 mb-1">
+              {m.inspections_hub_publish_summary_label()}
+            </span>
+            <textarea
+              name="summary"
+              rows={3}
+              maxLength={500}
+              placeholder={m.inspections_hub_publish_summary_ph()}
+              className="w-full rounded-md border border-ih-border bg-ih-bg-card px-2.5 py-1.5 text-[13px] text-ih-fg-1 placeholder:text-ih-fg-4 focus:border-ih-primary focus:ring-1 focus:ring-ih-primary"
+            />
+          </label>
+        )}
+
+        {error && <p className="text-[12px] font-medium text-ih-bad-fg">{error}</p>}
+      </fetcher.Form>
+    </Modal>
+  );
+}
+
+/** A labeled checkbox row for the publish modal toggles (DS tokens). */
+function ToggleRow({
+  name,
+  label,
+  defaultChecked,
+}: {
+  name: string;
+  label: string;
+  defaultChecked: boolean;
+}) {
+  return (
+    <label className="flex items-center gap-2.5 text-[13px] text-ih-fg-1 cursor-pointer">
+      <input
+        type="checkbox"
+        name={name}
+        defaultChecked={defaultChecked}
+        className="rounded border-ih-border text-ih-primary focus:ring-ih-primary"
+      />
+      <span>{label}</span>
+    </label>
+  );
+}

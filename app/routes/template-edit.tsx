@@ -1,0 +1,722 @@
+import { useState, useEffect, useMemo } from "react";
+import { CLIENT_PROFILE_LIST } from "~/lib/report-style/profiles-client";
+import { useLoaderData, Link, isRouteErrorResponse, useRouteError } from "react-router";
+import type { Route } from "./+types/template-edit";
+import { requireToken } from "~/lib/session.server";
+import { createApi } from "~/lib/api-client.server";
+import { Icon, Button, TabStrip, Banner } from "@core/shared-ui";
+import { ThemeSegmentControl } from "~/components/sidebar/ThemeSegmentControl";
+import { RATING_PRESETS } from "~/components/template/types";
+import type { RatingLevel, RatingSystem, TemplateItem, TemplateSchema, TemplateSection, CannedComment } from "~/components/template/types";
+import { RatingSystemEditor } from "~/components/RatingSystemEditor";
+import { toEditorLevel, fromEditorLevel } from "~/lib/editor/rating-level-adapter";
+import { textInputSize } from "~/lib/text-input-width";
+import { ItemPropertiesPanel } from "~/components/template/ItemPropertiesPanel";
+import { ItemCommentsPanel } from "~/components/template/ItemCommentsPanel";
+import { ItemPreviewPanel } from "~/components/template/ItemPreviewPanel";
+import { SectionAuthorHeader } from "~/components/template/SectionAuthorHeader";
+import { SectionPreview } from "~/components/template/SectionPreview";
+import { SectionRail } from "~/components/editor-shared/SectionRail";
+import { ItemList } from "~/components/editor-shared/ItemList";
+import { TemplatePropertyTypePanel } from "~/components/template/TemplatePropertyTypePanel";
+import { serializeTemplateMeta, serializeSectionMeta } from "~/lib/editor/template-meta";
+import * as ops from "~/lib/editor/structure-ops";
+import { serializeItemForSave } from "~/lib/editor/serialize-template";
+import type { PropertyType } from "~/components/template/types";
+import { CommentLibraryDrawer } from "~/components/editor/CommentLibraryDrawer";
+import { useCannedComments } from "~/hooks/useCannedComments";
+import { buildCannedFromText, TAB_SEVERITY, type CannedTab } from "~/lib/editor/canned-from-library";
+import { useGuardedSubmit } from "~/hooks/useGuardedSubmit";
+import { m } from "~/paraglide/messages";
+
+export function meta() {
+  return [{ title: m.templates_edit_meta_title() }];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Loader                                                             */
+/* ------------------------------------------------------------------ */
+
+export async function loader({ request, params, context }: Route.LoaderArgs) {
+  const token = await requireToken(context, request);
+  const id = params.id;
+  const api = createApi(context, { token });
+  const [res, defectCatRes] = await Promise.all([
+    api.inspections.templates[":id"].$get({ param: { id } }),
+    // Authoring unification Plan-4 module K — the tenant's defect categories,
+    // fetched ONCE here (seeded on first read) so the editor can build a
+    // single name/id → color lookup for the defects-tab chip.
+    api.defectCategories["defect-categories"].$get().catch(() => null),
+  ]);
+  // A non-OK response previously fell through to an empty `{}`, which rendered a
+  // section-less editor that looks blank ("the editor never opened"). Surface the
+  // failure to the ErrorBoundary instead so the user gets an actionable message.
+  if (!res.ok) {
+    // res.status is typed to the route's declared success code (200) by the
+    // hono client, but the runtime value is the real HTTP status — read it as
+    // a number to distinguish a permission failure from a missing template.
+    throw new Response("Template not found", { status: (res.status as number) === 403 ? 403 : 404 });
+  }
+  const body = await res.json();
+  const raw = ((body as Record<string, unknown>).data ?? {}) as Record<string, unknown>;
+  const tpl = raw?.template ? (raw.template as Record<string, unknown>) : raw;
+  const name = (tpl?.name as string) || m.templates_edit_untitled();
+  const version = (tpl?.version as number) || 1;
+  let schema = (tpl?.schema || { schemaVersion: 2, sections: [] }) as TemplateSchema;
+  if (typeof schema === "string") {
+    try { schema = JSON.parse(schema); } catch { schema = { schemaVersion: 2, sections: [] }; }
+  }
+  // Normalize name/title. Always coerce `items` to an array so the editor's
+  // `section.items.length` / `.map` calls can never crash on a section whose
+  // `items` key is absent (which renders as a blank screen via the root
+  // ErrorBoundary).
+  if (!Array.isArray(schema.sections)) {
+    schema.sections = [];
+  }
+  schema.sections = schema.sections.map((sec) => {
+    const s = { ...sec };
+    if (!s.title && (s as unknown as Record<string, string>).name) {
+      s.title = (s as unknown as Record<string, string>).name;
+    }
+    s.items = Array.isArray(s.items)
+      ? s.items.map((item) => {
+          const it = { ...item };
+          if (!it.label && (it as unknown as Record<string, string>).name) {
+            it.label = (it as unknown as Record<string, string>).name;
+          }
+          return it;
+        })
+      : [];
+    return s;
+  });
+  // Authoring unification Plan-4 module K — tenant defect categories (id/name/color).
+  let defectCategories: Array<{ id: string; name: string; color: string }> = [];
+  if (defectCatRes?.ok) {
+    const defectCatBody = await defectCatRes.json() as { data?: Array<{ id: string; name: string; color: string }> };
+    defectCategories = defectCatBody.data ?? [];
+  }
+  const defaultProfileId = (tpl?.defaultProfileId as string | null) ?? null;
+  // A platform-supplied template that produces an authority's own form. The
+  // editor must say so, because every structural control on this page is about
+  // to be refused by the server (`refuseStatutoryTemplateEdit`) and a control
+  // that fails on click teaches nothing.
+  const statutoryFormId =
+    (schema as unknown as { statutoryForm?: { formId?: string } })?.statutoryForm?.formId ?? null;
+
+  return { id, name, version, schema, token, defectCategories, defaultProfileId, statutoryFormId };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Action                                                             */
+/* ------------------------------------------------------------------ */
+
+export async function action({ request, params, context }: Route.ActionArgs) {
+  const token = await requireToken(context, request);
+  const formData = await request.formData();
+  const name = formData.get("name") as string;
+  const schemaStr = formData.get("schema") as string;
+  if (!schemaStr) return { error: m.templates_edit_error_no_schema() };
+  const defaultProfileIdRaw = formData.get("defaultProfileId");
+  const api = createApi(context, { token });
+  const res = await api.inspections.templates[":id"].$put({
+    param: { id: params.id },
+    json: { name, schema: JSON.parse(schemaStr), defaultProfileId: defaultProfileIdRaw ? (defaultProfileIdRaw as string) : null },
+  });
+  if (res.ok) {
+    const data = await res.json();
+    const newVersion = (data as Record<string, unknown>)?.data
+      ? ((data as Record<string, unknown>).data as Record<string, unknown>)?.version
+      : null;
+    return { ok: true, version: newVersion };
+  }
+  const err = await res.json().catch(() => ({}));
+  return { error: (err as Record<string, unknown>)?.message || m.templates_edit_error_save_failed() };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Page                                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The template editor's rich-item default.
+ *
+ * `buildNewItem` produces the smallest VALID item, which for a rich item means
+ * an empty `ratingOptions` — and an empty one serializes below as a single
+ * "Inspected". The five-level vocabulary is what this editor's authors have
+ * always got, so the editor supplies it rather than moving it into the shared
+ * builder, where it would also land on every item the inspection editor adds.
+ */
+const NEW_RICH_ITEM = {
+  ratingOptions: ["Inspected", "Not Inspected", "Not Present", "Repair", "Safety Hazard"],
+  options: { choices: [] as string[] },
+};
+
+export default function TemplateEditPage() {
+  const { id, name: initialName, version: initialVersion, schema: initial, defectCategories, defaultProfileId: initialDefaultProfileId, statutoryFormId } = useLoaderData<typeof loader>();
+  // #106 - Save writes the whole template schema and bumps its version.
+  const { fetcher, submit, busy: saving } = useGuardedSubmit();
+
+  // Authoring unification Plan-4 module K — one tenant-wide category → color
+  // lookup, built once from the loader's single fetch, keyed by BOTH name and
+  // id (mirroring the report's + inspection editor's resolution).
+  const catColor = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const c of defectCategories ?? []) {
+      map.set(c.name, c.color);
+      map.set(c.id, c.color);
+    }
+    return map;
+  }, [defectCategories]);
+
+  const [templateName, setTemplateName] = useState(initialName);
+  const [defaultProfileId, setDefaultProfileId] = useState<string>(initialDefaultProfileId ?? "");
+  const [sections, setSections] = useState<TemplateSection[]>(initial.sections || []);
+  const [propertyType, setPropertyType] = useState<PropertyType | undefined>(initial.propertyType);
+  const [commercialSubtype, setCommercialSubtype] = useState<string | undefined>(initial.commercialSubtype);
+  const [ratingSystem, setRatingSystem] = useState<RatingSystem>(
+    initial.ratingSystem || { name: "Standard 5-Level", defaultLevelId: "S", levels: RATING_PRESETS[1].levels },
+  );
+  const [activeSection, setActiveSection] = useState(0);
+  const [editingItem, setEditingItem] = useState<string | null>(null);
+  const [previewMode, setPreviewMode] = useState(false);
+  const [rightRail, setRightRail] = useState<"properties" | "comments" | "preview">("properties");
+  const [ratingModalOpen, setRatingModalOpen] = useState(false);
+  const [choicesText, setChoicesText] = useState("");
+  const [saveSuccess, setSaveSuccess] = useState(false);
+
+  const section = sections[activeSection] || null;
+  const activeSectionId = sections[activeSection]?.id ?? "";
+  const findSectionIdx = (id: string) => sections.findIndex((s) => s.id === id);
+  const selectSectionById = (id: string) => {
+    const idx = findSectionIdx(id);
+    if (idx >= 0) { setActiveSection(idx); setEditingItem(null); }
+  };
+
+  const fetcherData = fetcher.data as { ok?: boolean; error?: string; version?: number } | undefined;
+
+  useEffect(() => {
+    if (fetcherData?.ok) {
+      setSaveSuccess(true);
+      const timer = setTimeout(() => setSaveSuccess(false), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [fetcherData]);
+
+  /* ---- Section CRUD ---- */
+  function updateSections(fn: (s: TemplateSection[]) => TemplateSection[]) {
+    setSections((prev) => fn(structuredClone(prev)));
+  }
+
+  function addSection() {
+    const newId = `sec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    updateSections((s) => [...s, { id: newId, title: m.templates_edit_new_section(), items: [] }]);
+    setActiveSection(sections.length);
+  }
+
+  function renameSection(idx: number, title: string) {
+    updateSections((s) => { s[idx].title = title; return s; });
+  }
+
+  function removeSection(idx: number) {
+    updateSections((s) => { s.splice(idx, 1); return s; });
+    if (activeSection >= sections.length - 1) setActiveSection(Math.max(0, sections.length - 2));
+  }
+
+  function moveSection(idx: number, dir: -1 | 1) {
+    updateSections((s) => {
+      const target = idx + dir;
+      if (target < 0 || target >= s.length) return s;
+      [s[idx], s[target]] = [s[target], s[idx]];
+      return s;
+    });
+    setActiveSection(Math.max(0, Math.min(sections.length - 1, activeSection + dir)));
+  }
+
+  function reorderSection(fromId: string, toId: string) {
+    const activeId = sections[activeSection]?.id;
+    let nextIdx = activeSection;
+    updateSections((s) => {
+      const from = s.findIndex((sec) => sec.id === fromId);
+      const to = s.findIndex((sec) => sec.id === toId);
+      if (from < 0 || to < 0 || from === to) return s;
+      const [moved] = s.splice(from, 1);
+      s.splice(to, 0, moved);
+      nextIdx = s.findIndex((sec) => sec.id === activeId);
+      return s;
+    });
+    if (nextIdx >= 0) setActiveSection(nextIdx);
+  }
+
+  /* ---- Item CRUD ---- */
+  // Every structural edit below delegates to the shared tree ops. They each
+  // used to hold their own loop, which is how the inspection editor and the
+  // template editor came to disagree about what "move down" meant -- and how
+  // "delete" came to mean two different things once items could nest.
+  function applyOps(op: (snap: ops.Snapshot) => ops.Snapshot): TemplateSection[] {
+    const snap = { schemaVersion: 2, sections: structuredClone(sections) } as unknown as ops.Snapshot;
+    const next = op(snap).sections as unknown as TemplateSection[];
+    setSections(next);
+    return next;
+  }
+
+  /** Runs a structural op, then selects whatever new item it produced. */
+  function addAndSelect(op: (snap: ops.Snapshot) => ops.Snapshot) {
+    if (!section) return;
+    const before = new Set(section.items.map((i) => i.id));
+    const fresh = applyOps(op)[activeSection]?.items.find((i) => !before.has(i.id));
+    if (fresh) { setEditingItem(fresh.id); setRightRail("properties"); }
+  }
+
+  const addItem = () => addAndSelect((snap) =>
+    ops.addItem(snap, activeSectionId, m.templates_edit_new_item(), "rich", NEW_RICH_ITEM));
+
+  const addSubItem = (parentItemId: string) => addAndSelect((snap) =>
+    ops.addSubItem(snap, activeSectionId, parentItemId, m.templates_edit_new_item(), "rich", NEW_RICH_ITEM));
+
+  function removeItem(itemId: string) {
+    applyOps((snap) => ops.deleteItem(snap, activeSectionId, itemId));
+    if (editingItem === itemId) setEditingItem(null);
+  }
+
+  const moveItem = (itemId: string, dir: -1 | 1) =>
+    applyOps((snap) => ops.moveItem(snap, activeSectionId, itemId, dir));
+
+  const reorderItem = (fromId: string, toId: string) =>
+    applyOps((snap) => ops.reorderItem(snap, activeSectionId, fromId, toId));
+
+  function updateItem(itemId: string, patch: Partial<TemplateItem>) {
+    updateSections((s) => {
+      const item = s[activeSection].items.find((i) => i.id === itemId);
+      if (item) Object.assign(item, patch);
+      return s;
+    });
+  }
+
+  function duplicateItem(itemId: string) {
+    const before = new Set(section?.items.map((i) => i.id) ?? []);
+    addAndSelect((snap) => {
+      const dup = ops.duplicateItem(snap, activeSectionId, itemId);
+      // Only the ROOT of the copied subtree is renamed. Suffixing every
+      // descendant would rename rows the author never pointed at.
+      const root = dup.sections.find((s) => s.id === activeSectionId)?.items
+        .find((i) => !before.has(i.id));
+      if (root) root.label = m.templates_edit_item_copy_suffix({ label: root.label as string });
+      return dup;
+    });
+  }
+
+  /* ---- Canned comment CRUD ---- */
+  function addCannedToItem(tab: "information" | "limitations" | "defects") {
+    if (!editingItem || !section) return;
+    updateSections((s) => {
+      const item = s[activeSection].items.find((i) => i.id === editingItem);
+      if (!item || item.type !== "rich") return s;
+      if (!item.tabs) item.tabs = { information: [], limitations: [], defects: [] };
+      const prefix = tab === "defects" ? "rd_" : tab === "limitations" ? "rl_" : "ri_";
+      const newId = `${prefix}${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const entry: CannedComment = { id: newId, title: m.templates_edit_new_entry(), comment: "", default: false };
+      if (tab === "defects") {
+        entry.category = "recommendation";
+        entry.location = "";
+        entry.photos = [];
+      }
+      item.tabs[tab].push(entry);
+      return s;
+    });
+  }
+
+  function removeCannedFromItem(tab: "information" | "limitations" | "defects", idx: number) {
+    if (!editingItem || !section) return;
+    updateSections((s) => {
+      const item = s[activeSection].items.find((i) => i.id === editingItem);
+      if (!item?.tabs?.[tab]) return s;
+      item.tabs[tab].splice(idx, 1);
+      return s;
+    });
+  }
+
+  /* ---- Save ---- */
+  function toV2Payload(): Record<string, unknown> {
+    return {
+      schemaVersion: 2,
+      ...serializeTemplateMeta(propertyType, commercialSubtype),
+      sections: sections.map((s) => ({
+        id: s.id,
+        title: s.title,
+        ...(s.icon ? { icon: s.icon } : {}),
+        ...(s.identifier ? { identifier: s.identifier } : {}),
+        ...(s.disclaimerText ? { disclaimerText: s.disclaimerText } : {}),
+        ...(s.alwaysPageBreak ? { alwaysPageBreak: true } : {}),
+        ...(s.source?.platform ? { source: s.source } : {}),
+        ...serializeSectionMeta(s),
+        items: s.items.map(serializeItemForSave),
+      })),
+      ratingSystem: ratingSystem.levels.length ? {
+        ...(ratingSystem.name ? { name: ratingSystem.name } : {}),
+        ...(ratingSystem.defaultLevelId ? { defaultLevelId: ratingSystem.defaultLevelId } : {}),
+        levels: ratingSystem.levels.map((l) => {
+          const lv: Record<string, unknown> = { id: l.id, label: l.label };
+          if (l.abbreviation) lv.abbreviation = l.abbreviation;
+          if (l.color) lv.color = l.color;
+          if (l.severity) lv.severity = l.severity;
+          if (typeof l.isDefect === "boolean") lv.isDefect = l.isDefect;
+          if (typeof l.pausesAdvance === "boolean") lv.pausesAdvance = l.pausesAdvance;
+          if (typeof l.default === "boolean") lv.default = l.default;
+          if (l.description) lv.description = l.description;
+          return lv as unknown as RatingLevel;
+        }),
+      } : undefined,
+    };
+  }
+
+  function handleSave() {
+    submit(
+      { name: templateName, schema: JSON.stringify(toV2Payload()), defaultProfileId: defaultProfileId ?? "" },
+      { method: "post" },
+    );
+  }
+
+  /* ---- Currently selected item ---- */
+  const selectedItem = section?.items.find((i) => i.id === editingItem) || null;
+
+  // Sync choices text when item changes
+  useEffect(() => {
+    if (selectedItem?.options?.choices) {
+      setChoicesText(selectedItem.options.choices.join("\n"));
+    } else {
+      setChoicesText("");
+    }
+  }, [editingItem]);
+
+  // Module C — shared comment-library drawer, hard-filtered by item + rating.
+  const [libraryTab, setLibraryTab] = useState<CannedTab | null>(null);
+  const [commentLibrarySearch, setCommentLibrarySearch] = useState("");
+  const [commentLibrarySelectedIdx, setCommentLibrarySelectedIdx] = useState(0);
+  const [serverComments, setServerComments] = useState<Array<{ id: string; text: string; useCount?: number; lastUsedAt?: string | null }>>([]);
+
+  // Reuse the inspection editor's hook verbatim. `inspectionId` is only a load
+  // key for the tenant library route; the template id is a stable, unique key.
+  // `severityForRatingId` is unused on this surface (we pass the severity
+  // explicitly via TAB_SEVERITY), so a constant identity is sufficient.
+  const comments = useCannedComments({
+    inspectionId: id,
+    severityForRatingId: () => "all",
+  });
+
+  useEffect(() => {
+    if (!libraryTab || !selectedItem) { setServerComments([]); return; }
+    const ctx: { itemLabel?: string; section?: string; severity?: string; search?: string } = {
+      itemLabel: selectedItem.label,
+      severity: TAB_SEVERITY[libraryTab], // hard severity filter = the tab
+    };
+    if (section?.title) ctx.section = section.title; // hard item-context filter
+    const q = commentLibrarySearch.trim();
+    if (q.length >= 2) ctx.search = q;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      comments.fetchFiltered(ctx).then((rows) => {
+        if (cancelled) return;
+        setServerComments(rows as Array<{ id: string; text: string; useCount?: number; lastUsedAt?: string | null }>);
+      });
+    }, q ? 250 : 0);
+    return () => { cancelled = true; clearTimeout(t); };
+    // `selectedItem`/`section` are recomputed each render from state; depend on the
+    // stable ids so the effect re-runs on item/section change, not every render.
+  }, [libraryTab, selectedItem?.id, section?.id, commentLibrarySearch, comments.sort, comments.fetchFiltered]);
+
+  /* ---- Append a picked library comment to a tab (module C) ---- */
+  function addCannedFromLibrary(tab: CannedTab, text: string) {
+    if (!editingItem || !section) return;
+    updateSections((s) => {
+      const item = s[activeSection].items.find((i) => i.id === editingItem);
+      if (!item || item.type !== "rich") return s;
+      if (!item.tabs) item.tabs = { information: [], limitations: [], defects: [] };
+      item.tabs[tab].push(buildCannedFromText(tab, text));
+      return s;
+    });
+  }
+
+  function openCommentLibrary(tab: CannedTab) {
+    comments.setFilterMode("auto"); // ensure item context rides fetchFiltered
+    setCommentLibrarySearch("");
+    setCommentLibrarySelectedIdx(0);
+    setLibraryTab(tab);
+  }
+
+  // Stable reference so the shared editor's seed effect (keyed on the `system`
+  // prop identity) does not re-seed and discard in-progress edits on unrelated
+  // re-renders while the modal is open.
+  const editorSystem = useMemo(
+    () => ({ id, name: ratingSystem.name || m.templates_edit_rating_system(), slug: "template", levels: ratingSystem.levels.map(toEditorLevel) }),
+    [id, ratingSystem],
+  );
+
+  return (
+    <div className="flex flex-col h-screen bg-ih-bg-app">
+      {/* A platform-supplied statutory template. Said once, at the top, rather
+          than disabling forty controls individually: the server refuses every
+          structural write on this template, so the honest thing is to tell the
+          reader why before they try, not after. `info` because nothing is
+          wrong — this is whose template it is. */}
+      {statutoryFormId ? (
+        <Banner tone="info">
+          This template produces the official form{" "}
+          <span className="font-mono">{statutoryFormId}</span> and is supplied with the
+          software. Its structure is read-only. Duplicate it to build your own version.
+        </Banner>
+      ) : null}
+      {/* Toolbar */}
+      <header className="flex items-center justify-between h-12 px-4 border-b border-ih-border bg-ih-bg-card shrink-0">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
+          <Link to="/library/templates" className="inline-flex items-center gap-1 shrink-0 text-ih-fg-3 hover:text-ih-fg-2 text-[13px]"><Icon name="chevL" size={14} /> {m.templates_breadcrumb_current()}</Link>
+          {/* F38 — this was `w-48`: a 192px box for a name that is routinely
+              longer. "Standard Residential Inspection" rendered as "Standard
+              Residential Inspec", clipped by 31px with `text-overflow: clip`,
+              so there was not even an ellipsis to say something was missing —
+              while ~600px of toolbar sat empty to the right of it.
+
+              `size` asks the input to be as wide as its CONTENT, which is the
+              actual requirement ("I can read the name I am editing"), floored
+              so an empty name is still a visible target and capped so a very
+              long one cannot push the toolbar's buttons around. `min-w-0`
+              lets it give that width back when the toolbar is genuinely
+              short of room. */}
+          <input
+            value={templateName}
+            onChange={(e) => setTemplateName(e.target.value)}
+            size={textInputSize(templateName)}
+            aria-label={m.templates_name_label()}
+            className="text-[14px] font-bold bg-transparent border-b border-transparent focus:border-ih-primary outline-none text-ih-fg-1 min-w-0 max-w-full"
+          />
+          <span className="text-[10px] font-mono text-ih-fg-3">v{initialVersion}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Shared theme control (xl+; this bare route has no mobile drawer). */}
+          <ThemeSegmentControl className="hidden xl:flex" />
+          {/* Bespoke: active "watch" tone would fight Button's ghost hover/selected treatment. */}
+          <button
+            onClick={() => setPreviewMode(!previewMode)}
+            className={`h-7 px-3 rounded-md text-[12px] font-bold transition-colors ${previewMode ? "bg-ih-watch-bg text-ih-watch-fg" : "bg-ih-bg-muted text-ih-fg-2"}`}
+          >
+            {previewMode ? m.templates_edit_exit_preview() : m.templates_edit_preview()}
+          </button>
+          <Button variant="secondary" size="sm" onClick={() => setRatingModalOpen(true)}>
+            {m.templates_edit_rating_system()}
+          </Button>
+          <Button variant="primary" size="sm" onClick={handleSave} disabled={saving} aria-busy={saving || undefined}>
+            {saving ? m.templates_edit_saving() : saveSuccess ? m.templates_edit_saved() : m.common_save()}
+          </Button>
+        </div>
+      </header>
+
+      <div className="flex items-center h-10 px-4 border-b border-ih-border bg-ih-bg-card shrink-0 gap-4">
+        <TemplatePropertyTypePanel
+          propertyType={propertyType}
+          commercialSubtype={commercialSubtype}
+          onChange={(patch) => { setPropertyType(patch.propertyType); setCommercialSubtype(patch.commercialSubtype); }}
+        />
+        <label className="flex items-center gap-2 text-[12px] text-ih-fg-3 whitespace-nowrap" title={m.templates_edit_appearance_help()}>
+          {m.templates_edit_appearance_label()}
+          <select
+            value={defaultProfileId}
+            onChange={(e) => setDefaultProfileId(e.target.value)}
+            className="h-7 px-2 rounded-md border border-ih-border bg-ih-bg-card text-ih-fg-1 text-[12px] focus:border-ih-primary focus:shadow-ih-focus outline-none"
+            data-testid="template-default-profile"
+          >
+            <option value="">{m.templates_edit_appearance_inherit()}</option>
+            {CLIENT_PROFILE_LIST.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {fetcherData?.error && (
+        <div className="px-4 py-2 bg-ih-bad-bg text-ih-bad-fg text-[12px] font-medium">
+          {fetcherData.error}
+        </div>
+      )}
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* Section rail */}
+        <SectionRail
+          mode="author"
+          sections={sections}
+          activeSection={activeSectionId}
+          onSelect={selectSectionById}
+          onAddSection={addSection}
+          onMoveSection={(id, dir) => {
+            const idx = findSectionIdx(id);
+            if (idx >= 0) moveSection(idx, dir);
+          }}
+          onDeleteSection={(id) => {
+            const idx = findSectionIdx(id);
+            if (idx >= 0) removeSection(idx);
+          }}
+          onReorderSection={reorderSection}
+        />
+
+        {/* Item nav (center column) */}
+        <div className="w-[280px] shrink-0 flex flex-col overflow-hidden">
+          {section && <SectionAuthorHeader section={section} activeSection={activeSection} renameSection={renameSection} updateSections={updateSections} />}
+          {section ? (
+            previewMode ? (
+              <div className="flex-1 overflow-y-auto p-3"><SectionPreview section={section} /></div>
+            ) : (
+              <ItemList
+                mode="author"
+                items={section.items}
+                sectionId={section.id}
+                activeItemId={editingItem}
+                onSelect={(id) => { setEditingItem(id); setRightRail("properties"); }}
+                onAddItem={addItem}
+                onAddSubItem={addSubItem}
+                confirmSubtreeDelete
+                onDuplicateItem={duplicateItem}
+                onDeleteItem={removeItem}
+                onMoveItem={moveItem}
+                onReorderItem={reorderItem}
+              />
+            )
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-[13px] text-ih-fg-3">{m.templates_edit_empty_add_section()}</div>
+          )}
+        </div>
+
+        {/* Right rail (item properties) — now the main editor area */}
+        {selectedItem && !previewMode && (
+          <aside className="flex-1 border-l border-ih-border bg-ih-bg-card overflow-y-auto">
+            {/* Rail tabs */}
+            <TabStrip
+              tabs={[
+                { id: "properties", label: m.templates_edit_tab_properties() },
+                { id: "comments", label: m.templates_edit_tab_comments() },
+                { id: "preview", label: m.templates_edit_preview() },
+              ]}
+              activeId={rightRail}
+              onChange={(id) => setRightRail(id as "properties" | "comments" | "preview")}
+            />
+
+            <div className="p-4 space-y-3 max-w-xl">
+              {rightRail === "properties" && (
+                <ItemPropertiesPanel
+                  selectedItem={selectedItem}
+                  sectionItems={section?.items ?? []}
+                  updateItem={updateItem}
+                  choicesText={choicesText}
+                  setChoicesText={setChoicesText}
+                />
+              )}
+
+              {rightRail === "comments" && selectedItem.type === "rich" && (
+                <ItemCommentsPanel
+                  selectedItem={selectedItem}
+                  activeSection={activeSection}
+                  editingItem={editingItem}
+                  updateSections={updateSections}
+                  addCannedToItem={addCannedToItem}
+                  removeCannedFromItem={removeCannedFromItem}
+                  onOpenLibrary={openCommentLibrary}
+                  categoryColor={catColor}
+                />
+              )}
+
+              {rightRail === "preview" && (
+                <ItemPreviewPanel selectedItem={selectedItem} categoryColor={catColor} />
+              )}
+            </div>
+          </aside>
+        )}
+      </div>
+
+      {/* Comment library drawer (shared with inspection editor; hard-filtered) */}
+      {libraryTab && selectedItem && section && (
+        <CommentLibraryDrawer
+          open              // required prop (CommentLibraryDrawer.tsx: `open: boolean`); host mounts only while open
+          comments={{
+            filterMode: "auto",            // locked: item context always rides
+            setFilterMode: () => {},       // template hard-filters — no auto/all toggle
+            sort: comments.sort,
+            setSort: comments.setSort,
+            touchSnippet: comments.touchSnippet,
+          }}
+          state={{
+            activeItem: { label: selectedItem.label },
+            currentSection: { id: section.id, title: section.title },
+            activeItemId: selectedItem.id,
+            getResult: () => ({}),          // template authoring has no per-item rating result
+            commentLibraryFilter: TAB_SEVERITY[libraryTab], // severity chip pinned to the tab's severity
+            setCommentLibraryFilter: () => {},            // locked
+            setCommentLibrarySelectedIdx,
+            commentLibrarySearch,
+            setCommentLibrarySearch,
+            commentLibrarySelectedIdx,
+            setShowCommentLibrary: (open: boolean) => { if (!open) setLibraryTab(null); },
+          }}
+          serverComments={serverComments}
+          onInsert={(_sectionId, _itemId, text) => addCannedFromLibrary(libraryTab, text)}
+          onClose={() => setLibraryTab(null)}
+        />
+      )}
+
+      {/* Rating system editor — canonical editor shared with /library/rating-systems (module F).
+          `onSaveLevels` writes back onto the template's own schema instead of POSTing to the
+          library table. */}
+      <RatingSystemEditor
+        open={ratingModalOpen}
+        onClose={() => setRatingModalOpen(false)}
+        system={editorSystem}
+        onSaveLevels={(levels) => {
+          setRatingSystem((prev) => {
+            const nextLevels = levels.map((l, i) => {
+              const next = fromEditorLevel(l, i);
+              // Preserve per-level fields the shared editor does not author
+              // (description feeds inspection helpers.backfillLevelDescriptions;
+              // `default` is a legacy per-level flag) by re-attaching from the
+              // prior level with the same id.
+              const old = prev.levels.find((o) => o.id === next.id);
+              if (old) {
+                if (old.description !== undefined) next.description = old.description;
+                if (old.default !== undefined) next.default = old.default;
+              }
+              return next;
+            });
+            const defaultLevelId = nextLevels.some((l) => l.id === prev.defaultLevelId)
+              ? prev.defaultLevelId
+              : nextLevels[0]?.id;
+            return { ...prev, levels: nextLevels, defaultLevelId };
+          });
+        }}
+      />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Error boundary                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Local boundary so a failed template fetch (404/403) or an unexpected render
+ * error surfaces an actionable message + a way back to the list, instead of a
+ * blank full-screen editor that looks like "the editor never opened".
+ */
+export function ErrorBoundary() {
+  const error = useRouteError();
+  const status = isRouteErrorResponse(error) ? error.status : null;
+  const message =
+    status === 404
+      ? m.templates_edit_error_not_found()
+      : status === 403
+        ? m.templates_edit_error_forbidden()
+        : m.templates_edit_error_generic();
+
+  return (
+    <div className="flex flex-col items-center justify-center h-screen bg-ih-bg-app gap-3 px-6 text-center">
+      <p className="text-[15px] font-bold text-ih-fg-1">{message}</p>
+      <Link to="/library/templates" className="h-8 px-4 inline-flex items-center rounded-md bg-ih-primary text-ih-fg-inverse font-bold text-[13px] hover:bg-ih-primary-600">
+        {m.templates_edit_error_back()}
+      </Link>
+    </div>
+  );
+}

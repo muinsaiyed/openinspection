@@ -1,0 +1,142 @@
+import { Link } from "react-router";
+import { Table, Icon } from "@core/shared-ui";
+import { TemplateIcon } from "./TemplateIcon";
+import { countItems, type Template } from "./types";
+import { EntityAuditTrail } from "~/components/audit/EntityAuditTrail";
+import { importEntryHref } from "~/lib/import-entry-points";
+import { m } from "~/paraglide/messages";
+
+interface TemplatesListViewProps {
+  filtered: Template[];
+  searchQuery: string;
+  setCreateOpen: (open: boolean) => void;
+  handleDuplicate: (t: Template) => void;
+  setDeleteConfirm: (id: string | null) => void;
+  /** Viewer's effective zone for the audit-trail timestamps. */
+  timeZone: string;
+  /** Resolved from the server's capability set by the route (#307). Duplicate
+   *  is a CREATE — it POSTs a new template — so it rides on canCreate, not on
+   *  an "edit" reading of the word. TemplatesCardView takes the same three:
+   *  a UI capability applied to one of two views is a control the other view
+   *  keeps offering. */
+  canCreate: boolean;
+  /** Whether to offer the import entrance at all — the wizard link is
+   *  hidden rather than disabled, matching the page header. */
+  canImport: boolean;
+  canDelete: boolean;
+}
+
+export function TemplatesListView({
+  filtered,
+  searchQuery,
+  setCreateOpen,
+  handleDuplicate,
+  setDeleteConfirm,
+  timeZone,
+  canCreate,
+  canImport,
+  canDelete,
+}: TemplatesListViewProps) {
+  return (
+    <div className="bg-ih-bg-card border border-ih-border rounded-lg overflow-hidden">
+      <Table<Template>
+        rows={filtered}
+        getRowKey={(t) => t.id}
+        empty={
+          searchQuery ? (
+            <p className="py-12 text-center text-[13px] text-ih-fg-3">{m.templates_empty_search()}</p>
+          ) : (
+            <div className="py-14 flex flex-col items-center gap-4">
+              <div className="w-12 h-12 rounded-xl bg-ih-primary-tint flex items-center justify-center text-ih-primary-text">
+                <TemplateIcon size="lg" />
+              </div>
+              <div className="text-center">
+                <p className="text-[15px] font-bold text-ih-fg-1">{m.templates_empty_title()}</p>
+                <p className="text-[13px] text-ih-fg-3 mt-1 max-w-xs">
+                  {m.templates_empty_body()}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {canImport && (
+                  // Same address as the page header's control, from the same
+                  // builder. This empty state is where a person with no
+                  // templates starts, so it is the entrance most likely to be
+                  // the FIRST one used and the one most easily left behind.
+                  <Link
+                    to={importEntryHref("templates.create")}
+                    className="h-9 px-4 rounded-md bg-ih-primary text-ih-fg-inverse font-bold text-[13px] hover:bg-ih-primary-600 inline-flex items-center gap-2"
+                  >
+                    <Icon name="download" size={16} strokeWidth={1.75} />
+                    {m.templates_action_import()}
+                  </Link>
+                )}
+                {canCreate && (
+                  <button
+                    onClick={() => setCreateOpen(true)}
+                    className="h-9 px-3 rounded-md border border-ih-border text-[13px] font-bold text-ih-fg-3 hover:bg-ih-bg-muted inline-flex items-center gap-2"
+                  >
+                    {m.templates_empty_new()}
+                  </button>
+                )}
+              </div>
+            </div>
+          )
+        }
+        columns={[
+          {
+            label: m.templates_col_name(),
+            cell: (t) => (
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 bg-ih-primary-tint rounded-lg flex items-center justify-center text-ih-primary-text group-hover:bg-ih-primary group-hover:text-ih-fg-inverse transition-all shrink-0">
+                  <TemplateIcon />
+                </div>
+                <div>
+                  <Link to={`/templates/${t.id}/edit`} className="text-[13px] font-bold text-ih-fg-1 hover:text-ih-primary-text transition-colors">
+                    {t.name}
+                  </Link>
+                  {t.source === "marketplace" && (
+                    <span className="ml-2 text-[9px] font-bold uppercase tracking-widest text-ih-info-fg bg-ih-info-bg px-1.5 py-0.5 rounded">{m.templates_badge_marketplace()}</span>
+                  )}
+                  {t.description && (
+                    <p className="text-[11px] text-ih-fg-3 mt-0.5 line-clamp-1">{t.description}</p>
+                  )}
+                  <EntityAuditTrail entityId={t.id} timeZone={timeZone} />
+                </div>
+              </div>
+            ),
+          },
+          {
+            label: m.templates_col_version(),
+            cell: (t) => (
+              <span className="inline-flex items-center rounded border border-ih-primary/20 px-1.5 py-0.5 text-[10px] font-bold bg-ih-primary-tint text-ih-primary-text">
+                v{t.version || 1}.0
+              </span>
+            ),
+          },
+          { label: m.templates_col_items(), cell: (t) => <span className="text-ih-fg-3 font-bold">{m.templates_row_items({ count: countItems(t) })}</span> },
+          {
+            label: m.templates_col_actions(),
+            align: "right",
+            cell: (t) => (
+              <div className="inline-flex items-center gap-3">
+                <Link to={`/templates/${t.id}/edit`} className="text-[11px] font-bold text-ih-primary-text hover:text-ih-primary-text">
+                  {m.common_edit()}
+                </Link>
+                {canCreate && (
+                  <button onClick={() => handleDuplicate(t)} className="text-[11px] font-bold text-ih-fg-3 hover:text-ih-primary-text transition-colors">
+                    {m.templates_action_duplicate()}
+                  </button>
+                )}
+                {canDelete && (
+                  <button onClick={() => setDeleteConfirm(t.id)} className="text-[11px] font-bold text-ih-fg-3 hover:text-ih-bad-fg transition-colors">
+                    {m.common_delete()}
+                  </button>
+                )}
+              </div>
+            ),
+          },
+        ]}
+      />
+    </div>
+  );
+}

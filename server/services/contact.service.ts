@@ -1,0 +1,358 @@
+import { drizzle } from 'drizzle-orm/d1';
+import { eq, and, like, sql, isNull, isNotNull } from 'drizzle-orm';
+import { contacts, type ContactType } from '../lib/db/schema/contact';
+import { inspectionPeople, contactRoleProfiles } from '../lib/db/schema/inspection/role-profiles';
+import { Errors } from '../lib/errors';
+import { buildContactDetail } from './contact-detail';
+import { escapeLikePattern } from '../lib/db/like-escape';
+import { safeISODate } from '../lib/date';
+import { normalizeLocale } from '../lib/i18n/contact-locale';
+import { tenantConfigs } from '../lib/db/schema';
+import { logger } from '../lib/logger';
+
+export class ContactService {
+    /**
+     * `portalAccess` is optional so the many tests that construct this service
+     * bare keep working. When absent, archive simply does not revoke — the
+     * conservative direction: failing to revoke is visible on the next audit,
+     * whereas revoking by accident silently breaks a customer's report link.
+     */
+    constructor(
+        private db: D1Database,
+        private portalAccess?: import('./portal-access.service').PortalAccessService,
+    ) {}
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private getDrizzle() { return drizzle(this.db as any); }
+
+    async listContacts(tenantId: string, opts: { type?: ContactType; search?: string; archived?: 'exclude' | 'only'; limit: number; offset: number }) {
+        const db = this.getDrizzle();
+        // IA-120 — archived rows used to be unconditionally excluded here, which
+        // is what made Archive a one-way door: written by the button, readable
+        // by nothing.
+        const conditions = [
+            eq(contacts.tenantId, tenantId),
+            opts.archived === 'only' ? isNotNull(contacts.archivedAt) : isNull(contacts.archivedAt),
+        ];
+        if (opts.type) conditions.push(eq(contacts.type, opts.type));
+        if (opts.search) conditions.push(like(contacts.name, `%${escapeLikePattern(opts.search)}%`));
+
+        const rows = await db.select().from(contacts).where(and(...conditions)).limit(opts.limit).offset(opts.offset).all();
+
+        // "Which inspections is this contact on" is uniform across contact
+        // types (agent vs client): any inspection_people row naming this
+        // contact in ANY role, on ANY inspection in this tenant. Replaces the
+        // legacy dual-path (referredByAgentId for agents, clientEmail match
+        // for clients) — a contact could hold >1 role on one inspection, so
+        // count DISTINCT inspection ids.
+        const withCounts = await Promise.all(rows.map(async (c) => {
+            const res = await db.select({
+                count: sql<number>`count(distinct ${inspectionPeople.inspectionId})`,
+                // Referral = inspections where this contact is the tenant's
+                // buyer_agent (the metric an inspector reads as "jobs this agent
+                // sent me"). All-role count stays as inspectionCount.
+                referralCount: sql<number>`count(distinct case when ${contactRoleProfiles.key} = 'buyer_agent' then ${inspectionPeople.inspectionId} end)`,
+            })
+                .from(inspectionPeople)
+                .leftJoin(contactRoleProfiles, eq(contactRoleProfiles.id, inspectionPeople.roleProfileId))
+                .where(and(eq(inspectionPeople.tenantId, tenantId), eq(inspectionPeople.contactId, c.id)))
+                .get();
+            return { ...c, inspectionCount: res?.count ?? 0, referralCount: res?.referralCount ?? 0 };
+        }));
+
+        return withCounts.map(c => ({ ...c, createdAt: safeISODate(c.createdAt) }));
+    }
+
+    /**
+     * IA-18 (#111) — contact detail page payload: the contact, its inspection
+     * history (date desc), and aggregate stats.
+     *
+     * History linkage (uniform across agent/client, Task 9c-X2): inspections
+     * that have an inspection_people row naming this contact in ANY role
+     * (buyer_agent, listing_agent, client, co_client, ...), replacing the
+     * legacy dual-path (referredByAgentId/sellingAgentId for agents,
+     * clientContactId/clientEmail for clients — frozen cache, dropped Task 13).
+     * A contact could hold >1 role on one inspection, so the join is deduped
+     * by inspection id.
+     *
+     * Archived contacts STILL return detail (the history stays useful after a
+     * soft-delete). Cross-tenant / unknown ids return null.
+     *
+     * Revenue authority chain (DB-5): revenue = Σ amountCents of PAID invoices
+     * (paidAt IS NOT NULL) joined on those inspection ids — money actually
+     * received. Inspections without a paid invoice contribute zero revenue but
+     * still count toward inspectionCount.
+     */
+    async getContactDetail(id: string, tenantId: string) {
+        return buildContactDetail(this.getDrizzle(), id, tenantId);
+    }
+
+    async createContact(tenantId: string, data: { type: ContactType; name: string; email?: string | null | undefined; phone?: string | null | undefined; agency?: string | null | undefined; notes?: string | null | undefined; locale?: string | null | undefined; createdByUserId?: string | null | undefined }) {
+        const db = this.getDrizzle();
+        const normalized = {
+            email: data.email ?? null,
+            phone: data.phone ?? null,
+            agency: data.agency ?? null,
+            notes: data.notes ?? null,
+            // Reduced to a locale the catalogue actually covers, so what is
+            // stored is always something resolveContactLocale would hand back;
+            // anything else becomes NULL rather than a promise broken at send
+            // time. Same reduction the booking path applies.
+            locale: normalizeLocale(data.locale),
+            // A1 auto-link uses this to populate agent_tenant_links.invited_by_user_id
+            // when the agent later signs up with the same email — keeps the
+            // /agent-inspectors card pointing at the actual inviting inspector.
+            createdByUserId: data.createdByUserId ?? null,
+        };
+        const row = { id: crypto.randomUUID(), tenantId, createdAt: new Date(), type: data.type, name: data.name, ...normalized };
+        await db.insert(contacts).values(row);
+        return { ...row, createdAt: safeISODate(row.createdAt), inspectionCount: 0 };
+    }
+
+    async updateContact(id: string, tenantId: string, data: Partial<{ type: ContactType; name: string; email: string | null; phone: string | null; agency: string | null; notes: string | null; locale: string | null }>) {
+        const db = this.getDrizzle();
+        const existing = await db.select().from(contacts).where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId))).get();
+        if (!existing) throw Errors.NotFound('Contact not found');
+        // Agent email is the cross-tenant identity + referral/auto-link key
+        // (see server/services/agent/referral.ts + signup.ts): editing it can
+        // re-route report visibility to a different agent and collide with the
+        // (tenant,email) partial-unique index. Freeze it server-side — the UI
+        // also renders it read-only, but this is the authoritative guard. To
+        // change an agent's email, archive the record and add a new one.
+        const patch = { ...data };
+        if (existing.type === 'agent' && 'email' in patch) delete patch.email;
+        // Only when the caller actually said something about it: an absent key
+        // must leave a stored preference alone, while an explicit null is a
+        // correction back to "not stated". Normalizing on the way in keeps the
+        // column's contract — every stored value is one the resolver returns.
+        if ('locale' in patch) patch.locale = normalizeLocale(patch.locale);
+        await db.update(contacts).set(patch).where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId)));
+        return { ...existing, ...patch, createdAt: safeISODate(existing.createdAt) };
+    }
+
+    async deleteContact(id: string, tenantId: string) {
+        const db = this.getDrizzle();
+        const existing = await db.select().from(contacts).where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId))).get();
+        if (!existing) throw Errors.NotFound('Contact not found');
+        // If nothing references this contact, hard-delete so import mistakes /
+        // junk rows leave no residue and don't linger against the (tenant,email)
+        // partial-unique index. Otherwise soft-archive: inspection_people.contact_id
+        // references this row, so a hard delete would orphan historical
+        // inspections (and the agent's access to them, which the referral join
+        // preserves for archived contacts — see the referral-visibility test).
+        const ref = await db.select({ id: inspectionPeople.id }).from(inspectionPeople)
+            .where(and(eq(inspectionPeople.tenantId, tenantId), eq(inspectionPeople.contactId, id)))
+            .get();
+        if (!ref) {
+            await db.delete(contacts).where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId)));
+            return;
+        }
+        // Idempotent — re-archiving an archived row is a no-op set.
+        await db.update(contacts).set({ archivedAt: new Date() })
+            .where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId)));
+
+        // IA-100 — archiving a contact LOOKED like it cut off their access and
+        // did not: a report link is a per-inspection token that works with no
+        // account, so it survives the contact row being retired. Whether that
+        // is right depends on what the tenant means by "archive", so it is
+        // their setting rather than our guess — see is_archive_revoking_access.
+        //
+        // Type-agnostic: clients hold these links exactly as agents do.
+        if (existing.email) {
+            const revokes = await db.select({ on: tenantConfigs.archiveRevokesAccess })
+                .from(tenantConfigs).where(eq(tenantConfigs.tenantId, tenantId)).get();
+            if (revokes?.on) {
+                const n = await this.portalAccess?.revokeAccessForRecipient(tenantId, existing.email) ?? 0;
+                if (n > 0) logger.info('contact.archive.revoked_access', { tenantId, contactId: id, revoked: n });
+            }
+        }
+    }
+
+    /**
+     * Undo an archive (IA-120).
+     *
+     * Deliberately narrow: it clears `archivedAt` and nothing else. Archiving
+     * can also REVOKE report links when the tenant has that policy on, and those
+     * are not resurrected here — a revoked link is revoked, and re-granting
+     * access is the People card's job ("Reset access link"), not a side effect
+     * of un-hiding a contact row. Restoring a contact must not silently hand
+     * someone back a report.
+     *
+     * Note the asymmetry with archive(): archive DELETES the row outright when
+     * the contact is referenced by no inspection, so there is nothing to restore
+     * in that case. Restore therefore only ever applies to contacts that have
+     * history — which is exactly the set worth keeping.
+     */
+    async restoreContact(id: string, tenantId: string): Promise<{ restored: boolean }> {
+        const db = this.getDrizzle();
+        const row = await db.select({ archivedAt: contacts.archivedAt }).from(contacts)
+            .where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId))).get();
+        if (!row) throw Errors.NotFound('Contact not found');
+        if (!row.archivedAt) return { restored: false };
+        await db.update(contacts).set({ archivedAt: null })
+            .where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId)));
+        return { restored: true };
+    }
+
+    /**
+     * Every inspection this contact can still open (IA-100). Null when the
+     * contact does not exist in this tenant, so the route can 404 rather than
+     * report an empty list for an id that was never theirs — those two answers
+     * look identical to a caller and mean very different things.
+     *
+     * An empty array for a contact with no email is correct: a token is
+     * addressed to an email, so there is nothing to hold.
+     */
+    async listAccess(id: string, tenantId: string): Promise<Array<{
+        inspectionId: string;
+        propertyAddress: string | null;
+        role: string;
+        roleLabel: string | null;
+        createdAt: number | null;
+    }> | null> {
+        const db = this.getDrizzle();
+        const row = await db.select({ email: contacts.email }).from(contacts)
+            .where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId))).get();
+        if (!row) return null;
+        if (!row.email || !this.portalAccess) return [];
+        const live = await this.portalAccess.listLiveAccessByRecipient(tenantId, row.email);
+        const labelByKey = await this.roleLabels(tenantId);
+        // IA-119 — `role` is a role-profile KEY. This panel is read by an
+        // operator deciding what a live link grants, so it shows the tenant's
+        // own wording. `null` when the profile was retired or deactivated: the
+        // panel falls back to the key, which is ugly and true, rather than to a
+        // label this layer invented for a role the tenant no longer defines.
+        return live.map((a) => ({ ...a, roleLabel: labelByKey.get(a.role) ?? null }));
+    }
+
+    /**
+     * The tenant's active role vocabulary, key → display label. The same lookup
+     * `report-view-status.ts` does for the delivery list, and the only place
+     * these labels live — they are tenant-editable, so no map in code can stand
+     * in for them.
+     */
+    private async roleLabels(tenantId: string): Promise<Map<string, string>> {
+        const rows = await this.getDrizzle()
+            .select({ key: contactRoleProfiles.key, label: contactRoleProfiles.label })
+            .from(contactRoleProfiles)
+            .where(and(
+                eq(contactRoleProfiles.tenantId, tenantId),
+                eq(contactRoleProfiles.active, true),
+            ))
+            .all();
+        return new Map(rows.map((r) => [r.key, r.label]));
+    }
+
+    /**
+     * Withdraw some or all of that access. Null on an unknown contact (see
+     * listAccess); otherwise the number of links ACTUALLY revoked, which can
+     * be lower than asked for when a link had already lapsed. Reporting the
+     * real number matters: "revoked 3" when one was already dead would teach
+     * an operator to trust a count that is not measuring anything.
+     */
+    async revokeAccess(id: string, tenantId: string, inspectionIds?: string[]): Promise<number | null> {
+        const db = this.getDrizzle();
+        const row = await db.select({ email: contacts.email }).from(contacts)
+            .where(and(eq(contacts.id, id), eq(contacts.tenantId, tenantId))).get();
+        if (!row) return null;
+        if (!row.email || !this.portalAccess) return 0;
+        const n = await this.portalAccess.revokeAccessForRecipient(tenantId, row.email, inspectionIds);
+        if (n > 0) logger.info('contact.access.revoked', { tenantId, contactId: id, revoked: n });
+        return n;
+    }
+
+    /**
+     * How many live report links this contact still holds (IA-100). Drives the
+     * archive dialog's warning, so an operator is never asked to archive
+     * someone without being told what that does or does not withdraw.
+     */
+    async liveAccessCount(id: string, tenantId: string): Promise<number> {
+        return (await this.listAccess(id, tenantId))?.length ?? 0;
+    }
+
+    /**
+     * IA-1 — Idempotent upsert used during inspection creation to capture client
+     * and agent people without double-creating rows.
+     *
+     * Rules:
+     * - Email is normalized to lowercase+trim before any lookup or write.
+     * - Email present: find ACTIVE (archived_at IS NULL) row by (tenantId, normalizedEmail).
+     *   - Found: fill-forward: set name/phone ONLY where existing value is null/empty. Returns {id, created:false}.
+     *   - Not found: INSERT a new row. Returns {id, created:true}.
+     * - Email absent: always INSERT a name-only row. Returns {id, created:true}.
+     * - Archived rows with matching email are NOT matched (the partial unique allows a fresh active row).
+     */
+    async upsertClientContact(
+        tenantId: string,
+        // `?: T | undefined` rather than `?: T`: under exactOptionalPropertyTypes the
+        // bare form refuses an explicitly-passed `undefined`, and every caller builds
+        // this object out of Zod `.optional()` fields, which are exactly `T | undefined`.
+        // The body below reads each of these through a truthiness check or `?? null`,
+        // so an omitted key and an undefined one are already the same input.
+        input: { name: string; email?: string | undefined; phone?: string | undefined; type: 'client' | 'agent'; locale?: string | null | undefined },
+    ): Promise<{ id: string; created: boolean }> {
+        const db = this.getDrizzle();
+        const normalizedEmail = input.email ? input.email.toLowerCase().trim() : undefined;
+
+        if (normalizedEmail) {
+            // Look for an ACTIVE row with this email (archived_at IS NULL).
+            const existing = await db
+                .select()
+                .from(contacts)
+                .where(
+                    and(
+                        eq(contacts.tenantId, tenantId),
+                        eq(contacts.email, normalizedEmail),
+                        isNull(contacts.archivedAt),
+                    ),
+                )
+                .get();
+
+            if (existing) {
+                // Fill-forward: only update name/phone if currently null/empty.
+                const updates: Partial<{ name: string; phone: string; locale: string }> = {};
+                if ((!existing.name || existing.name.trim() === '') && input.name) {
+                    updates.name = input.name;
+                }
+                if ((!existing.phone || existing.phone.trim() === '') && input.phone) {
+                    updates.phone = input.phone;
+                }
+                // Locale does NOT fill forward: the contact has just told us
+                // again, and the newer answer is the true one. Being written to
+                // in English after asking for Spanish is the failure this
+                // avoids. An omitted choice still never clears a stored one —
+                // silence is not a retraction.
+                if (input.locale && input.locale !== existing.locale) {
+                    updates.locale = input.locale;
+                }
+                if (Object.keys(updates).length > 0) {
+                    await db
+                        .update(contacts)
+                        .set(updates)
+                        // tenantId as well as id: `existing` came from a
+                        // tenant-scoped read, so this is belt-and-braces, but
+                        // an id-only write is the shape the scoping gate exists
+                        // to keep out of the codebase — and it costs nothing.
+                        .where(and(eq(contacts.id, existing.id), eq(contacts.tenantId, tenantId)));
+                }
+                return { id: existing.id, created: false };
+            }
+        }
+
+        // INSERT — either no email or no matching active row found.
+        const id = crypto.randomUUID();
+        await db.insert(contacts).values({
+            id,
+            tenantId,
+            type: input.type,
+            name: input.name,
+            email: normalizedEmail ?? null,
+            phone: input.phone ?? null,
+            agency: null,
+            notes: null,
+            locale: input.locale ?? null,
+            createdAt: new Date(),
+        });
+        return { id, created: true };
+    }
+}

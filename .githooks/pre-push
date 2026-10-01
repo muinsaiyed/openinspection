@@ -1,0 +1,187 @@
+#!/usr/bin/env sh
+# .githooks/pre-push — openinspection
+#
+# Worker bundle-size gate. Moved here from pre-commit: Workers FREE caps the
+# script at 3 MiB gzipped and OpenInspection promises one-click Free-plan
+# deploys, so an oversized bundle breaks every self-hoster — but the bundle can
+# only actually break at DEPLOY, and the check runs the REAL build pipeline
+# (~1-2 min). Paying that on every commit was overkill; here it runs once per
+# push. CI's required "verify" check remains the authoritative final gate.
+#
+# Activated via core.hooksPath .githooks (set by the "prepare" npm script).
+# Bypass (discouraged): git push --no-verify
+
+# Never run in CI / non-interactive contexts (CI does not push, but guard anyway).
+[ -n "$CI" ] && exit 0
+
+# Bound the node build step so it doesn't exhaust RAM on this machine.
+case " $NODE_OPTIONS " in *"--max-old-space-size"*) : ;; *) export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=4096" ;; esac
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# printf, not echo: POSIX sh echo does not interpret \n or \033 escapes.
+pass() { printf '  ✓  %b\n' "$1"; }
+fail() { printf '  ✗  %b\n' "$1"; }
+step() { printf '\n  →  %b\n' "$1"; }
+
+printf '%b\n' "${BOLD}── OpenInspection (Pre-push Checks) ─────────────────────────────${NC}"
+
+ZERO=0000000000000000000000000000000000000000
+
+# stdin can only be read ONCE, and two steps below need it, so slurp it here.
+REFS=$(cat)
+
+# A push that only DELETES refs ships no code. It used to pay for everything
+# anyway: the loop below `continue`s past a deletion, which leaves CHANGED empty,
+# and the skip condition requires a non-empty CHANGED — so "no evidence" fell
+# through to the fail-safe and ran a full worker build. Cleaning up four merged
+# branches meant four builds plus four network audits, which is how a routine
+# tidy-up timed out. Deleting a branch is positive evidence that nothing ships,
+# not an absence of evidence.
+if [ -n "$REFS" ]; then
+    NON_DELETE=$(printf '%s\n' "$REFS" | awk -v z="$ZERO" 'NF && $2 != z')
+    if [ -z "$NON_DELETE" ]; then
+        pass "Skipped — this push only deletes refs, so nothing ships"
+        printf '\n%b\n' "${GREEN}Pre-push checks passed.${NC}"
+        exit 0
+    fi
+fi
+
+# Dependency advisories. Runs on EVERY push, deliberately NOT gated on whether
+# package-lock.json moved: an advisory is published against code that is already
+# sitting in the lockfile, so "nothing changed" is exactly the case it has to
+# catch. The nanoid advisory this gate was written for sat in three repositories
+# for ten days without a single dependency edit.
+#
+# It asks the registry directly rather than trusting Dependabot's alert count,
+# because that count lags the advisory (measured: 8.5 hours and 10 days).
+# Offline / registry down: SKIP_ADVISORY_AUDIT=1 git push — it says so loudly.
+step "Dependency advisories"
+ADV_OUT=$(node scripts/check-advisories.mjs --level=high 2>&1)
+ADV_RC=$?
+if [ "$ADV_RC" -eq 0 ]; then
+    pass "$(printf '%s' "$ADV_OUT" | tail -1)"
+else
+    printf '%s\n' "$ADV_OUT"
+    fail "Dependency-advisory gate failed"
+    printf '\n%b\n' "${RED}Pre-push checks failed. Fix the errors before pushing.${NC}"
+    exit 1
+fi
+
+# --- QuickBooks live contract ------------------------------------------------
+#
+# Runs only when this push touches the QuickBooks adapter, because it is the
+# only lane that can see the things no schema carries: which fault code a
+# duplicate name really returns, that v3 has no PUT, that a colon is refused.
+# Six paths in that adapter had never once worked in production while the unit
+# suite was green, and every one of them was invisible for the same reason —
+# the tests supplied the upstream's answers.
+#
+# It needs a connected Intuit SANDBOX. Contributors who have none get a failure
+# naming exactly what is missing plus the opt-out below; that is deliberate.
+# Silence would be indistinguishable from a pass, and a gate nobody can satisfy
+# gets bypassed wholesale rather than argued with:
+#
+#     SKIP_QBO_CONTRACT=1 git push       # says so, loudly, in the output
+#
+QBO_PATHS='^apps/openinspection/server/services/qbo/|^server/services/qbo/|^tests/contract/qbo/'
+QBO_CHANGED=""
+while read -r _l_ref l_sha _r_ref r_sha; do
+    [ -z "$l_sha" ] && continue
+    [ "$l_sha" = "$ZERO" ] && continue
+    if [ "$r_sha" = "$ZERO" ] || [ -z "$r_sha" ]; then
+        # A brand-new branch has no remote counterpart, so the range has to be
+        # computed from a main ref. UPSTREAM FIRST, and that order matters on a
+        # fork: `origin/main` here is the fork's copy and it lags the canonical
+        # branch by however many PRs have merged since it was last synced. A
+        # range measured from the stale one re-attributes already-merged,
+        # already-verified work to the new branch — which is exactly what fired
+        # this gate on a branch that touches no QuickBooks file at all, and a
+        # gate that fires on every first push is one people learn to skip.
+        QBASE=$(git merge-base "$l_sha" upstream/main 2>/dev/null)             || QBASE=$(git merge-base "$l_sha" origin/main 2>/dev/null)             || QBASE=""
+        [ -z "$QBASE" ] && { QBO_CHANGED="unknown"; break; }
+        QRANGE="$QBASE..$l_sha"
+    else
+        QRANGE="$r_sha..$l_sha"
+    fi
+    QF=$(git diff --name-only "$QRANGE" 2>/dev/null) || { QBO_CHANGED="unknown"; break; }
+    QBO_CHANGED="$QBO_CHANGED
+$QF"
+done <<QREFS_EOF
+$REFS
+QREFS_EOF
+
+if [ "$QBO_CHANGED" = "unknown" ] || printf '%s\n' "$QBO_CHANGED" | grep -qE "$QBO_PATHS"; then
+    step "QuickBooks live contract"
+    if [ "${SKIP_QBO_CONTRACT:-0}" = "1" ]; then
+        pass "SKIPPED by SKIP_QBO_CONTRACT=1 — the QuickBooks adapter changed and nothing verified it against the real API"
+    else
+        QBO_OUT=$(npm run --silent test:contract:live 2>&1)
+        if [ $? -eq 0 ]; then
+            pass "$(printf '%s' "$QBO_OUT" | grep -E '^\s+Tests ' | tail -1)"
+        else
+            printf '%s\n' "$QBO_OUT" | tail -30
+            fail "QuickBooks live contract failed — or no sandbox is connected (the reason is printed above)"
+            printf '%b\n' "  No Intuit sandbox on this machine? ${YELLOW}SKIP_QBO_CONTRACT=1 git push${NC}"
+            printf '\n%b\n' "${RED}Pre-push checks failed. Fix the errors before pushing.${NC}"
+            exit 1
+        fi
+    fi
+fi
+
+# The gate runs a REAL build (~1-2 min). Nothing that cannot reach the worker
+# bundle can change its size, so a push touching only .github/, docs/ or tests/
+# should not pay for one. Work out what is actually being pushed from the refs
+# git feeds this hook on stdin.
+#
+# Fail-safe in both directions: an unreadable range, a brand-new branch with no
+# merge-base, or an empty stdin all fall through to RUNNING the check. Skipping
+# is only ever chosen on positive evidence that nothing bundle-affecting moved.
+BUNDLE_PATHS='^(server|app|workers|packages|public|scripts)/|^(package\.json|package-lock\.json|vite\.config|react-router\.config|wrangler|tsconfig)'
+CHANGED=""
+FORCE_CHECK=0
+# Reads the slurped $REFS, not stdin: stdin was consumed at the top of this file.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    [ "$local_sha" = "$ZERO" ] && continue          # branch deletion — nothing to build
+    if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ]; then
+        BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null)
+        [ -z "$BASE" ] && { FORCE_CHECK=1; break; }
+        RANGE="$BASE..$local_sha"
+    else
+        RANGE="$remote_sha..$local_sha"
+    fi
+    FILES=$(git diff --name-only "$RANGE" 2>/dev/null) || { FORCE_CHECK=1; break; }
+    CHANGED="$CHANGED
+$FILES"
+done <<REFS_EOF
+$REFS
+REFS_EOF
+
+if [ "$FORCE_CHECK" -eq 0 ] && [ -n "$CHANGED" ] &&    ! printf '%s
+' "$CHANGED" | grep -qE "$BUNDLE_PATHS"; then
+    step "Worker bundle size"
+    pass "Skipped — nothing bundle-affecting in this push (CI's build job remains the gate)"
+    printf '
+%b
+' "${GREEN}Pre-push checks passed.${NC}"
+    exit 0
+fi
+
+step "Worker bundle size"
+BUNDLE_OUT=$(node scripts/check-bundle-size.mjs 2>&1)
+BUNDLE_RC=$?
+BUNDLE_LINE=$(echo "$BUNDLE_OUT" | grep -E '^\[bundle-size\] (worker upload|FAIL|WARNING)' | tail -2 | tr '\n' ' ')
+if [ "$BUNDLE_RC" -eq 0 ]; then
+    pass "Bundle size OK — ${BUNDLE_LINE:-see node scripts/check-bundle-size.mjs}"
+    printf '\n%b\n' "${GREEN}Pre-push checks passed.${NC}"
+    exit 0
+else
+    fail "Bundle size gate failed — ${BUNDLE_LINE:-run node scripts/check-bundle-size.mjs}"
+    printf '\n%b\n' "${RED}Pre-push checks failed. Fix the errors before pushing.${NC}"
+    exit 1
+fi

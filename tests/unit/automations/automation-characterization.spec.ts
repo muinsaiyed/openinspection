@@ -1,0 +1,309 @@
+// apps/openinspection/tests/unit/automation-characterization.spec.ts
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import * as schema from '../../../server/lib/db/schema';
+import { createTestDb, setupSchema } from '../db';
+import { asD1Db } from '../helpers/test-db';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
+
+vi.mock('drizzle-orm/d1', () => ({ drizzle: vi.fn() }));
+import { drizzle as mockDrizzle } from 'drizzle-orm/d1';
+import { AutomationService } from '../../../server/services/automation.service';
+import { SmsConsentService } from '../../../server/services/sms-consent.service';
+import { PeopleService } from '../../../server/services/people.service';
+import { seedRoleProfiles } from '../../../server/services/seed/seed-role-profiles';
+import type { EmailService } from '../../../server/services/email.service';
+
+const TENANT = '00000000-0000-0000-0000-000000000001';
+const roleProfileId = (key: string) => `crp_${TENANT}_${key}`;
+let db: BetterSQLite3Database<typeof schema>;
+let svc: AutomationService;
+
+// Record what the email path delivered: [subject, html] tuples.
+const sent: Array<{ subject: string; html: string }> = [];
+const stubEmailFor = async (_tid: string) => ({
+  sendEmail: async (_to: string[], subject: string, html: string) => {
+    sent.push({ subject, html });
+    return { delivered: true };
+  },
+} as unknown as EmailService);
+
+const fakeSendMessage = vi.fn().mockResolvedValue({ ok: true });
+const fakeProvider = { sendMessage: fakeSendMessage, validateInboundSignature: vi.fn().mockResolvedValue(false) };
+const smsRuntime = { resolveProvider: vi.fn().mockResolvedValue({ provider: fakeProvider, from: '+1999' }) };
+
+beforeEach(async () => {
+  const fx = createTestDb();
+  db = fx.db; await setupSchema(fx.sqlite);
+  (mockDrizzle as unknown as ReturnType<typeof vi.fn>).mockReturnValue(db);
+  sent.length = 0;
+  fakeSendMessage.mockClear();
+  smsRuntime.resolveProvider.mockResolvedValue({ provider: fakeProvider, from: '+1999' });
+  await db.insert(schema.tenants).values({
+    id: TENANT, slug: 'acme', status: 'active', phone: '+15550001111',
+    deploymentMode: 'shared', tier: 'free', createdAt: new Date(),
+  } as never);
+  await seedRoleProfiles(asD1Db(db), TENANT, new Date(1));
+  svc = new AutomationService({} as D1Database);
+});
+
+// Task 11a — client_name (email path) and the SMS consent-gate contactId now
+// resolve via inspection_people (not the legacy inspections.client_* columns),
+// so every seeded inspection also gets a contact + inspection_people 'client'
+// row. `clientContactId` is still accepted here (default 'c1', matching the
+// original fixture's SMS-branch literal) so seedInspection seeds the SAME
+// contact id the SMS tests already grant consent for.
+async function seedInspection(over: Partial<typeof schema.inspections.$inferInsert> & { clientContactId?: string | null } = {}) {
+  const id = (over.id as string) ?? crypto.randomUUID();
+  const contactId = over.clientContactId ?? 'primary-client';
+  await db.insert(schema.inspections).values({
+    id, tenantId: TENANT, propertyAddress: '1 Main',
+    date: '2026-06-01', status: 'completed',
+    reportStatus: 'published', paymentStatus: 'unpaid', price: 50000,
+    agreementRequired: false, paymentRequired: false, createdAt: new Date(), ...over,
+  } as never);
+  await db.insert(schema.contacts).values({
+    id: contactId, tenantId: TENANT, type: 'client', name: 'Jane',
+    email: 'jane@example.com', phone: '+15551234567', createdAt: new Date(),
+  } as never);
+  await new PeopleService({ DB: {} as D1Database }).addPerson(TENANT, id, contactId, roleProfileId('client'));
+  return id;
+}
+
+async function seedRuleAndLog(opts: {
+  conditions?: object | null; channel?: 'email' | 'sms'; subject?: string; body?: string;
+  smsBody?: string; trigger?: string; inspectionId: string;
+  /** IA-109 — the per-recipient role KEY stamped on the log. */
+  roleKey?: string;
+  /** IA-109 — the contact the log is addressed to. */
+  recipientContactId?: string | null;
+}) {
+  const ruleId = crypto.randomUUID();
+  const channel = opts.channel ?? 'email';
+  // 'R' matches no real AUTOMATION_SEEDS entry, so the dead automations.subject_
+  // template/body_template/sms_body columns (now dropped) can't be recovered by
+  // backfillAutomationTemplates' seed-only fallback — reference a template
+  // directly instead, the way ensureSeeds does for a freshly-seeded rule.
+  let emailTemplateId: string | null = null;
+  let smsTemplateId: string | null = null;
+  if (channel === 'email') {
+    emailTemplateId = crypto.randomUUID();
+    await db.insert(schema.messageTemplates).values({
+      id: emailTemplateId, tenantId: TENANT, name: 'R — Email', channel: 'email',
+      subject: opts.subject ?? 'Subj', body: opts.body ?? 'Body', variables: null, isSeeded: false,
+      createdAt: new Date(), updatedAt: new Date(),
+    } as never);
+  }
+  if (channel === 'sms' && opts.smsBody) {
+    smsTemplateId = crypto.randomUUID();
+    await db.insert(schema.messageTemplates).values({
+      id: smsTemplateId, tenantId: TENANT, name: 'R — SMS', channel: 'sms',
+      subject: null, body: opts.smsBody, variables: null, isSeeded: false,
+      createdAt: new Date(), updatedAt: new Date(),
+    } as never);
+  }
+  await db.insert(schema.automations).values({
+    id: ruleId, tenantId: TENANT, name: 'R', trigger: opts.trigger ?? 'report.published',
+    recipientKind: 'role', recipientRoleProfileId: roleProfileId('client'), delayMinutes: 0,
+    emailTemplateId, smsTemplateId,
+    channels: JSON.stringify([channel]),
+    active: true, isDefault: false, createdAt: new Date(),
+    conditions: opts.conditions ? JSON.stringify(opts.conditions) : null,
+  } as never);
+
+  const logId = crypto.randomUUID();
+  await db.insert(schema.automationLogs).values({
+    id: logId, tenantId: TENANT, automationId: ruleId, inspectionId: opts.inspectionId,
+    recipient: opts.channel === 'sms' ? '+15551234567' : 'jane@example.com',
+    channel: opts.channel ?? 'email',
+    // `=== undefined`, not `??`: a legacy log with NO role key is its own case
+    // (it predates the column), and `??` would have collapsed it into 'client',
+    // making the legacy-fallback test pass without exercising the branch.
+    recipientRoleKey: opts.roleKey === undefined ? 'client' : opts.roleKey,
+    recipientContactId: opts.recipientContactId === undefined ? 'c1' : opts.recipientContactId,
+    sendAt: new Date(Date.now() - 1000), status: 'pending',
+  } as never);
+  return logId;
+}
+
+const statusOf = async (id: string) =>
+  await db.select().from(schema.automationLogs).where(eq(schema.automationLogs.id, id)).get();
+
+describe('CHARACTERIZATION — automation delivery (freeze before SP-ENG refactor)', () => {
+  it('email path: conditions pass → sent, interpolates company_name + client_name', async () => {
+    const insp = await seedInspection({ paymentStatus: 'paid' });
+    const logId = await seedRuleAndLog({
+      conditions: { requirePaid: true }, subject: 'Hi {{client_name}}',
+      body: 'From {{company_name}}', inspectionId: insp,
+    });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com');
+    expect((await statusOf(logId))?.status).toBe('sent');
+    expect(sent).toEqual([{ subject: 'Hi Jane', html: 'From Acme' }]);
+  });
+
+  it('email path: requirePaid fails on unpaid → skipped "condition: not paid"', async () => {
+    const insp = await seedInspection({ paymentStatus: 'unpaid' });
+    const logId = await seedRuleAndLog({ conditions: { requirePaid: true }, inspectionId: insp });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com');
+    const r = await statusOf(logId);
+    expect(r?.status).toBe('skipped');
+    expect(r?.error).toBe('condition: not paid');
+    expect(sent).toEqual([]);
+  });
+
+  it('email path: requireSigned skips when no signed agreement', async () => {
+    const insp = await seedInspection();
+    const logId = await seedRuleAndLog({ conditions: { requireSigned: true }, inspectionId: insp });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com');
+    const r = await statusOf(logId);
+    expect(r?.status).toBe('skipped');
+    expect(r?.error).toBe('condition: agreement not signed');
+  });
+
+  it('email path: serviceIds skips when none booked', async () => {
+    const insp = await seedInspection();
+    const logId = await seedRuleAndLog({ conditions: { serviceIds: ['svc-x'] }, inspectionId: insp });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com');
+    const r = await statusOf(logId);
+    expect(r?.status).toBe('skipped');
+    expect(r?.error).toBe('condition: service not matched');
+  });
+
+  it('review_url FAIL-CLOSED: body references {{review_url}}, tenant_configs unset → skipped', async () => {
+    const insp = await seedInspection();
+    const logId = await seedRuleAndLog({ body: 'Review: {{review_url}}', inspectionId: insp });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com');
+    const r = await statusOf(logId);
+    expect(r?.status).toBe('skipped');
+    expect(r?.error).toBe('review_url not configured');
+    expect(sent).toEqual([]);
+  });
+
+  it('review_url configured → sent with the configured url', async () => {
+    const insp = await seedInspection();
+    await db.insert(schema.tenantConfigs).values(
+      { tenantId: TENANT, reviewUrl: 'https://g.page/r/acme', updatedAt: new Date() } as never);
+    const logId = await seedRuleAndLog({ body: 'Review: {{review_url}}', inspectionId: insp });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com');
+    expect((await statusOf(logId))?.status).toBe('sent');
+    expect(sent).toEqual([{ subject: 'Subj', html: 'Review: https://g.page/r/acme' }]);
+  });
+
+  it('SMS branch: client without consent → skipped "no sms consent"', async () => {
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    const logId = await seedRuleAndLog({ channel: 'sms', smsBody: 'Hi {{client_name}}', inspectionId: insp });
+    await new SmsConsentService({} as D1Database).publishDisclosure('disclosure');
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+    const r = await statusOf(logId);
+    expect(r?.status).toBe('skipped');
+    expect(r?.error).toMatch(/consent/);
+    expect(fakeSendMessage).not.toHaveBeenCalled();
+  });
+
+  // ── IA-109 — the consent gate must key on role KIND, not one role KEY ────
+  //
+  // The gate read . But co_client is ALSO
+  // kind='client' (default-role-profiles.ts), and resolveRecipients resolves
+  // an SMS recipient for ANY role key that has a phone. A co-client was
+  // therefore texted with no consent check at all — same consumer, same TCPA
+  // exposure, different string.
+
+  it('SMS branch: CO-CLIENT without consent → skipped, not sent', async () => {
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    await new SmsConsentService({} as D1Database).publishDisclosure('disclosure');
+    // Addressed to a DIFFERENT contact in a co_client role — the shape the old
+    // gate let straight through.
+    const logId = await seedRuleAndLog({
+      channel: 'sms', smsBody: 'Hi', inspectionId: insp,
+      roleKey: 'co_client', recipientContactId: 'c2',
+    });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+
+    const r = await statusOf(logId);
+    expect(r?.status).toBe('skipped');
+    expect(r?.error).toMatch(/consent/);
+    expect(fakeSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('SMS branch: co-client consent is read for THEIR contact, not the primary client', async () => {
+    // The old gate looked up inspections.client_contact_id regardless of who
+    // the log was for, so the primary client's consent silently authorised a
+    // text to someone who had never granted anything.
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    const consent = new SmsConsentService({} as D1Database);
+    await consent.publishDisclosure('disclosure');
+    await consent.record(TENANT, 'c1', 'granted', 'admin', {});  // primary ONLY
+    const logId = await seedRuleAndLog({
+      channel: 'sms', smsBody: 'Hi', inspectionId: insp,
+      roleKey: 'co_client', recipientContactId: 'c2',
+    });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+
+    expect((await statusOf(logId))?.status).toBe('skipped');
+    expect(fakeSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('SMS branch: co-client WITH their own consent → sent', async () => {
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    const consent = new SmsConsentService({} as D1Database);
+    await consent.publishDisclosure('disclosure');
+    await consent.record(TENANT, 'c2', 'granted', 'admin', {});
+    const logId = await seedRuleAndLog({
+      channel: 'sms', smsBody: 'Hi', inspectionId: insp,
+      roleKey: 'co_client', recipientContactId: 'c2',
+    });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+
+    expect((await statusOf(logId))?.status).toBe('sent');
+    expect(fakeSendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('SMS branch: a NON-primary client-kind log with no contact id fails closed', async () => {
+    // Legacy rows predate recipient_contact_id. For the primary client the
+    // inspection's own (inspection_people-derived) contact is a correct
+    // fallback, so those keep working across the deploy. For a co-client there
+    // is nobody to look up — and the primary client's consent is emphatically
+    // not theirs — so skipping is the only safe answer.
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    const consent = new SmsConsentService({} as D1Database);
+    await consent.publishDisclosure('disclosure');
+    await consent.record(TENANT, 'c1', 'granted', 'admin', {});   // primary ONLY
+    const logId = await seedRuleAndLog({
+      channel: 'sms', smsBody: 'Hi', inspectionId: insp,
+      roleKey: 'co_client', recipientContactId: null,
+    });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+
+    expect((await statusOf(logId))?.status).toBe('skipped');
+    expect(fakeSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('SMS branch: a legacy log with NO role key still uses the primary client contact', async () => {
+    // Rows predating recipientRoleKey could only ever have been the primary
+    // client. Failing those closed would drop every already-queued send at
+    // deploy time for no safety gain.
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    const consent = new SmsConsentService({} as D1Database);
+    await consent.publishDisclosure('disclosure');
+    await consent.record(TENANT, 'c1', 'granted', 'admin', {});
+    const logId = await seedRuleAndLog({
+      channel: 'sms', smsBody: 'Hi', inspectionId: insp,
+      roleKey: null as unknown as string, recipientContactId: null,
+    });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+
+    expect((await statusOf(logId))?.status).toBe('sent');
+  });
+
+  it('SMS branch: client with granted consent → sent via provider', async () => {
+    const insp = await seedInspection({ clientContactId: 'c1' });
+    const consent = new SmsConsentService({} as D1Database);
+    await consent.publishDisclosure('disclosure');
+    await consent.record(TENANT, 'c1', 'granted', 'admin', {});
+    const logId = await seedRuleAndLog({ channel: 'sms', smsBody: 'Hi {{client_name}}', inspectionId: insp });
+    await svc.flush(stubEmailFor, 'Acme', 'https://acme.example.com', smsRuntime);
+    expect((await statusOf(logId))?.status).toBe('sent');
+    expect(fakeSendMessage).toHaveBeenCalledTimes(1);
+    expect((fakeSendMessage.mock.calls[0][0] as { to: string }).to).toBe('+15551234567');
+  });
+});

@@ -1,0 +1,243 @@
+#!/usr/bin/env sh
+# .githooks/pre-commit — openinspection
+#
+# Quality gate for commits made inside this repo. Activated automatically by the
+# "prepare" npm script on `npm install`/`npm ci`:
+#     git config core.hooksPath .githooks
+# Bypass (discouraged): git commit --no-verify
+#
+# If you do bypass it AND the commit touches TypeScript, run
+# `npm run type-check:app` (plus type-check:api if server/ moved) immediately
+# afterwards. tsc's incremental build-info is only refreshed by a run that
+# completes, so skipping the hook leaves it describing the PREVIOUS tree and the
+# next type-check pays full cold cost — measured here: 21s warm, 357s cold. That
+# cold run then blows whatever timeout made --no-verify attractive, and the loop
+# feeds itself. Ask how this was measured: by falling into it.
+#
+# Mechanism is .githooks + core.hooksPath (no husky), aligned with the
+# superproject and the portal/cms submodules.
+
+# Never run in CI / non-interactive contexts (CI does not commit, but guard anyway).
+[ -n "$CI" ] && exit 0
+
+# Memory ceiling so concurrent pre-commits (two parallel agent sessions on this
+# machine) don't exhaust RAM and freeze the box. Local-only (CI exited above).
+# `:-` keeps any value the caller already exported.
+#   NODE_OPTIONS → bound the node heavy steps: tsc type-check (--max-old-space-size
+#                  is also set per-script), react-router build for the bundle-size
+#                  gate, jscpd for lint:dup, eslint.
+case " $NODE_OPTIONS " in *"--max-old-space-size"*) : ;; *) export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=4096" ;; esac
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+FAILED=0
+
+# printf, not echo: POSIX sh echo does not interpret \n or \033 escapes
+# (they printed literally under Git Bash), and %b expands them portably.
+pass() { printf '  ✓  %b\n' "$1"; }
+fail() { printf '  ✗  %b\n' "$1"; FAILED=1; }
+step() { printf '\n  →  %b\n' "$1"; }
+
+printf '%b\n' "${BOLD}── OpenInspection (Pre-commit Checks) ───────────────────────────${NC}"
+
+# 1. Type check — SCOPED to what the staged changes can actually affect.
+#    Runs tsc (the SAME compiler as CI's authoritative "verify" gate) with
+#    --incremental build-info caching, so a warm commit only re-checks what
+#    changed and stays fast. (We used tsgo/@typescript/native-preview here before;
+#    it was faster cold but unstable under memory pressure — GC death-loops that
+#    timed out and left multi-GB zombies. tsc is bounded and predictable.)
+#    Tiers:
+#      - no staged .ts/.tsx or ts-config files  → skip type check entirely
+#        (docs, assets, hooks, fixtures — a markdown edit must not cost seconds)
+#      - staged TS confined to server/ or tests/ → api + tests (type-check:tests,
+#        which builds the api project first). NOT `type-check:api`: its include
+#        is `server/**` and holds no test file, so that spelling made this tier
+#        a no-op for tests-only commits.
+#      - anything touching app/ workers/ packages/ or ts-config files → app,
+#        plus api unless the change cannot reach it, plus the tests program
+#        whenever a spec is among the staged files. That last clause is not
+#        decoration: without it this tier — the one for the BROADEST commits —
+#        checked less of the test program than the narrow tier above.
+STAGED=$(git diff --cached --name-only --diff-filter=ACMRD)
+STAGED_TREE=$(git diff --cached --name-only --diff-filter=ADR)
+TS_STAGED=$(echo "$STAGED" | grep -E '\.(ts|tsx)$' || true)
+CONFIG_STAGED=$(echo "$STAGED" | grep -E '^(tsconfig|package\.json|package-lock\.json|vite\.config|react-router\.config|worker-configuration)' || true)
+
+#    The full tier used to shell out to `npm run type-check`, which regenerates
+#    two type artifacts before compiling. Measured on this repo, warm:
+#      paraglide compile   ~27s   ← app/paraglide/, from messages/ + project.inlang/
+#      react-router typegen ~30s  ← .react-router/types/, from the route TREE
+#      tsc app + tsc api    ~14s
+#    So three quarters of a ~76s "type check" was generating inputs, not checking
+#    types. They are pure functions of their own inputs: an edit that cannot reach
+#    a generator's input cannot change its output. Regenerate one only when the
+#    staged changes do reach it, or when its output is missing (fresh clone, after
+#    a clean). `npm run type-check` still runs both unconditionally — that is what
+#    CI's verify gate uses, and what the failure messages below point developers at.
+#    (The api tier never needed either: tsconfig.api.json includes server/** alone.)
+needs_paraglide() {
+    [ -d app/paraglide ] || return 0
+    echo "$STAGED" | grep -qE '^(messages/|project\.inlang/)'
+}
+needs_typegen() {
+    [ -d .react-router/types ] || return 0
+    echo "$STAGED" | grep -qE '^(app/routes\.ts|react-router\.config\.ts)$' && return 0
+    # Editing a route module's body does not change its generated types — those
+    # infer from `typeof loader` when tsc runs. A route file APPEARING or
+    # DISAPPEARING changes the tree, and that does.
+    #
+    # A colocated SPEC is not a route: `app/routes/foo.test.tsx` never enters
+    # routes.ts, so typegen's output cannot differ because one arrived. The Test
+    # Layout in CLAUDE.md REQUIRES frontend specs to sit beside what they test,
+    # so this fires on ordinary work — and typegen costs ~60s measured here.
+    echo "$STAGED_TREE" | grep -E '^app/routes/' | grep -qvE '\.(test|spec)\.(ts|tsx)$'
+}
+
+step "Type check"
+if [ -z "$TS_STAGED" ] && [ -z "$CONFIG_STAGED" ]; then
+    pass "Skipped — no staged TypeScript/config changes (CI verify remains the full gate)"
+elif [ -z "$CONFIG_STAGED" ] && [ -z "$(echo "$TS_STAGED" | grep -vE '^(server|tests)/')" ]; then
+    # `type-check:tests`, not `type-check:api`, and the difference is the whole
+    # point of this tier existing.
+    #
+    # This branch fires when the staged TS is confined to `server/` OR `tests/`,
+    # but `type-check:api`'s include is `server/**` — it has never contained a
+    # single file under `tests/`. So a tests-only commit ran a program that did
+    # not hold any of the files being committed: a gate whose report said
+    # "passed" about work it could not see. Demonstrated rather than assumed —
+    # `const x: number = "str"` in a spec produced ZERO errors here and is
+    # caught by the tests program.
+    #
+    # `type-check:tests` runs `tsc -b tsconfig.api.json` first, so it subsumes
+    # the api pass rather than adding a second one; the extra cost is the tests
+    # program alone (587 files, ~16s warm, capped at 1024 MB).
+    if npm run type-check:tests > /dev/null 2>&1; then
+        pass "Type check passed (tsc, api + tests programs — staged TS confined to server/ and tests/)"
+    else
+        fail "Type check failed  →  npm run type-check:tests"
+    fi
+else
+    GEN_OK=1
+    GEN_NOTE=""
+    if needs_paraglide; then
+        if npm run i18n:compile:cached > /dev/null 2>&1; then
+            GEN_NOTE="${GEN_NOTE}, regenerated messages"
+        else
+            GEN_OK=0
+        fi
+    fi
+    if [ "$GEN_OK" -eq 1 ] && needs_typegen; then
+        if npx react-router typegen > /dev/null 2>&1; then
+            GEN_NOTE="${GEN_NOTE}, regenerated route types"
+        else
+            GEN_OK=0
+        fi
+    fi
+    # The api program includes server/** and nothing else, so staged changes
+    # confined to app/ packages/ workers/ cannot affect it. That pass was being
+    # run anyway: 11s warm, and 152s when its build-info had gone cold — paid on
+    # every front-end commit for a program the commit cannot reach.
+    #
+    # Config changes (tsconfig, package.json, vite/react-router config) still run
+    # BOTH, because those can move either program's inputs.
+    APP_ONLY=0
+    if [ -z "$CONFIG_STAGED" ] && [ -z "$(echo "$TS_STAGED" | grep -E '^server/')" ]; then
+        APP_ONLY=1
+    fi
+
+    # The two programs this tier compiles are `tsconfig.json` (app) and
+    # `tsconfig.api.json` (server). NEITHER includes `tsconfig.tests.json`, so a
+    # spec staged ALONGSIDE app/ or server/ code was type-checked by nothing
+    # here — this tier, the one that runs when a commit is broadest, covered
+    # LESS of the test program than the narrow server/tests tier above it. The
+    # bug that surfaced it passed a better-sqlite3 handle to a parameter typed
+    # `DrizzleD1Database | { [k: string]: unknown }`, which a class can never
+    # satisfy; the spec shipped green because its commit also touched app/.
+    # `npm run type-check` — what CI runs, and what the failure hints here name —
+    # has always ended with this pass. This tier reimplemented that script inline
+    # and dropped the last step. Only charged when a spec is actually staged.
+    TESTS_STAGED=$(echo "$TS_STAGED" | grep -E '^tests/' || true)
+    staged_tests_ok() {
+        [ -z "$TESTS_STAGED" ] && return 0
+        npm run type-check:tests > /dev/null 2>&1
+    }
+
+    if [ "$GEN_OK" -eq 0 ]; then
+        fail "Type generation failed  →  npm run type-check"
+    elif [ "$APP_ONLY" -eq 1 ]; then
+        if npm run type-check:app > /dev/null 2>&1 && staged_tests_ok; then
+            pass "Type check passed (tsc, app pass only — no staged server/ changes${GEN_NOTE})"
+        else
+            fail "Type check failed  →  npm run type-check"
+        fi
+    elif npm run type-check:app > /dev/null 2>&1 && npm run type-check:api > /dev/null 2>&1 && staged_tests_ok; then
+        pass "Type check passed (tsc${GEN_NOTE})"
+    else
+        fail "Type check failed  →  npm run type-check"
+    fi
+fi
+
+# 2. Lint & Fix — ONE eslint process over every staged file (see .lintstagedrc).
+#    eslint's cost here is the type-information program, not the file count:
+#    `parserOptions.project` names both tsconfigs, so any invocation builds the app
+#    program AND the api program before it checks a single line. Four parallel
+#    groups paid for that four times over, and quadrupled peak memory on a 16GB
+#    box. `server/index.ts` is exempt from type-aware rules entirely, because no
+#    heap this machine can spare was enough for it (see eslint.config.js).
+#
+#    ESLINT_FAST=1 drops the type-information program for this run — same rules,
+#    minus the ones that cannot fail a commit anyway. Measured, cache cleared:
+#    15.1s → 3.7s (one server file), 15.8s → 3.9s (two app files). The reasoning
+#    for why nothing is lost lives at the top of eslint.config.js; the short
+#    version is that every type-aware rule here is 'warn' and .lintstagedrc sets
+#    no --max-warnings, so eslint exited 0 on all of them regardless. CI's
+#    `npm run lint` runs without the flag and stays the authority.
+#
+#    Dropping the program also retires this step's 6GB heap override. That number
+#    existed because the program build is a large fixed cost with each file's type
+#    instantiation retained on top of it — a 17-file commit exhausted 4GB after
+#    103s and needed 6GB to finish in ~147s. With no program there is nothing to
+#    retain, so the global 4GB ceiling is plenty and peak memory stops scaling
+#    with commit size. (The `server/index.ts` type-aware exemption in
+#    eslint.config.js exists for the same OOM reason; at commit time it is now moot.)
+step "Lint & Fix"
+if ESLINT_FAST=1 npx lint-staged; then
+    pass "Lint & Fix passed"
+else
+    fail "Lint failed  →  npx lint-staged"
+fi
+
+# 3. Conformance gates, all in ONE node process (scripts/run-gates.mjs):
+#      DS tokens · SVG dimensions · migration-reference hygiene · large-file
+#      ratchet · calendar timezone-safety · duplicate-code ceiling
+#    Each was its own `node scripts/check-*.mjs` spawn. The checks themselves scan
+#    a few hundred files in milliseconds; what cost 0.7-1.3s apiece was node
+#    starting up, so paying it six times was almost all of the 5.5s these gates
+#    took. Merged: 1.9s. The runner prints the same per-gate ✓/✗ lines, runs every
+#    gate even after one fails, and shows violations only for the ones that did.
+#    CI still runs them individually via `npm run lint` -- that stays the
+#    authoritative gate, and jscpd is a child process either way.
+step "Conformance gates"
+if node scripts/run-gates.mjs --rung precommit; then
+    :
+else
+    FAILED=1
+fi
+
+# NOTE: the Worker bundle-size gate lives in .githooks/pre-push, not here. The
+#    bundle can only break at deploy, and its check runs the REAL build pipeline
+#    (~1-2 min), so paying it on every commit was overkill. pre-push builds it
+#    once per push instead; CI's verify remains the authoritative final gate.
+
+if [ "$FAILED" -eq 1 ]; then
+    printf '\n%b\n' "${RED}Pre-commit checks failed. Fix the errors before committing.${NC}"
+    exit 1
+fi
+
+printf '\n%b\n' "${GREEN}All pre-commit checks passed.${NC}"
+exit 0

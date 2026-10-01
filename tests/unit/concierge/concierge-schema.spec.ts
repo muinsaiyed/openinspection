@@ -1,0 +1,94 @@
+import { describe, it, expect } from 'vitest';
+import { inspections, tenantConfigs, conciergeConfirmTokens } from '../../../server/lib/db/schema';
+import { createTestDb, setupSchema } from '../db';
+import * as schema from '../../../server/lib/db/schema';
+
+/**
+ * Agent Accounts A3 — Schema verification for concierge booking.
+ *
+ * Verifies:
+ *   1. inspections.concierge_status (nullable text)
+ *   2. tenant_configs.is_concierge_review_required (boolean default false)
+ *   3. concierge_confirm_tokens table with expected columns + index
+ */
+describe('concierge schema — A3', () => {
+    it('inspections has conciergeStatus column mapping concierge_status', () => {
+        const t = inspections as unknown as Record<string, { name: string }>;
+        expect(t.conciergeStatus?.name).toBe('concierge_status');
+    });
+
+    it('tenant_configs has conciergeReviewRequired column mapping is_concierge_review_required', () => {
+        const t = tenantConfigs as unknown as Record<string, { name: string }>;
+        expect(t.conciergeReviewRequired?.name).toBe('is_concierge_review_required');
+    });
+
+    it('concierge_confirm_tokens table is exported with an id primary key and no plaintext column', () => {
+        expect(conciergeConfirmTokens).toBeDefined();
+        const t = conciergeConfirmTokens as unknown as Record<string, { name: string }>;
+        expect(t.id?.name).toBe('id');
+        expect(t.tokenHash?.name).toBe('token_hash');
+        // The plaintext column the PK used to be. Asserted ABSENT rather than
+        // simply not asserted: its whole history is that it looked like it held
+        // the secret and never did, so a reintroduction should fail here.
+        expect(t.token).toBeUndefined();
+        expect(t.inspectionId?.name).toBe('inspection_id');
+        expect(t.tenantId?.name).toBe('tenant_id');
+        expect(t.clientEmail?.name).toBe('client_email');
+        expect(t.expiresAt?.name).toBe('expires_at');
+        expect(t.confirmedAt?.name).toBe('confirmed_at');
+        expect(t.createdAt?.name).toBe('created_at');
+    });
+
+    it('concierge review columns apply cleanly and the columns/table are queryable', async () => {
+        const fixture = createTestDb();
+        await setupSchema(fixture.sqlite);
+
+        // Insert a tenant + tenant_config row, then read back the new column default.
+        const TENANT = '00000000-0000-0000-0000-000000000a01';
+        await fixture.db.insert(schema.tenants).values({
+            id: TENANT,
+            slug: 'a3test',
+            status: 'active',
+            deploymentMode: 'shared',
+            tier: 'free',
+            createdAt: new Date(),
+        });
+        await fixture.db.insert(schema.tenantConfigs).values({
+            tenantId: TENANT,
+            updatedAt: new Date(),
+        });
+
+        const cfg = await fixture.db.select().from(schema.tenantConfigs).all();
+        expect(cfg.length).toBeGreaterThan(0);
+        // Default for is_concierge_review_required is 0 (false) per migration.
+        expect(!!cfg[0].conciergeReviewRequired).toBe(false);
+
+        // Insert a token row to confirm the new table is wired and queryable.
+        await fixture.db.insert(schema.inspections).values({
+            id: 'insp-a3',
+            tenantId: TENANT,
+            propertyAddress: '1 Main St',
+            date: '2026-06-15',
+            // Scaffolding only: this row exists so the concierge token below
+            // has a parent. 'requested' is the schema default and the state the
+            // concierge intake path actually writes.
+            status: 'requested',
+            paymentStatus: 'unpaid',
+            createdAt: new Date(),
+        });
+        await fixture.db.insert(schema.conciergeConfirmTokens).values({
+            id: 'cct-a3-1',
+            tokenHash: 'a'.repeat(64),
+            inspectionId: 'insp-a3',
+            tenantId: TENANT,
+            clientEmail: 'sarah@example.com',
+            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+            createdAt: new Date(),
+        });
+        const tokens = await fixture.db.select().from(schema.conciergeConfirmTokens).all();
+        expect(tokens.length).toBe(1);
+        expect(tokens[0].id).toBe('cct-a3-1');
+        expect(tokens[0].tokenHash).toBe('a'.repeat(64));
+        expect(tokens[0].confirmedAt).toBeNull();
+    });
+});

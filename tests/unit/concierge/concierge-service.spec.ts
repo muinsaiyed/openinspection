@@ -1,0 +1,437 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { eq } from 'drizzle-orm';
+import { ConciergeService } from '../../../server/services/concierge.service';
+import { seedRoleProfiles } from '../../../server/services/seed/seed-role-profiles';
+import { createTestDb, setupSchema } from '../db';
+import * as schema from '../../../server/lib/db/schema';
+import { hashToken } from '../../../server/lib/token-hash';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type { EmailService } from '../../../server/services/email.service';
+
+vi.mock('drizzle-orm/d1', () => ({ drizzle: vi.fn() }));
+import { drizzle as mockDrizzle } from 'drizzle-orm/d1';
+import { asD1Db } from '../helpers/test-db';
+
+const T1            = '00000000-0000-0000-0000-0000000000a1';
+const T1_SUB        = 't1';
+const AGENT         = '00000000-0000-0000-0000-0000000000a2';
+const INSPECTOR     = '00000000-0000-0000-0000-0000000000a3';
+const CONTACT_INSP  = '00000000-0000-0000-0000-0000000000a4'; // contact row in T1 referencing the inspector
+const CONTACT_AGENT = '00000000-0000-0000-0000-0000000000a5'; // contact row in T1 referencing the agent
+
+interface SeedOpts { reviewRequired?: boolean; agentLinkStatus?: 'active' | 'pending' | 'revoked' }
+
+async function seedFixture(testDb: BetterSQLite3Database<typeof schema>, opts: SeedOpts = {}) {
+    const { reviewRequired = false, agentLinkStatus = 'active' } = opts;
+    await testDb.insert(schema.tenants).values({
+        id: T1, slug: T1_SUB, status: 'active',
+        deploymentMode: 'shared', tier: 'free', createdAt: new Date(),
+    });
+    await testDb.insert(schema.tenantConfigs).values({
+        tenantId: T1,
+        conciergeReviewRequired: reviewRequired,
+        updatedAt: new Date(),
+    });
+    await testDb.insert(schema.users).values([
+        // Inspector — tenant-scoped.
+        { id: INSPECTOR, tenantId: T1, email: 'mike@acme.com', name: 'Mike Reynolds',
+          role: 'inspector', passwordHash: 'x', createdAt: new Date() },
+        // Agent — global (tenant_id NULL).
+        { id: AGENT, tenantId: null, email: 'jane@realty.com', name: 'Jane Smith',
+          role: 'agent', passwordHash: 'x', createdAt: new Date() },
+    ]);
+    await testDb.insert(schema.contacts).values([
+        // The inspector's contact row in T1 (used to identify them in the booking form).
+        { id: CONTACT_INSP, tenantId: T1, type: 'client', name: 'Mike Reynolds',
+          email: 'mike@acme.com', createdAt: new Date() },
+        // The agent's contact row in T1 (used by referredByAgentId reverse-lookup).
+        { id: CONTACT_AGENT, tenantId: T1, type: 'agent', name: 'Jane Smith',
+          email: 'jane@realty.com', createdAt: new Date() },
+    ]);
+    // IA-104 — the agent binding is a column on the contact now, so seeding
+    // it is an update to the contact rather than a row in a link table.
+    // 'pending' no longer exists: nothing ever wrote it, so the states are
+    // bound (agent_user_id set) and revoked (agent_revoked_at set).
+    await testDb.update(schema.contacts)
+        .set({
+            agentUserId: AGENT,
+            agentLinkedAt: new Date(),
+            agentRevokedAt: agentLinkStatus === 'active' ? null : new Date(),
+        })
+        .where(eq(schema.contacts.id, CONTACT_AGENT));
+    // Task 9c-X2 — confirmByClient's agent-notify now resolves the buyer_agent
+    // contact via inspection_people, which createBooking only populates when
+    // role profiles exist for the tenant (see its try/catch mirror-write).
+    await seedRoleProfiles(asD1Db(testDb), T1, new Date(1));
+}
+
+const baseParams = () => ({
+    tenantId: T1,
+    agentUserId: AGENT,
+    inspectorContactId: CONTACT_INSP,
+    date: '2026-06-15',
+    timeSlot: '10:00',
+    propertyAddress: '1 Main St',
+    clientName: 'Sarah Buyer',
+    clientEmail: 'sarah@example.com',
+    agreementRequired: true,
+    paymentRequired: false,
+});
+
+describe('ConciergeService — A3', () => {
+    let svc: ConciergeService;
+    let testDb: BetterSQLite3Database<typeof schema>;
+    let stubEmail: {
+        sendConciergeClientConfirm: ReturnType<typeof vi.fn>;
+        sendConciergeInspectorReview: ReturnType<typeof vi.fn>;
+        sendConciergeConfirmedToAgent: ReturnType<typeof vi.fn>;
+        sendConciergeCancelledToAgent: ReturnType<typeof vi.fn>;
+    };
+
+    /** The plaintext confirm token is only ever in the email — never stored. */
+    const emailedToken = (): string => {
+        const calls = stubEmail.sendConciergeClientConfirm.mock.calls;
+        return calls[calls.length - 1]?.[1]?.token as string;
+    };
+
+    beforeEach(async () => {
+        const fixture = createTestDb();
+        testDb = fixture.db;
+        await setupSchema(fixture.sqlite);
+        (mockDrizzle as unknown as ReturnType<typeof vi.fn>).mockReturnValue(testDb);
+        stubEmail = {
+            sendConciergeClientConfirm:    vi.fn().mockResolvedValue(undefined),
+            sendConciergeInspectorReview:  vi.fn().mockResolvedValue(undefined),
+            sendConciergeConfirmedToAgent: vi.fn().mockResolvedValue(undefined),
+            sendConciergeCancelledToAgent: vi.fn().mockResolvedValue(undefined),
+        };
+        svc = new ConciergeService({} as D1Database, stubEmail as unknown as EmailService, 'https://acme.example.com');
+    });
+
+    describe('createBooking', () => {
+        it('flips state to awaiting_inspector + emails inspector when reviewRequired=true', async () => {
+            await seedFixture(testDb, { reviewRequired: true });
+            const result = await svc.createBooking(baseParams());
+
+            expect(result.status).toBe('awaiting_inspector');
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, result.inspectionId)).get();
+            expect(insp?.conciergeStatus).toBe('awaiting_inspector');
+            // A hold, not a settled booking — the office moves it on from here.
+            expect(insp?.status).toBe('requested');
+            expect(insp?.tenantId).toBe(T1);
+            expect(insp?.inspectorId).toBe(INSPECTOR);
+            // No client token minted yet — inspector hasn't approved.
+            const tokens = await testDb.select().from(schema.conciergeConfirmTokens).all();
+            expect(tokens.length).toBe(0);
+            expect(stubEmail.sendConciergeInspectorReview).toHaveBeenCalledTimes(1);
+            expect(stubEmail.sendConciergeClientConfirm).not.toHaveBeenCalled();
+        });
+
+        it('flips state to awaiting_client + mints token + emails client when reviewRequired=false (default)', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const result = await svc.createBooking(baseParams());
+
+            expect(result.status).toBe('awaiting_client');
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, result.inspectionId)).get();
+            expect(insp?.conciergeStatus).toBe('awaiting_client');
+            const tokens = await testDb.select().from(schema.conciergeConfirmTokens).all();
+            expect(tokens.length).toBe(1);
+            expect(tokens[0].inspectionId).toBe(result.inspectionId);
+            expect(tokens[0].clientEmail).toBe('sarah@example.com');
+            expect(tokens[0].confirmedAt).toBeNull();
+            expect(stubEmail.sendConciergeClientConfirm).toHaveBeenCalledTimes(1);
+            // Inspector NOT notified in auto-confirm mode (the per-tenant default).
+            expect(stubEmail.sendConciergeInspectorReview).not.toHaveBeenCalled();
+        });
+
+        it('rejects when agent link is revoked', async () => {
+            await seedFixture(testDb, { agentLinkStatus: 'revoked' });
+            await expect(svc.createBooking(baseParams())).rejects.toThrow(/not linked|forbidden/i);
+        });
+
+        it('rejects when agent link is pending (not yet active)', async () => {
+            await seedFixture(testDb, { agentLinkStatus: 'pending' });
+            await expect(svc.createBooking(baseParams())).rejects.toThrow(/not linked|forbidden/i);
+        });
+
+        it('auto-binds the buyer_agent from agentTenantLinks.inspectorContactId reverse lookup (inspection_people — Task 13 dropped referredByAgentId)', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const result = await svc.createBooking(baseParams());
+            const { PeopleService } = await import('../../../server/services/people.service');
+            const buyerAgentContactId = await new PeopleService({ DB: {} as D1Database })
+                .contactIdForRole(T1, result.inspectionId, 'buyer_agent');
+            expect(buyerAgentContactId).toBe(CONTACT_AGENT);
+        });
+
+        it('rejects when inspector contact is not found in tenant', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await expect(svc.createBooking({ ...baseParams(), inspectorContactId: 'no-such-contact' }))
+                .rejects.toThrow(/not found/i);
+        });
+    });
+
+    describe('approveByInspector', () => {
+        it('transitions awaiting_inspector → awaiting_client + mints token + emails client', async () => {
+            await seedFixture(testDb, { reviewRequired: true });
+            await seedRoleProfiles(asD1Db(testDb), T1, new Date(1));
+            const created = await svc.createBooking(baseParams());
+
+            // Task 9b (people-role-profiles) — approveByInspector resolves the
+            // client-confirm recipient via PeopleService.getPrimaryClient
+            // (inspection_people join) instead of the legacy
+            // inspection.clientEmail column. createBooking itself now mirrors
+            // the booking client into inspection_people (client role) — see
+            // concierge-people.spec.ts — so no manual seeding is needed here.
+            await svc.approveByInspector(created.inspectionId, T1);
+
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.conciergeStatus).toBe('awaiting_client');
+            const tokens = await testDb.select().from(schema.conciergeConfirmTokens).all();
+            expect(tokens.length).toBe(1);
+            expect(stubEmail.sendConciergeClientConfirm).toHaveBeenCalledTimes(1);
+        });
+
+        it('rejects when inspection is not in awaiting_inspector state', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const created = await svc.createBooking(baseParams()); // awaiting_client
+            await expect(svc.approveByInspector(created.inspectionId, T1)).rejects.toThrow(/not awaiting/i);
+        });
+
+        it('refuses cross-tenant approval (different tenantId)', async () => {
+            await seedFixture(testDb, { reviewRequired: true });
+            const created = await svc.createBooking(baseParams());
+            const OTHER = '00000000-0000-0000-0000-0000000000ff';
+            await expect(svc.approveByInspector(created.inspectionId, OTHER)).rejects.toThrow(/not found/i);
+        });
+    });
+
+    /**
+     * An agent booking on behalf of a client is a HOLD: someone wants an
+     * inspection, nothing is settled. These pin the inputs a booking FORM can
+     * actually supply — the inspector as a user id (no front end can know a
+     * contact row id) or nobody at all, plus the services the agent picked.
+     */
+    describe('createBooking — the shape a booking form can submit', () => {
+        it('lands as requested, not scheduled — the office still has to settle it', async () => {
+            await seedFixture(testDb);
+            const created = await svc.createBooking(baseParams());
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.status).toBe('requested');
+        });
+
+        it('accepts the inspector as a user id (what the booking page knows)', async () => {
+            await seedFixture(testDb);
+            const { inspectorContactId: _drop, ...rest } = baseParams();
+            const created = await svc.createBooking({ ...rest, inspectorUserId: INSPECTOR });
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.inspectorId).toBe(INSPECTOR);
+        });
+
+        it('rejects an inspector user from another tenant', async () => {
+            await seedFixture(testDb);
+            const { inspectorContactId: _drop, ...rest } = baseParams();
+            await expect(
+                svc.createBooking({ ...rest, inspectorUserId: '00000000-0000-0000-0000-0000000000ff' }),
+            ).rejects.toThrow(/inspector/i);
+        });
+
+        it('leaves the inspection unassigned when the agent picked no inspector', async () => {
+            await seedFixture(testDb);
+            const { inspectorContactId: _drop, ...rest } = baseParams();
+            const created = await svc.createBooking(rest);
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.inspectorId).toBeNull();
+            expect(insp?.status).toBe('requested');
+        });
+
+        it('snapshots the requested services and prices the hold from them', async () => {
+            await seedFixture(testDb);
+            const SVC_A = '00000000-0000-0000-0000-0000000000b1';
+            const SVC_B = '00000000-0000-0000-0000-0000000000b2';
+            await testDb.insert(schema.services).values([
+                { id: SVC_A, tenantId: T1, name: 'Full Inspection', price: 45000, createdAt: new Date() },
+                { id: SVC_B, tenantId: T1, name: 'Radon', price: 15000, createdAt: new Date() },
+            ]);
+            const created = await svc.createBooking({
+                ...baseParams(),
+                services: [{ serviceId: SVC_A }, { serviceId: SVC_B }],
+            });
+            const lines = await testDb.select().from(schema.inspectionServices)
+                .where(eq(schema.inspectionServices.inspectionId, created.inspectionId)).all();
+            expect(lines).toHaveLength(2);
+            expect(lines.map((l) => l.nameSnapshot).sort()).toEqual(['Full Inspection', 'Radon']);
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.price).toBe(60000);
+        });
+
+        it('refuses a service from another tenant rather than silently dropping it', async () => {
+            await seedFixture(testDb);
+            await expect(
+                svc.createBooking({ ...baseParams(), services: [{ serviceId: 'no-such-service' }] }),
+            ).rejects.toThrow(/service/i);
+        });
+    });
+
+    describe('confirmByClient', () => {
+        it('clears concierge_status, sets inspection.status = "confirmed", marks token used', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const created = await svc.createBooking(baseParams());
+            const tok = emailedToken();
+
+            const result = await svc.confirmByClient(tok);
+
+            expect(result.inspectionId).toBe(created.inspectionId);
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.conciergeStatus).toBeNull();
+            expect(insp?.status).toBe('confirmed');
+            const after = await testDb.select().from(schema.conciergeConfirmTokens).all();
+            expect(after[0].confirmedAt).toBeTruthy();
+        });
+
+        it('rejects expired token', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const created = await svc.createBooking(baseParams());
+            await testDb.update(schema.conciergeConfirmTokens)
+                .set({ expiresAt: new Date(Date.now() - 1000) })
+                .where(eq(schema.conciergeConfirmTokens.inspectionId, created.inspectionId));
+            await expect(svc.confirmByClient(emailedToken())).rejects.toThrow(/expired/i);
+        });
+
+        it('rejects already-confirmed token (single-use)', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await svc.createBooking(baseParams());
+            const tok = emailedToken();
+            await svc.confirmByClient(tok);
+            await expect(svc.confirmByClient(tok)).rejects.toThrow(/already/i);
+        });
+
+        it('rejects unknown token', async () => {
+            await seedFixture(testDb);
+            await expect(svc.confirmByClient('does-not-exist')).rejects.toThrow(/not found/i);
+        });
+
+        it('refuses to resurrect an inspection cancelled while the link sat in the inbox (#81)', async () => {
+            // The link is minted BEFORE the client confirms, so the window is
+            // real. Redeeming it used to write `confirmed` unconditionally —
+            // a cancelled job back on the calendar, `cancel_reason` still on
+            // the row, and nobody signed in for any of it.
+            await seedFixture(testDb, { reviewRequired: false });
+            const created = await svc.createBooking(baseParams());
+            const tok = emailedToken();
+            await testDb.update(schema.inspections)
+                .set({ status: 'cancelled', cancelReason: 'client_cancelled' })
+                .where(eq(schema.inspections.id, created.inspectionId));
+
+            await expect(svc.confirmByClient(tok)).rejects.toThrow(/was cancelled/i);
+
+            const insp = await testDb.select().from(schema.inspections)
+                .where(eq(schema.inspections.id, created.inspectionId)).get();
+            expect(insp?.status).toBe('cancelled');
+            expect(insp?.cancelReason).toBe('client_cancelled');
+            // The token is NOT burned: the office may legitimately restore the
+            // inspection, and a link spent on a refusal would strand the client.
+            const after = await testDb.select().from(schema.conciergeConfirmTokens).all();
+            expect(after[0].confirmedAt).toBeFalsy();
+        });
+
+        it('emails the agent that the booking was confirmed', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await svc.createBooking(baseParams());
+            await svc.confirmByClient(emailedToken());
+            expect(stubEmail.sendConciergeConfirmedToAgent).toHaveBeenCalledTimes(1);
+            // Agent's email is jane@realty.com (from seed users insert).
+            expect(stubEmail.sendConciergeConfirmedToAgent.mock.calls[0]?.[0]).toBe('jane@realty.com');
+        });
+    });
+
+    describe('resolveToken', () => {
+        it('returns inspection summary + expired=false for a fresh token', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const created = await svc.createBooking(baseParams());
+
+            const view = await svc.resolveToken(emailedToken());
+
+            expect(view).not.toBeNull();
+            expect(view?.expired).toBe(false);
+            expect(view?.alreadyConfirmed).toBe(false);
+            expect(view?.inspection.id).toBe(created.inspectionId);
+            expect(view?.inspection.propertyAddress).toBe('1 Main St');
+        });
+
+        it('returns expired=true for past-TTL tokens', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            const created = await svc.createBooking(baseParams());
+            await testDb.update(schema.conciergeConfirmTokens)
+                .set({ expiresAt: new Date(Date.now() - 1000) })
+                .where(eq(schema.conciergeConfirmTokens.inspectionId, created.inspectionId));
+            const view = await svc.resolveToken(emailedToken());
+            expect(view?.expired).toBe(true);
+        });
+
+        it('returns alreadyConfirmed=true once redeemed', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await svc.createBooking(baseParams());
+            const tok = emailedToken();
+            await svc.confirmByClient(tok);
+            const view = await svc.resolveToken(tok);
+            expect(view?.alreadyConfirmed).toBe(true);
+        });
+
+        it('returns null for an unknown token', async () => {
+            await seedFixture(testDb);
+            const view = await svc.resolveToken('does-not-exist');
+            expect(view).toBeNull();
+        });
+    });
+
+    // ─── Track I-a — confirm-token hash-at-rest (tier-1) ──────────────────────
+    describe('token hash-at-rest', () => {
+        it('(a) createBooking stores the hash and nothing else — the row holds no plaintext at all', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await svc.createBooking(baseParams());
+            const tok = emailedToken();
+            const rows = await testDb.select().from(schema.conciergeConfirmTokens).all();
+            expect(rows).toHaveLength(1);
+            expect(rows[0].tokenHash).toBe(await hashToken(tok));
+            // There used to be a sentinel to assert here, because the plaintext
+            // column was the PK and had to hold SOMETHING. Now the assertion is
+            // the stronger one: the emailed token appears nowhere in the row.
+            expect(JSON.stringify(rows[0])).not.toContain(tok);
+        });
+
+        it('(b) presenting the emailed plaintext resolves via the hash path', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await svc.createBooking(baseParams());
+            const view = await svc.resolveToken(emailedToken());
+            expect(view).not.toBeNull();
+        });
+
+        // (c) and (c2) used to cover the legacy plaintext row: resolve it, upgrade
+        // it in place, and prove the confirm still landed despite the PK being
+        // rewritten mid-flight. Both the plaintext column and the upgrade are
+        // gone — the table was empty when they went, so there is no such row to
+        // resolve and nothing to upgrade. What (c2) was really protecting is
+        // single-use, which is not about legacy rows at all, so it stays:
+
+        it('(c) a confirm is single-use', async () => {
+            await seedFixture(testDb, { reviewRequired: false });
+            await svc.createBooking(baseParams());
+            const tok = emailedToken();
+
+            await svc.confirmByClient(tok);
+            const row = await testDb.select().from(schema.conciergeConfirmTokens)
+                .where(eq(schema.conciergeConfirmTokens.tokenHash, await hashToken(tok))).get();
+            expect(row?.confirmedAt).toBeTruthy();
+
+            await expect(svc.confirmByClient(tok)).rejects.toThrow(/already/i);
+        });
+    });
+});

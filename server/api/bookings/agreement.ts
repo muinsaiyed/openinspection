@@ -1,0 +1,582 @@
+// Public token-gated agreement sub-router.
+// Behavior-preserving extraction from bookings.ts — route definitions and
+// handler bodies are byte-identical to the original (only their location
+// changed). Covers GET /agreements/:token, GET /checkout/:token,
+// POST /agreements/:token/sign, POST /agreements/:token/decline.
+import { createRoute, z } from '@hono/zod-openapi';
+import { createApiRouter } from '../../lib/openapi-router';
+import { eq, and, desc } from 'drizzle-orm';
+import { agreements, tenantConfigs, invoices, inspections, esignAuditLogs } from '../../lib/db/schema';
+import { Errors } from '../../lib/errors';
+import { logger } from '../../lib/logger';
+import { signingIntentProblem } from '../../lib/esign/signing-intent';
+import { withMcpMetadata } from "../../lib/route-metadata-standards";
+import { PublicAgreementBodySchema } from '../../lib/validations/agreement-public.schema';
+import { runEnvelopeCompletionPipeline, runSignerReceiptEffects } from '../../lib/sign-effects';
+import { getDrizzle } from '../../lib/route-helpers';
+import { resolveAutomationCompanyName } from '../../services/automation/company-name';
+import { AGREEMENT_LANGUAGE_DISCLOSURE } from '../../lib/legal/agreement-language-disclosure';
+
+import { fireAndForget } from '../../lib/fire-and-forget';
+
+// Local aliases for the literal unions the DB columns are narrowed to in the
+// JSON responses below. Kept file-local (not exported) so the public router
+// type surface is unchanged; they only de-duplicate the inline casts.
+type EnvelopeStatus = 'pending' | 'sent' | 'viewed' | 'signed' | 'declined' | 'expired';
+type SignerRole = 'client' | 'co_client' | 'agent' | 'other';
+
+/**
+ * GET /api/public/agreements/:token — fetch agreement content + mark viewed
+ */
+const getAgreementByTokenRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/agreements/:token',
+    tags: ["bookings", "public"],
+    summary: 'Get agreement for signing (public, token-gated)',
+    request: { params: z.object({ token: z.string().min(1).describe('TODO describe token field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration') },
+    responses: {
+        200: {
+            content: {
+                'application/json': {
+                    // Track I-a — shape lives in validations so the public sign
+                    // page can derive its type from it instead of hand-copying.
+                    schema: z.object({
+                        success: z.literal(true).describe('Always true on a 200'),
+                        data: PublicAgreementBodySchema.describe('Agreement + signer context for the presented token'),
+                    }),
+                },
+            },
+            description: 'Agreement content',
+        },
+    },
+    operationId: "listBookingAgreements",
+    description: "Auto-generated placeholder for listBookingAgreements (GET /agreements/:token, bookings domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['read'], tier: 'extended' }));
+
+/**
+ * GET /api/public/checkout/:token — combined "Sign & pay" page data (Track I-a
+ * Task 7). Resolves a SIGNER token (same tier-2 token the public sign page
+ * uses) to the snapshot + envelope progress + the inspection's outstanding
+ * invoice / payment state + tenant branding, so the page renders in one round
+ * trip. No-auth surface: tokens are NEVER echoed back; only the minimum signer
+ * context the signer themselves needs is exposed.
+ */
+const getCheckoutByTokenRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/checkout/:token',
+    tags: ["bookings", "public"],
+    summary: 'Get combined sign & pay checkout context (public, token-gated)',
+    request: { params: z.object({ token: z.string().min(1).describe('Signer public token from the checkout link') }).describe('Checkout token param') },
+    responses: {
+        200: {
+            content: {
+                'application/json': {
+                    schema: z.object({
+                        success: z.literal(true).describe('Whether the request succeeded'),
+                        data: z.object({
+                            signer: z.object({
+                                name: z.string(),
+                                role: z.enum(['client', 'co_client', 'agent', 'other']),
+                                status: z.enum(['pending', 'sent', 'viewed', 'signed', 'declined', 'expired']),
+                            }).describe('The signer resolved from the presented token'),
+                            agreement: z.object({
+                                name: z.string().describe('Agreement display name'),
+                                content: z.string().describe('Pinned content snapshot served to the signer'),
+                                contentHash: z.string().nullable().describe('SHA-256 hex of the snapshot'),
+                            }).describe('Pinned agreement snapshot'),
+                            envelope: z.object({
+                                status: z.enum(['pending', 'sent', 'viewed', 'signed', 'declined', 'expired']).describe('Envelope aggregate status'),
+                                completionPolicy: z.enum(['all', 'one']).describe('Envelope completion policy'),
+                                progress: z.object({
+                                    signed: z.number().int(),
+                                    total: z.number().int(),
+                                }).describe('Signature progress across the envelope'),
+                            }).describe('Envelope status + progress'),
+                            invoice: z.object({
+                                id: z.string(),
+                                amountCents: z.number().int(),
+                                amountPaidCents: z.number().int().nullable().describe('Cumulative amount received in cents; null when no figure was recorded'),
+                                status: z.enum(['paid', 'partial', 'unpaid']),
+                            }).nullable().describe('Latest invoice for the inspection, or null'),
+                            payment: z.object({
+                                required: z.boolean(),
+                                paid: z.boolean(),
+                            }).describe('Inspection payment gate state'),
+                            inspection: z.object({
+                                id: z.string(),
+                                propertyAddress: z.string().nullable(),
+                            }).describe('Minimal inspection context'),
+                            branding: z.object({
+                                companyName: z.string(),
+                                primaryColor: z.string().nullable(),
+                            }).describe('Tenant branding for the page chrome'),
+                            portalToken: z.string().nullable().describe("IA-44 — the signer's own per-inspection portal token, so the completed checkout can hand off to the client Hub. Null for non-client signers."),
+                        }).describe('Combined checkout context'),
+                    }),
+                },
+            },
+            description: 'Combined checkout context',
+        },
+    },
+    operationId: "getBookingCheckout",
+    description: "Combined sign & pay context for the public checkout page (GET /checkout/:token, bookings domain). Resolves a signer token to the agreement snapshot, envelope progress, outstanding invoice/payment state, and tenant branding."
+}, { scopes: ['read'], tier: 'extended' }));
+
+/**
+ * POST /api/public/agreements/:token/sign — submit client signature
+ */
+const signAgreementRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/agreements/:token/sign',
+    tags: ["bookings", "public"],
+    summary: 'Submit client signature (public, token-gated)',
+    request: {
+        params: z.object({ token: z.string().min(1).describe('TODO describe token field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration'),
+        body: {
+            content: {
+                'application/json': {
+                    schema: z.object({
+                        signatureBase64: z.string().min(1).describe('TODO describe signatureBase64 field for the OpenInspection MCP integration'),
+                        onBehalfOf: z.string().max(200).optional().describe('Client name an authorized agent is signing on behalf of'),
+                        onBehalfDisclaimer: z.string().max(2000).optional().describe('Authorized-agent disclaimer text shown at sign time'),
+                    }).describe('TODO describe schema field for the OpenInspection MCP integration'),
+                },
+            },
+        },
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': {
+                    schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration') }).describe('TODO describe schema field for the OpenInspection MCP integration'),
+                },
+            },
+            description: 'Signed',
+        },
+    },
+    operationId: "createBookingAgreementsSign",
+    description: "Auto-generated placeholder for createBookingAgreementsSign (POST /agreements/:token/sign, bookings domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['write'], tier: 'extended' }));
+
+/**
+ * POST /api/public/agreements/:token/decline — client declines the agreement
+ */
+const declineAgreementRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/agreements/:token/decline',
+    tags: ["bookings", "public"],
+    summary: 'Decline agreement (public, token-gated)',
+    request: {
+        params: z.object({ token: z.string().min(1).describe('TODO describe token field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration'),
+        body: {
+            content: {
+                'application/json': {
+                    schema: z.object({ reason: z.string().max(500).optional().describe('TODO describe reason field for the OpenInspection MCP integration') }).describe('TODO describe schema field for the OpenInspection MCP integration'),
+                },
+            },
+        },
+    },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration') }).describe('TODO describe schema field for the OpenInspection MCP integration') } },
+            description: 'Declined',
+        },
+    },
+    operationId: "declineBooking",
+    description: "Auto-generated placeholder for declineBooking (POST /agreements/:token/decline, bookings domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['write'], tier: 'extended' }));
+
+const agreementRoutes = createApiRouter()
+    .openapi(getAgreementByTokenRoute, async (c) => {
+        const { token } = c.req.valid('param');
+        const svc = c.var.services.agreement;
+
+        // Track I-a — resolve the presented token to a SIGNER (signer token first,
+        // legacy envelope-token fallback w/ lazy upgrade). 404 on miss.
+        const resolved = await svc.getSignerByPresentedToken(token);
+        if (!resolved) throw Errors.NotFound('Signing request not found');
+        const { signer, envelope } = resolved;
+
+        // Mark this signer viewed (idempotent; rolls the envelope aggregate forward).
+        await svc.markViewedBySigner(token);
+
+        // Serve the pinned content SNAPSHOT — never the live template.
+        const snapshot = await svc.getSnapshotForRequest(envelope);
+
+        // THE PRESENTATION, on the audit chain. Intent must
+        // come from a recorded act, not be inferred from a signature image
+        // existing — and step one of that chain, "the signer was presented
+        // agreement X at hash Y", was recorded nowhere. `request.viewed` had been
+        // declared in the event enum for months with ZERO writers; the status
+        // flag `markViewedBySigner` sets is not a chained tamper-evident fact and
+        // carries no hash.
+        //
+        // Appended AFTER the snapshot resolves, because the hash is the point: on
+        // a first view of an unpinned envelope `getSnapshotForRequest` is what
+        // pins it, so reading the hash beforehand would record null for the one
+        // case that matters.
+        //
+        // Best-effort, like every other append on this path: a signer must not be
+        // unable to READ their agreement because an audit row failed. The
+        // consequence of a lost row is that the signature is later refused for a
+        // missing presentation, which is the safe direction.
+        try {
+            await c.var.services.auditLog.append(envelope.tenantId, envelope.id, 'signer.presented', {
+                envelopeId: envelope.id,
+                signerId: signer.id,
+                signerEmail: signer.email,
+                contentHash: snapshot.hash,
+                presentedAt: Date.now(),
+            });
+        } catch (err) {
+            logger.error('agreement presentation audit append failed',
+                { envelopeId: envelope.id, signerId: signer.id },
+                err instanceof Error ? err : undefined);
+        }
+
+        // Agreement name comes from the template row (display only, not content).
+        const agreementRow = await getDrizzle(c).select({ name: agreements.name })
+            .from(agreements).where(eq(agreements.id, envelope.agreementId)).get();
+
+        // Signature progress across the whole envelope.
+        const signers = await svc.listSigners(envelope.tenantId, envelope.id);
+        const signedCount = signers.filter((s) => s.status === 'signed').length;
+
+        return c.json({
+            success: true as const,
+            data: {
+                status: envelope.status as EnvelopeStatus,
+                envelopeId: envelope.id,
+                clientName: envelope.clientName ?? null,
+                agreementName: agreementRow?.name ?? 'Agreement',
+                agreementContent: snapshot.content,
+                signer: {
+                    name: signer.name,
+                    role: signer.role as SignerRole,
+                    // Re-read this signer's status post-view (markViewedBySigner may
+                    // have flipped it from sent → viewed).
+                    status: (signers.find((s) => s.id === signer.id)?.status ?? signer.status) as EnvelopeStatus,
+                },
+                progress: { signed: signedCount, total: signers.length },
+                completionPolicy: envelope.completionPolicy as 'all' | 'one',
+            },
+        }, 200);
+    })
+    .openapi(getCheckoutByTokenRoute, async (c) => {
+        const { token } = c.req.valid('param');
+        const svc = c.var.services.agreement;
+
+        // Track I-a Task 7 — resolve the presented SIGNER token to its envelope.
+        // 404 on miss (same posture as the agreement public routes).
+        const resolved = await svc.getSignerByPresentedToken(token);
+        if (!resolved) throw Errors.NotFound('Checkout not found');
+        const { signer, envelope } = resolved;
+
+        // Checkout is always inspection-bound (sign + pay); an envelope without
+        // an inspection has no payment context to combine, so treat as not found.
+        if (!envelope.inspectionId) throw Errors.NotFound('Checkout not found');
+
+        // Mark this signer viewed (idempotent; rolls the envelope aggregate
+        // forward) — same as the standalone sign page, since opening checkout
+        // IS viewing the agreement.
+        await svc.markViewedBySigner(token);
+
+        const db = getDrizzle(c);
+
+        // Pinned snapshot — never the live template.
+        const snapshot = await svc.getSnapshotForRequest(envelope);
+
+        // Agreement display name (display only, not content).
+        const agreementRow = await db.select({ name: agreements.name })
+            .from(agreements).where(eq(agreements.id, envelope.agreementId)).get();
+
+        // Envelope progress across all signers.
+        const signers = await svc.listSigners(envelope.tenantId, envelope.id);
+        const signedCount = signers.filter((s) => s.status === 'signed').length;
+
+        // Inspection + latest invoice + branding — mirrors getReportGate's
+        // tenant-scoped access pattern. All reads scope on the envelope tenant.
+        const tenantId = envelope.tenantId;
+        const inspectionId = envelope.inspectionId;
+
+        const inspectionRow = await db.select({
+            id: inspections.id,
+            propertyAddress: inspections.propertyAddress,
+            paymentRequired: inspections.paymentRequired,
+            paymentStatus: inspections.paymentStatus,
+        }).from(inspections)
+            .where(and(eq(inspections.id, inspectionId), eq(inspections.tenantId, tenantId)))
+            .get();
+        // Tenant-scoped read came back empty (deleted or cross-tenant) → not found.
+        if (!inspectionRow) throw Errors.NotFound('Checkout not found');
+
+        const invoiceRow = await db.select({
+            id: invoices.id,
+            amountCents: invoices.amountCents,
+            // Explicit projection: the `partial` status derived below carries no
+            // figure unless this column is named here.
+            amountPaidCents: invoices.amountPaidCents,
+            currency: invoices.currency,
+            paidAt: invoices.paidAt,
+            partialPaidAt: invoices.partialPaidAt,
+        }).from(invoices)
+            .where(and(eq(invoices.tenantId, tenantId), eq(invoices.inspectionId, inspectionId)))
+            .orderBy(desc(invoices.createdAt))
+            .limit(1)
+            .get();
+
+        const branding = await db.select({ companyName: tenantConfigs.companyName, primaryColor: tenantConfigs.primaryColor })
+            .from(tenantConfigs).where(eq(tenantConfigs.tenantId, tenantId)).get();
+
+        const invoiceStatus = invoiceRow
+            ? (invoiceRow.paidAt ? 'paid' : invoiceRow.partialPaidAt ? 'partial' : 'unpaid')
+            : null;
+
+        // IA-44 — hand the signer the per-inspection PORTAL token for their OWN
+        // email, so the completed checkout can bounce them into the client Hub
+        // (app/lib/portal-exchange.ts needs a portal token; checkout only ever
+        // held a signer token). This lives INSIDE the endpoint that already
+        // verified the signer — an independently-callable exchange route would
+        // be an unauthenticated token vending machine.
+        //
+        // Only client / co_client signers: those are the roles the Hub session
+        // and the client-actor gate (server/lib/portal-client-actor.ts) accept.
+        // An agent signer has no client hub, so minting one would be a grant
+        // they must not have. Issuance is idempotent per (inspection, recipient),
+        // so reloading checkout never rotates a link already sent by email.
+        let portalToken: string | null = null;
+        if (signer.role === 'client' || signer.role === 'co_client') {
+            try {
+                portalToken = await c.var.services.portalAccess.issueToken({
+                    tenantId, inspectionId, recipientEmail: signer.email, role: signer.role,
+                });
+            } catch (e) {
+                // Never let a token-issuance problem block signing or paying —
+                // the page degrades to "no hub hand-off", not to a dead end.
+                logger.warn('checkout.portal-token.issue.failed', {
+                    requestId: envelope.id, signerId: signer.id, error: (e as Error).message,
+                });
+            }
+        }
+
+        return c.json({
+            success: true as const,
+            data: {
+                signer: {
+                    name: signer.name,
+                    role: signer.role as SignerRole,
+                    status: (signers.find((s) => s.id === signer.id)?.status ?? signer.status) as EnvelopeStatus,
+                },
+                agreement: {
+                    name: agreementRow?.name ?? 'Agreement',
+                    content: snapshot.content,
+                    contentHash: snapshot.hash,
+                },
+                envelope: {
+                    status: envelope.status as EnvelopeStatus,
+                    completionPolicy: envelope.completionPolicy as 'all' | 'one',
+                    progress: { signed: signedCount, total: signers.length },
+                },
+                invoice: invoiceRow && invoiceStatus
+                    ? { id: invoiceRow.id, amountCents: invoiceRow.amountCents, amountPaidCents: invoiceRow.amountPaidCents ?? null, currency: invoiceRow.currency, status: invoiceStatus }
+                    : null,
+                payment: {
+                    required: inspectionRow.paymentRequired === true,
+                    paid: inspectionRow.paymentStatus === 'paid',
+                },
+                inspection: {
+                    id: inspectionRow.id,
+                    propertyAddress: inspectionRow.propertyAddress ?? null,
+                },
+                branding: {
+                    companyName: branding?.companyName ?? 'OpenInspection',
+                    primaryColor: branding?.primaryColor ?? null,
+                },
+                portalToken,
+            },
+        }, 200);
+    })
+    .openapi(signAgreementRoute, async (c) => {
+        const { token } = c.req.valid('param');
+        const { signatureBase64, onBehalfOf, onBehalfDisclaimer } = c.req.valid('json');
+        const svc = c.var.services.agreement;
+
+        // Track I-a — resolve the presented token to a SIGNER. 404 on miss.
+        const resolved = await svc.getSignerByPresentedToken(token);
+        if (!resolved) throw Errors.NotFound('Agreement request not found');
+        const { signer, envelope } = resolved;
+
+        // INTENT MUST COME FROM AN ACT. It is never inferred back
+        // from the fact that a signature image exists. So before recording one,
+        // the chain has to show this signer was presented THIS document.
+        //
+        // Two distinct refusals, and they are recorded as different facts: no
+        // presentation at all is a missing step, and a presentation of different
+        // content is a document that changed under a signer. A missing HASH is
+        // neither — an envelope predating content hashing has nothing to compare,
+        // and refusing there would block a signature for a reason about our own
+        // history rather than about the signer.
+        const intentLogs = await getDrizzle(c)
+            .select({ event: esignAuditLogs.event, payloadJson: esignAuditLogs.payloadJson })
+            .from(esignAuditLogs)
+            .where(and(
+                eq(esignAuditLogs.tenantId, envelope.tenantId),
+                eq(esignAuditLogs.requestId, envelope.id),
+            ))
+            .all();
+        const intentProblem = signingIntentProblem({
+            logs: intentLogs, signerId: signer.id, signedHash: envelope.contentHash ?? null,
+        });
+        if (intentProblem) {
+            logger.error('signing refused — intent chain incomplete',
+                { envelopeId: envelope.id, signerId: signer.id, reason: intentProblem });
+            throw Errors.BadRequest(
+                'This agreement has not been presented to you in a recorded step. '
+                + 'Please reopen the signing link and try again.',
+            );
+        }
+
+        const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || null;
+        const ua = (c.req.header('user-agent') || '').slice(0, 200) || null;
+        const country = c.req.header('cf-ipcountry') || null;
+        const tsMs = Date.now();
+
+        // Spec 5H P0 — append the per-signer audit BEFORE flipping DB status so
+        // chain integrity survives a partial failure (audit-before-mutation).
+        // Hash the signature image for cert reference (full image stored in DB).
+        const sigBytes = (() => {
+            try {
+                const b64 = signatureBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+                const bin = atob(b64);
+                const out = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                return out;
+            } catch { return new Uint8Array(); }
+        })();
+        const sigHash = sigBytes.length > 0
+            ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', sigBytes)))
+                .map((b) => b.toString(16).padStart(2, '0')).join('')
+            : null;
+        try {
+            await c.var.services.auditLog.append(envelope.tenantId, envelope.id, 'signer.signed', {
+                envelopeId: envelope.id,
+                signerId: signer.id,
+                signerEmail: signer.email,
+                signerRole: signer.role,
+                channel: 'remote',
+                contentHash: envelope.contentHash ?? null,
+                onBehalfOf: onBehalfOf ?? null,
+                country,
+                ip,
+                signatureImageHash: sigHash ? `sha256:${sigHash}` : null,
+                tsMs,
+                ua,
+            });
+        } catch (e) {
+            logger.warn('audit.append.signer-signed.failed', { requestId: envelope.id, signerId: signer.id, error: (e as Error).message });
+        }
+
+        const result = await svc.markSignedBySigner(token, signatureBase64, {
+            signedAtMs: tsMs,
+            channel: 'remote',
+            ipAddress: ip,
+            userAgent: ua,
+            onBehalfOf: onBehalfOf ?? null,
+            onBehalfDisclaimer: onBehalfDisclaimer ?? null,
+            // The two surfaces this route serves — standalone sign page, checkout
+            // sign card — both render <AgreementLanguageDisclosure> (asserted by
+            // the containment spec), so this states a screen the signer saw.
+            languageDisclosureVersion: AGREEMENT_LANGUAGE_DISCLOSURE.version,
+        });
+
+        // Spec 2A — per-signer automation event so per-tenant rules can react to
+        // each individual signature (fires on EVERY sign, not just completion).
+        if (result.inspectionId) {
+            fireAndForget(c, c.var.services.automation.trigger({
+                tenantId: result.tenantId,
+                inspectionId: result.inspectionId,
+                triggerEvent: 'agreement.signer_signed',
+                companyName: await resolveAutomationCompanyName(getDrizzle(c), result.tenantId),
+            }), 'automation trigger', { event: 'agreement.signer_signed', tenantId: result.tenantId });
+        }
+
+        // Envelope completion side-effects fire EXACTLY ONCE — gated on the
+        // atomic single-fire flag from the service.
+        if (result.envelopeCompletedNow) {
+            await runEnvelopeCompletionPipeline(c, {
+                requestId: result.requestId,
+                tenantId: result.tenantId,
+                inspectionId: result.inspectionId,
+                clientEmail: envelope.clientEmail ?? null,
+                clientName: envelope.clientName ?? null,
+                agreementId: envelope.agreementId,
+            });
+        }
+
+        // IA-46 — per-signer receipt at THIS signer's own email carrying the
+        // tamper-evident /verify/:envelopeId link, mirroring the in-person route.
+        // Without it a remote co-signer (or any non-client signer) walks away
+        // with nothing: the completion pipeline emails only the envelope client.
+        // Skip the duplicate only when this same signature completed the envelope
+        // AND the signer IS the envelope client (already emailed above).
+        const completedSelf = result.envelopeCompletedNow
+            && !!envelope.clientEmail
+            && signer.email.trim().toLowerCase() === envelope.clientEmail.trim().toLowerCase();
+        if (!completedSelf) {
+            await runSignerReceiptEffects(c, {
+                signerEmail: signer.email,
+                signerName: signer.name,
+                inspectionId: result.inspectionId,
+                requestId: result.requestId,
+            });
+        }
+
+        return c.json({ success: true as const }, 200);
+    })
+    .openapi(declineAgreementRoute, async (c) => {
+        const { token } = c.req.valid('param');
+        const { reason } = c.req.valid('json');
+        const svc = c.var.services.agreement;
+
+        // Track I-a — resolve the presented token to a SIGNER. 404 on miss.
+        const resolved = await svc.getSignerByPresentedToken(token);
+        if (!resolved) throw Errors.NotFound('Agreement request not found');
+        const { signer, envelope } = resolved;
+
+        const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || null;
+        const ua = (c.req.header('user-agent') || '').slice(0, 200) || null;
+        const country = c.req.header('cf-ipcountry') || null;
+
+        // Per-signer audit append (audit-before-mutation, try/catch).
+        try {
+            await c.var.services.auditLog.append(envelope.tenantId, envelope.id, 'signer.declined', {
+                envelopeId: envelope.id,
+                signerId: signer.id,
+                signerEmail: signer.email,
+                reason: reason ?? null,
+                country,
+                ip,
+                tsMs: Date.now(),
+                ua,
+            });
+        } catch (e) {
+            logger.warn('audit.append.signer-declined.failed', { requestId: envelope.id, signerId: signer.id, error: (e as Error).message });
+        }
+
+        const r = await svc.markDeclinedBySigner(token, reason);
+
+        // Envelope-level automation fires ONLY when the WHOLE envelope declined.
+        if (r.inspectionId && r.envelopeStatus === 'declined') {
+            fireAndForget(c, c.var.services.automation.trigger({
+                tenantId: r.tenantId,
+                inspectionId: r.inspectionId,
+                triggerEvent: 'agreement.declined',
+                companyName: await resolveAutomationCompanyName(getDrizzle(c), r.tenantId),
+                
+            }), 'automation trigger', { event: 'agreement.declined', tenantId: r.tenantId });
+        }
+
+        return c.json({ success: true as const }, 200);
+    });
+
+export default agreementRoutes;

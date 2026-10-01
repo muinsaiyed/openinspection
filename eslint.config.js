@@ -1,0 +1,707 @@
+﻿import eslint from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import reactHooks from 'eslint-plugin-react-hooks';
+import react from 'eslint-plugin-react';
+import jsxA11y from 'eslint-plugin-jsx-a11y';
+import importX from 'eslint-plugin-import-x';
+import { createTypeScriptImportResolver } from 'eslint-import-resolver-typescript';
+
+/**
+ * ESLINT_FAST — the pre-commit shape: same rules, no type information.
+ *
+ * Building the type-aware program is what eslint costs here, and on a commit it
+ * buys nothing. Measured on this repo, cache cleared:
+ *
+ *     one staged server file    15.1s  →  3.7s
+ *     two staged app files      15.8s  →  3.9s
+ *
+ * It buys nothing because every rule that NEEDS type information is 'warn'
+ * (no-floating-promises and the no-unsafe-* family below), and `.lintstagedrc`
+ * passes no `--max-warnings` — so eslint exits 0 no matter what those rules
+ * find. The only error-level TypeScript rules are `no-explicit-any` and
+ * `no-unused-vars`, and neither reads types. The hook was therefore spending
+ * ~11.5s per commit building a program whose entire output was discarded.
+ *
+ * The warnings still matter — they are just meant to be READ, not raced past on
+ * the way to a commit. `npm run lint` (CI's verify job) runs with no flag set
+ * and stays the authority; nothing below changes what CI checks.
+ */
+const FAST = !!process.env.ESLINT_FAST;
+
+/** A rule that requires type information: its normal severity, or off under ESLINT_FAST. */
+const typed = (severity = 'warn') => (FAST ? 'off' : severity);
+
+// T-hooks warn-first rollout: downgrade every rule in a plugin's preset rules
+// object to 'warn' (preserving any non-severity options), rather than hand-
+// picking which of a preset's rules to enable. Used for jsx-a11y's flat
+// recommended config below — see task-hooks-brief.md severity policy.
+//
+// Rules the preset ships as 'off'/0 by design (deprecated rules like
+// jsx-a11y/label-has-for, or rules superseded by another on-rule like
+// anchor-ambiguous-text / control-has-associated-label) must NOT be force-
+// enabled here — filter those out first, then only warn-ify what the preset
+// actually turns on. (T-hooks review fix — the first pass warn-ified
+// everything including the off-by-design rules, corrupting the audit table.)
+function toWarn(rules) {
+    return Object.fromEntries(
+        Object.entries(rules)
+            .filter(([, value]) => {
+                const severity = Array.isArray(value) ? value[0] : value;
+                return severity !== 'off' && severity !== 0;
+            })
+            .map(([name, value]) => [
+                name,
+                Array.isArray(value) ? ['warn', ...value.slice(1)] : 'warn',
+            ]),
+    );
+}
+
+export default tseslint.config(
+    // ── THE TWO LINES BELOW ARE WHERE UPSTREAM DECISIONS BECOME OURS ────
+    //
+    // Both presets are taken WHOLESALE, and both grow. ESLint and
+    // typescript-eslint each state up front that a major version adds rules to
+    // `recommended`, and that this can break an existing build. That is
+    // documented, expected behaviour — not an unwatched channel. It announces
+    // itself as a red `npm run lint`, which is the only rung that runs the full
+    // set, so the signal arrives late but it does arrive.
+    //
+    // Measured 2026-08-25: `@eslint/js` v10 promoted `no-useless-assignment`
+    // into `configs.recommended` at ERROR level. Nobody turned it on. It found
+    // 34 pre-existing dead assignments across 27 files and turned a green lint
+    // red — and every one of them was real.
+    //
+    // WHEN THAT HAPPENS AGAIN THERE ARE THREE OPTIONS, NOT TWO:
+    //
+    //   1. FIX THEM. The right answer when the findings are real and local, as
+    //      those 34 were — half of them verifiable by tsc's definite-assignment
+    //      analysis once the dead initialiser is dropped.
+    //
+    //   2. SUPPRESS THEM. `npx eslint --suppress-rule <name>` writes the
+    //      existing violations into `eslint-suppressions.json` and leaves the
+    //      rule at error, so NEW violations still fail; `--prune-suppressions`
+    //      removes entries as they are fixed. It is the same baseline-ratchet
+    //      shape as this repo's knip, file-size and tenant-scope gates, except
+    //      that ESLint ships and maintains it. Reach for this when the count
+    //      makes fixing a separate project rather than a task.
+    //
+    //   3. TURN IT OFF, with the reason written down — upstream's own guidance
+    //      is a comment saying why, or a TODO linking to an issue. A severity
+    //      downgrade with no stated reason is the one answer that is never
+    //      acceptable, because it looks identical to nobody having noticed.
+    //
+    // ⚠️ OPTION 2 IS WHY THIS COMMENT EXISTS. Faced with those 34, the first
+    // reaction was to downgrade the rule to 'warn' — because options 1 and 3
+    // looked like the whole menu. They are not, and a false binary between
+    // "fix all N now" and "stop enforcing it" is how a rule worth having gets
+    // switched off at N=500.
+    //
+    // Note the `pending cleanup` policy further down is a DIFFERENT thing: it
+    // governs the type-aware rules this config deliberately enables by name. A
+    // core rule arriving inside a preset is not covered by it.
+    eslint.configs.recommended,
+    ...tseslint.configs.recommended,
+    {
+        // `*.config.ts` (vitest/playwright/drizzle/react-router) are build/tooling
+        // configs not included in tsconfig.json/tsconfig.api.json, so the
+        // type-aware parser can't resolve them. They don't need type-aware
+        // linting — ignore them rather than widen the tsconfig projects.
+        //
+        // `.types/**` is tsc project-reference output (the .d.ts tsconfig.api.json
+        // emits for the app program). Generated, gitignored, and in no lintable
+        // TS project — leaving it in produced 803 "file not found in any of the
+        // provided project(s)" parse errors.
+        //
+        // ── THE CO-LOCATED SPECS ARE NO LONGER IGNORED (#98) ────────────────
+        //
+        // `app/**/*.test.{ts,tsx}` and `packages/shared-ui/src/**/*.test.{ts,tsx}`
+        // used to sit in this list, justified by "excluded from tsconfig.json, so
+        // the type-aware parser can't place them in any TS project". #63 Phase 0.5
+        // retired that: all 352 are in the app program now. Measured before
+        // removing them, in BOTH gate shapes, and the two agree exactly because
+        // every error-level rule here is syntactic:
+        //
+        //     ESLINT_FAST=1 (the pre-commit shape)   33 errors, 19 warnings
+        //     type-aware    (the `npm run lint` CI shape)  33 errors, 332 warnings
+        //
+        //     20 no-explicit-any · 10 no-unused-vars · 2 no-console
+        //     1 no-require-imports — across 15 of 352 files.
+        //
+        // The 332 warnings do not gate anything: no invocation of eslint in this
+        // repo passes `--max-warnings` (see the FAST note at the top), so warnings
+        // are output to read, and every type-aware rule below is 'warn'.
+        //
+        // Cost of including them in CI's type-aware pass is rule evaluation only,
+        // NOT program construction: tsconfig.json already contains these 352 files
+        // whether or not eslint lints them, so the program was being built for them
+        // already.
+        //
+        // ── `tests/**` STAYS, and NOT for the old reason ────────────────────
+        //
+        // tsconfig.tests.json now exists, so "belongs to no TS project" is dead
+        // there too — but it was never the operative fact and un-ignoring is not a
+        // one-line diff. What is actually in the way, measured under ESLINT_FAST:
+        //
+        //   1581 errors across 364 of 856 files, of which
+        //     970  no-restricted-syntax — 813 role literals + 135 status literals.
+        //          These are the FIXTURE case the override block below already
+        //          says is exempt ("Exempt: roles.ts itself, test files, …") and
+        //          never actually listed, because tests were ignored when it was
+        //          written. Listing them is the honest fix and belongs with a
+        //          reading of what a role literal means in a fixture, not here.
+        //      463 no-explicit-any — `as any` on partial fixtures. eslint flags a
+        //          CAST, not just a declaration (verified: `} as any,` reports at
+        //          the `any`), so this is the same 700-odd casts the tests/unit
+        //          suppression burn-down is already working through. Relaxing the
+        //          rule for specs would delete the only mechanical pointer at the
+        //          failure it keeps finding — a cast that hides a dead fixture,
+        //          leaving an assertion that cannot fail.
+        //       83 import/order + import/first — "Definition for rule … was not
+        //          found": stale `eslint-disable` comments naming
+        //          eslint-plugin-import, which this repo does not use (it uses
+        //          import-x). Deleting the comments is the fix.
+        //
+        // Two more things block the type-aware half specifically: `tests/**` is not
+        // in `parserOptions.project` (tsconfig.tests.json would have to be added),
+        // and even then `tests/e2e/**` plus the three files on tsconfig.tests.json's
+        // burn-down ratchet belong to no project in that list and would be fatal
+        // parse errors. So `tests/**` waits on that ratchet reaching zero.
+        //
+        // Note `tests/**` is not in `.lintstagedrc`'s glob either
+        // (`{server,app,workers,packages}/**`), so un-ignoring it would change
+        // nothing at commit time and land all 1581 in CI at once.
+        // `backups/**` is the gitignored dump directory (D1 exports, and whatever
+        // scratch a measurement leaves behind). Flat config does NOT read
+        // .gitignore, so a single stray `.ts` landing here fails `npm run lint`
+        // with a parse error — locally only, since CI checks out a tree where the
+        // directory does not exist. That divergence is worse than the lint it
+        // skips: it makes the local pre-push gate disagree with the gate it exists
+        // to predict.
+        ignores: ['dist/**', 'dist-check/**', 'build/**', '.types/**', '.react-router/**', 'node_modules/**', '.wrangler/**', '.worktrees/**', 'backups/**', 'app/paraglide/**', 'eslint.config.js', '*.config.ts', 'drizzle.config.trial.ts', 'public/**', 'tests/**', 'scripts/**'],
+    },
+    {
+        files: ['**/*.ts', '**/*.tsx'],
+        languageOptions: {
+            parserOptions: {
+                // Omitted under ESLINT_FAST — see the FAST note at the top of this file.
+                ...(FAST ? {} : { project: ['./tsconfig.json', './tsconfig.api.json'] }),
+                tsconfigRootDir: import.meta.dirname,
+            },
+        },
+        rules: {
+            '@typescript-eslint/no-explicit-any': 'error',
+            '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+            'no-console': ['error', { allow: ['warn', 'error', 'info'] }],
+            // T-hooks Tier 1 — type-checked rules, warn-first rollout (see
+            // task-hooks-brief.md). Not swapping to recommendedTypeChecked
+            // wholesale (would flip ~20 rules to error and fail CI); these are
+            // the specific rules called out, all at 'warn' pending cleanup.
+            // floating/misused-promises are the headline pre-release signal —
+            // silent unawaited promises are a data-loss bug class on Workers.
+            '@typescript-eslint/no-floating-promises': typed(),
+            // `checksVoidReturn.attributes: false` — passing an async function to
+            // a JSX event-handler prop (`onClick={async () => …}`) is idiomatic
+            // React (the return is ignored by design); flagging it is pure noise.
+            // The pre-release triage confirmed 43/45 misused-promises hits were
+            // exactly this pattern and zero were server-executed. The remaining
+            // argument/return/property checks stay on to catch genuine misuse.
+            '@typescript-eslint/no-misused-promises': typed(['warn', { checksVoidReturn: { attributes: false } }]),
+            '@typescript-eslint/await-thenable': typed(),
+            '@typescript-eslint/require-await': typed(),
+            '@typescript-eslint/no-base-to-string': typed(),
+            '@typescript-eslint/restrict-template-expressions': typed(),
+            '@typescript-eslint/no-unnecessary-condition': typed(),
+            '@typescript-eslint/no-unsafe-assignment': typed(),
+            '@typescript-eslint/no-unsafe-member-access': typed(),
+            '@typescript-eslint/no-unsafe-call': typed(),
+            '@typescript-eslint/no-unsafe-return': typed(),
+            '@typescript-eslint/no-unsafe-argument': typed(),
+            // T-hooks Tier 3 — architecture/hygiene, warn (no --fix sweep; huge diff).
+            '@typescript-eslint/consistent-type-imports': 'warn',
+            '@typescript-eslint/no-import-type-side-effects': 'warn',
+            // Round 5 lesson — Alpine v3 only auto-removes x-cloak from the x-data root.
+            // x-cloak on a NESTED element combined with the
+            // [x-cloak]{display:none!important} rule in main-layout permanently hides
+            // the element even when x-show=true. Two prod bugs landed because of this:
+            //   - 17a75d7 (marketplace preview modal)
+            //   - a753af5 (login 2fa form)
+            // Rule: x-cloak ONLY on the outermost x-data element. For nested
+            // hide-on-load, use style="display:none" + x-show.
+            'no-restricted-syntax': ['error',
+                {
+                    // IA-117 — an id validator must never be STRICTER than the
+                    // column it guards. Every id here is a plain TEXT column:
+                    // each writer happens to mint crypto.randomUUID() today, but
+                    // the COLUMN makes no such promise and the API must not make
+                    // it either.
+                    //
+                    // Not theoretical. `.uuid()` on contacts.id 400'd the
+                    // report-access lookup, and the page rendered that as "this
+                    // contact cannot open any reports" about someone holding two
+                    // live links. The same shape on invoices.id made Mark paid do
+                    // nothing, and earlier on inspectorId it rejected a whole
+                    // patch (IA-87). Three times, each found by a person.
+                    //
+                    // Relaxing loses nothing: a malformed id reaches the
+                    // tenant-scoped lookup and 404s, which is the honest answer.
+                    // `.trim()` matters — a bare `.min(1)` accepts "%20".
+                    // If a value really is UUID-shaped by construction rather
+                    // than convention, disable inline WITH that reason.
+                    selector: "CallExpression[callee.property.name='uuid'][callee.object.callee.property.name='string']",
+                    message: 'Do not validate an id with z.string().uuid() — these are opaque TEXT columns and the check is stricter than the column promises (IA-117/IA-87). Use z.string().trim().min(1).',
+                },
+                {
+                    selector: "JSXAttribute[name.name='x-cloak']",
+                    message: 'Avoid x-cloak on nested JSX elements — Alpine does not auto-remove it, so [x-cloak]{display:none} stays sticky. Use style="display:none" + x-show, or place x-cloak only on the outermost x-data element. See main-layout.tsx comment.',
+                },
+                // Cookie-policy guard (PR 1) — setCookie must take its attributes
+                // from a factory in server/lib/auth-helpers.ts, never an inline object.
+                // CLAUDE.md mandates httpOnly + secure + sameSite + path on EVERY
+                // setCookie; five sites were hand-maintaining identical copies of the
+                // staff-session options and two more the portal's. They were correct
+                // at the time, which is exactly why nobody noticed there were seven
+                // places to update on the next policy change.
+                {
+                    selector: "CallExpression[callee.name='setCookie'] > ObjectExpression",
+                    message: 'Pass a cookie-options factory from server/lib/auth-helpers.ts (authCookieOptions / portalSessionCookieOptions), not an inline object — CLAUDE.md requires httpOnly+secure+sameSite+path on every cookie.',
+                },
+                // Admin-tier guard (IA-94 / PR 1) — "is this an owner or a manager"
+                // must go through isAdminRole() in server/lib/auth/roles.ts. It was
+                // re-derived in SEVEN places before this rule existed, including a
+                // same-named local const with its own logic, and a comment reading
+                // "Keep in sync with isAdminRole" — a note asking a human to do what
+                // a rule can. The role-literal guard does not catch these: its
+                // override block exempts server/lib, server/api, server/services and
+                // app — i.e. everywhere they lived.
+                {
+                    selector: "LogicalExpression[operator='||']:has(Literal[value='owner']):has(Literal[value='manager'])",
+                    message: 'Use isAdminRole() from server/lib/auth/roles.ts instead of comparing to owner/manager inline.',
+                },
+                {
+                    selector: "LogicalExpression[operator='||']:has(MemberExpression[property.name='OWNER']):has(MemberExpression[property.name='MANAGER'])",
+                    message: 'Use isAdminRole() from server/lib/auth/roles.ts instead of comparing to ROLE.OWNER/ROLE.MANAGER inline.',
+                },
+                // Role taxonomy guard — all RBAC role string literals must derive from
+                // ROLES / Role in server/lib/auth/roles.ts (the single source of truth).
+                // This prevents typos and stale literals surviving a role rename.
+                // Exempt: roles.ts itself, test files, schema/data/seed files
+                // (see override block below).
+                // 'admin' was DROPPED from the pattern (Task 16, two-layer role model):
+                // it is not a member of ROLES, and keeping it made every OpenAPI
+                // `tags: ['admin']` / `scopes: ['admin']` a false positive — false
+                // positives are what made the directory exemptions necessary. The
+                // future admin→manager rename stays guarded because 'manager' is
+                // already in the pattern.
+                // requireRole(...roles: Role[]) is excluded via :not() because TypeScript
+                // already enforces Role at the call site — a typo there is a compile error.
+                {
+                    selector: "Literal[value=/^(owner|manager|inspector|agent)$/]:not(CallExpression[callee.name='requireRole'] > Literal):not(TSLiteralType > Literal)",
+                    message: 'Use ROLES / Role from server/lib/auth/roles.ts — no bare role string literals.',
+                },
+                // Task 14 (two-layer role model) — capabilitiesForKind is the KIND
+                // BASELINE; calling it directly skips the per-profile override layer
+                // and silently ignores a tenant's configuration. The one legitimate
+                // call site (inside capabilitiesForProfile) carries an inline disable.
+                {
+                    selector: "CallExpression[callee.name='capabilitiesForKind']",
+                    message: 'Call capabilitiesForProfile(kind, overrides) — capabilitiesForKind is the baseline only, and calling it directly ignores the role profile\'s own overrides.',
+                },
+                // Status taxonomy guard — inspection status literals must derive from
+                // INSPECTION_STATUS / REPORT_STATUS in server/lib/status/*.ts.
+                // Narrowly targets only the values that are unambiguous in this codebase:
+                //   'requested'  — only an InspectionStatus value (lifecycle axis)
+                //   'submitted'  — only a ReportStatus value (report deliverable axis)
+                // Values NOT banned because they collide with other enums:
+                //   'draft'      — invoice status ('draft'|'sent'|'paid'|'partial')
+                //   'published'  — sync outbox status + automation trigger names
+                //   'completed'  — could be used in other enums
+                //   'cancelled'  — broad usage
+                //   'scheduled'  — booking/concierge status
+                //   'confirmed'  — booking/concierge status
+                //   'in_progress' — collision: inspection_requests table status +
+                //                   dashboard filter tab IDs + report-status
+                // All legit uses of 'requested' and 'submitted' live in files already
+                // covered by the override block below (server/lib/**, server/api/**,
+                // server/services/**, app/**), so this guard only fires on NEW code
+                // outside those zones — keeping it forward-looking with zero current noise.
+                {
+                    selector: "Literal[value=/^(requested|submitted)$/]",
+                    message: 'Use INSPECTION_STATUS / REPORT_STATUS from server/lib/status/* — no bare status literals.',
+                },
+            ],
+        },
+    },
+    {
+        // Exempt files where the role-string matches are NOT bare RBAC literals
+        // that need fixing. Each category is explained below. The rule fires only
+        // on NEW code paths outside these globs, keeping the guard forward-looking.
+        //
+        // server/lib/auth/roles.ts       — source of truth; defines the literals
+        // server/lib/db/schema/**        — drizzle column defs; also has non-user-role
+        //                                  enums (signer/contact roles) which use 'agent'.
+        //                                  NARROWED by the IA-107 convergence: contacts.type,
+        //                                  contact_role_profiles.kind, inspection_messages.from_role,
+        //                                  sms_consent_log.recipient_type and
+        //                                  repair_requests.created_by_kind now read shared arrays,
+        //                                  and both users.role defaults read ROLE.*. What is LEFT
+        //                                  is five declarations that must stay distinct, each
+        //                                  carrying its reason at the column: agreement_signers.role
+        //                                  (adds co_client), client_uploads UPLOADER_KINDS (portal
+        //                                  SEATS, not kinds), automations.recipient_kind (a fan-out
+        //                                  selector), tenant point_of_contact ('inspector'|'company'),
+        //                                  and the message/uploader arrays themselves.
+        // server/data/**                 — seed/fixture data; literals are authoritative
+        // server/lib/middleware/rbac.ts  — requireRole(...roles:Role[]) definition;
+        //                                  the Role type already enforces call sites
+        // server/lib/auth/jwt-claims.ts  — uses 'agent' as a JWT kind discriminant
+        // server/lib/public-access.ts    — PortalRole ('client'|'co_client'|'agent') is
+        //                                  a non-RBAC signer role (≠ users.role)
+        // server/durable-objects/**      — presence role ≠ RBAC. (This line said
+        //                                  "('inspector'|'observer')"; 'observer' has no hits
+        //                                  anywhere in the tree — the presence role is the single
+        //                                  value 'inspector'. Three hits remain in
+        //                                  inspection-presence.ts, two of them type positions the
+        //                                  selector already excludes, so ONE value-position literal
+        //                                  is what this glob is still buying.)
+        // server/lib/email-templates/**  — email category ('agent'|'client') ≠ RBAC
+        // server/lib/integration/**      — bootstrap insert; drizzle column enum enforces
+        // server/portal/**               — credential upsert; drizzle column enum enforces
+        // server/api/**                  — existing sites: OpenAPI tags/scopes strings
+        //                                  ('admin' there is a doc label, not a role), plus
+        //                                  Drizzle typed inserts (column enum enforces), JWT
+        //                                  payload role fields (typed as UserRole), and
+        //                                  non-RBAC signer/contact role strings. requireRole
+        //                                  args are already excluded by :not() in the selector.
+        // server/services/**             — Drizzle insert/query role literals are typed by
+        //                                  { enum: ROLES }; non-RBAC contact-type strings
+        //                                  ('agent'|'client') are a distinct taxonomy
+        // server/lib/**                  — dashboard-column ids, route-metadata scopes,
+        //                                  validation schemas for non-RBAC signer/automation roles.
+        //                                  RBAC-specific helpers (can-edit, report-section-numbering)
+        //                                  were already fixed to use ROLE.* constants.
+        // server/index.ts                — JWT context population; typed as UserRole
+        // app/**                         — RE-MEASURED 2026-07-30 (Task 16, two-layer
+        //                                  role model): 80 value-position hits with the
+        //                                  narrowed selector + TSLiteralType exclusion
+        //                                  (24 in app/routes, 56 elsewhere) — the plan's
+        //                                  "4 lines" predates the agent-portal epic.
+        //                                  Removing this exemption is its own PR: give
+        //                                  the contact-party/portal axes constants
+        //                                  (server/lib/people/role-kinds.ts exists now),
+        //                                  convert one directory at a time, then delete.
+        //                                  Do NOT baseline: a baseline freezes the
+        //                                  ambiguity, a constant removes it.
+        files: [
+            'server/lib/auth/roles.ts',
+            'server/lib/db/schema/**/*.ts',
+            'server/data/**/*.ts',
+            'server/lib/middleware/rbac.ts',
+            'server/lib/auth/jwt-claims.ts',
+            'server/lib/public-access.ts',
+            'server/durable-objects/**/*.ts',
+            'server/lib/email-templates/**/*.ts',
+            'server/lib/integration/**/*.ts',
+            'server/portal/**/*.ts',
+            'server/api/**/*.ts',
+            'server/services/**/*.ts',
+            'server/lib/**/*.ts',
+            'server/index.ts',
+            'app/**/*.ts',
+            'app/**/*.tsx',
+        ],
+        rules: {
+            // Turn off ONLY the role-literal restriction for these files; all other rules still apply.
+            'no-restricted-syntax': ['error',
+                {
+                    // IA-117 — an id validator must never be STRICTER than the
+                    // column it guards. Every id here is a plain TEXT column:
+                    // each writer happens to mint crypto.randomUUID() today, but
+                    // the COLUMN makes no such promise and the API must not make
+                    // it either.
+                    //
+                    // Not theoretical. `.uuid()` on contacts.id 400'd the
+                    // report-access lookup, and the page rendered that as "this
+                    // contact cannot open any reports" about someone holding two
+                    // live links. The same shape on invoices.id made Mark paid do
+                    // nothing, and earlier on inspectorId it rejected a whole
+                    // patch (IA-87). Three times, each found by a person.
+                    //
+                    // Relaxing loses nothing: a malformed id reaches the
+                    // tenant-scoped lookup and 404s, which is the honest answer.
+                    // `.trim()` matters — a bare `.min(1)` accepts "%20".
+                    // If a value really is UUID-shaped by construction rather
+                    // than convention, disable inline WITH that reason.
+                    selector: "CallExpression[callee.property.name='uuid'][callee.object.callee.property.name='string']",
+                    message: 'Do not validate an id with z.string().uuid() — these are opaque TEXT columns and the check is stricter than the column promises (IA-117/IA-87). Use z.string().trim().min(1).',
+                },
+                {
+                    selector: "JSXAttribute[name.name='x-cloak']",
+                    message: 'Avoid x-cloak on nested JSX elements — Alpine does not auto-remove it, so [x-cloak]{display:none} stays sticky. Use style="display:none" + x-show, or place x-cloak only on the outermost x-data element. See main-layout.tsx comment.',
+                },
+                // Cookie-policy guard (PR 1) — setCookie must take its attributes
+                // from a factory in server/lib/auth-helpers.ts, never an inline object.
+                // CLAUDE.md mandates httpOnly + secure + sameSite + path on EVERY
+                // setCookie; five sites were hand-maintaining identical copies of the
+                // staff-session options and two more the portal's. They were correct
+                // at the time, which is exactly why nobody noticed there were seven
+                // places to update on the next policy change.
+                {
+                    selector: "CallExpression[callee.name='setCookie'] > ObjectExpression",
+                    message: 'Pass a cookie-options factory from server/lib/auth-helpers.ts (authCookieOptions / portalSessionCookieOptions), not an inline object — CLAUDE.md requires httpOnly+secure+sameSite+path on every cookie.',
+                },
+                // Admin-tier guard (IA-94 / PR 1) — "is this an owner or a manager"
+                // must go through isAdminRole() in server/lib/auth/roles.ts. It was
+                // re-derived in SEVEN places before this rule existed, including a
+                // same-named local const with its own logic, and a comment reading
+                // "Keep in sync with isAdminRole" — a note asking a human to do what
+                // a rule can. The role-literal guard does not catch these: its
+                // override block exempts server/lib, server/api, server/services and
+                // app — i.e. everywhere they lived.
+                {
+                    selector: "LogicalExpression[operator='||']:has(Literal[value='owner']):has(Literal[value='manager'])",
+                    message: 'Use isAdminRole() from server/lib/auth/roles.ts instead of comparing to owner/manager inline.',
+                },
+                {
+                    selector: "LogicalExpression[operator='||']:has(MemberExpression[property.name='OWNER']):has(MemberExpression[property.name='MANAGER'])",
+                    message: 'Use isAdminRole() from server/lib/auth/roles.ts instead of comparing to ROLE.OWNER/ROLE.MANAGER inline.',
+                },
+                // Task 14 (two-layer role model) — mirrored from the base list
+                // because this exemption block REPLACES no-restricted-syntax for
+                // its files, and skipping the override layer is exactly as wrong
+                // in server/services as anywhere else.
+                {
+                    selector: "CallExpression[callee.name='capabilitiesForKind']",
+                    message: 'Call capabilitiesForProfile(kind, overrides) — capabilitiesForKind is the baseline only, and calling it directly ignores the role profile\'s own overrides.',
+                },
+            ],
+        },
+    },
+    {
+        // Dead-routes cleanup (2026-05-30) — guard against re-introducing raw
+        // /api/* string-literal fetches and the now-deleted apiFetch helper in
+        // route files. The 17 retained apiFetch dead-route sites were all migrated
+        // to the typed createApi(context, { token }) client; this keeps it that way.
+        // Scoped to routes/** so browser-side component fetches aren't false-flagged.
+        files: ['app/routes/**/*.ts', 'app/routes/**/*.tsx'],
+        rules: {
+            'no-restricted-syntax': ['error',
+                {
+                    // IA-117 — an id validator must never be STRICTER than the
+                    // column it guards. Every id here is a plain TEXT column:
+                    // each writer happens to mint crypto.randomUUID() today, but
+                    // the COLUMN makes no such promise and the API must not make
+                    // it either.
+                    //
+                    // Not theoretical. `.uuid()` on contacts.id 400'd the
+                    // report-access lookup, and the page rendered that as "this
+                    // contact cannot open any reports" about someone holding two
+                    // live links. The same shape on invoices.id made Mark paid do
+                    // nothing, and earlier on inspectorId it rejected a whole
+                    // patch (IA-87). Three times, each found by a person.
+                    //
+                    // Relaxing loses nothing: a malformed id reaches the
+                    // tenant-scoped lookup and 404s, which is the honest answer.
+                    // `.trim()` matters — a bare `.min(1)` accepts "%20".
+                    // If a value really is UUID-shaped by construction rather
+                    // than convention, disable inline WITH that reason.
+                    selector: "CallExpression[callee.property.name='uuid'][callee.object.callee.property.name='string']",
+                    message: 'Do not validate an id with z.string().uuid() — these are opaque TEXT columns and the check is stricter than the column promises (IA-117/IA-87). Use z.string().trim().min(1).',
+                },
+                {
+                    selector: "JSXAttribute[name.name='x-cloak']",
+                    message: 'Avoid x-cloak on nested JSX elements — Alpine does not auto-remove it, so [x-cloak]{display:none} stays sticky. Use style="display:none" + x-show, or place x-cloak only on the outermost x-data element. See main-layout.tsx comment.',
+                },
+                // Cookie-policy guard (PR 1) — setCookie must take its attributes
+                // from a factory in server/lib/auth-helpers.ts, never an inline object.
+                // CLAUDE.md mandates httpOnly + secure + sameSite + path on EVERY
+                // setCookie; five sites were hand-maintaining identical copies of the
+                // staff-session options and two more the portal's. They were correct
+                // at the time, which is exactly why nobody noticed there were seven
+                // places to update on the next policy change.
+                {
+                    selector: "CallExpression[callee.name='setCookie'] > ObjectExpression",
+                    message: 'Pass a cookie-options factory from server/lib/auth-helpers.ts (authCookieOptions / portalSessionCookieOptions), not an inline object — CLAUDE.md requires httpOnly+secure+sameSite+path on every cookie.',
+                },
+                // Admin-tier guard (IA-94 / PR 1) — "is this an owner or a manager"
+                // must go through isAdminRole() in server/lib/auth/roles.ts. It was
+                // re-derived in SEVEN places before this rule existed, including a
+                // same-named local const with its own logic, and a comment reading
+                // "Keep in sync with isAdminRole" — a note asking a human to do what
+                // a rule can. The role-literal guard does not catch these: its
+                // override block exempts server/lib, server/api, server/services and
+                // app — i.e. everywhere they lived.
+                {
+                    selector: "LogicalExpression[operator='||']:has(Literal[value='owner']):has(Literal[value='manager'])",
+                    message: 'Use isAdminRole() from server/lib/auth/roles.ts instead of comparing to owner/manager inline.',
+                },
+                {
+                    selector: "LogicalExpression[operator='||']:has(MemberExpression[property.name='OWNER']):has(MemberExpression[property.name='MANAGER'])",
+                    message: 'Use isAdminRole() from server/lib/auth/roles.ts instead of comparing to ROLE.OWNER/ROLE.MANAGER inline.',
+                },
+                {
+                    // `/api/public/*` is exempt: those endpoints are unauthenticated
+                    // by design, so a browser calling them directly is correct. The
+                    // rule exists because a client fetch of a GUARDED route carries
+                    // no session cookie and 401s — see the BFF note in CLAUDE.md.
+                    // The embed widget posts a booking from a third-party page and
+                    // has no loader to route through.
+                    selector: "CallExpression[callee.name='fetch'][arguments.0.type='Literal'][arguments.0.value=/^\\u002Fapi\\u002F(?!public\\u002F)/]",
+                    message: 'Do not call fetch("/api/...") with a string literal. Use createApi(context) from ~/lib/api-client.server for typed access.',
+                },
+                {
+                    selector: "CallExpression[callee.name='apiFetch']",
+                    message: 'apiFetch was removed. Use createApi(context, { token }) from ~/lib/api-client.server.',
+                },
+                // Task 14 (two-layer role model) — mirrored because flat config
+                // REPLACES a rule per file match. NOTE the role-literal guard is
+                // still absent here on purpose: re-measured 2026-07-30, app/routes
+                // has 24 value-position hits (see the exemption block's app/**
+                // comment) — adding the guard before those are constant-ized would
+                // fail every commit touching those files.
+                {
+                    selector: "CallExpression[callee.name='capabilitiesForKind']",
+                    message: 'Call capabilitiesForProfile(kind, overrides) — capabilitiesForKind is the baseline only, and calling it directly ignores the role profile\'s own overrides.',
+                },
+            ],
+        },
+    },
+    {
+        // T-hooks Tier 2 — React hooks / RR + a11y, scoped to the frontend +
+        // shared component library (server/ has no JSX). rules-of-hooks is a
+        // genuine bug class (error, verified 0 violations); everything else is
+        // warn-first per task-hooks-brief.md — this is existing-code surfacing,
+        // not a fix-it-now gate.
+        files: ['app/**/*.{ts,tsx}', 'packages/shared-ui/src/**/*.{ts,tsx}'],
+        plugins: {
+            'react-hooks': reactHooks,
+            react,
+            'jsx-a11y': jsxA11y,
+        },
+        languageOptions: {
+            parserOptions: { ecmaFeatures: { jsx: true } },
+        },
+        settings: {
+            // NOT 'detect': eslint-plugin-react 7.37.5's version-detection path calls
+            // context.getFilename(), which flat-config ESLint 10 no longer exposes on
+            // the rule context (TypeError: contextOrFilename.getFilename is not a
+            // function). Pinning the version explicitly (react's actual installed
+            // version) skips that codepath entirely. Bump this if/when React is
+            // upgraded, or revisit 'detect' once the plugin ships an ESLint-10 fix.
+            react: { version: '18.3.1' },
+        },
+        rules: {
+            // DOWNGRADED from the intended 'error' (task-hooks-brief.md Tier 2) to
+            // 'warn' — auditing found a genuine violation, not a false positive:
+            // app/components/editor/ItemEditor.tsx:343 calls useMemo() AFTER an
+            // early `if (!item) return null;` at line 242, so the hook only runs on
+            // some renders. Real bug, left unfixed here per the hard invariant (no
+            // mass-fix in this task) — flagged prominently in task-hooks-report.md
+            // for a human decision. Re-promote to 'error' once fixed.
+            'react-hooks/rules-of-hooks': 'warn',
+            'react-hooks/exhaustive-deps': 'warn',
+            // Deliberately NOT eslint-plugin-react's full `recommended` preset —
+            // prop-types etc. is noise in a TS codebase (types already enforce
+            // props). Only the rules called out in the brief.
+            'react/react-in-jsx-scope': 'off',
+            'react/jsx-key': 'warn',
+            'react/no-array-index-key': 'warn',
+            'react/no-unstable-nested-components': 'warn',
+            'react/jsx-no-target-blank': 'warn',
+            // jsx-a11y's flat recommended, downgraded wholesale to 'warn' (see
+            // toWarn() above) rather than hand-picking a subset — the brief
+            // offers either; this gives fuller a11y audit coverage for free.
+            ...toWarn(jsxA11y.flatConfigs.recommended.rules),
+        },
+    },
+    {
+        // T-hooks Tier 3 — import-x/no-cycle (circular-dep guard for the
+        // service/di hub). Ordering rules (import/order etc.) are intentionally
+        // skipped — cosmetic and noisy per the brief. `import-x/resolver:
+        // {typescript: true}` (the legacy shorthand) errors ("invalid interface
+        // loaded as resolver") because no-cycle actually needs the
+        // `eslint-import-resolver-typescript` package resolved through the
+        // flat-config-only `resolver-next` API — added as a devDependency and
+        // wired below so path-mapped (~/*) and .ts-extensionless imports resolve.
+        files: ['**/*.ts', '**/*.tsx'],
+        plugins: { 'import-x': importX },
+        settings: {
+            'import-x/resolver-next': [createTypeScriptImportResolver()],
+        },
+        rules: {
+            'import-x/no-cycle': 'warn',
+        },
+    },
+    {
+        // T-hooks Tier 3/4 — app<->server BFF boundary + JWT sign/verify
+        // guard, combined into one no-restricted-imports rule (paths +
+        // patterns) per the brief. Both are 'error' ONLY because verified 0
+        // violations (see task-hooks-report.md) — server/ never imports app/,
+        // and the sole hono/jwt import (server/lib/jwt-keyring.ts) is a
+        // verify-only import carrying an inline disable with a reason (the
+        // keyring IS the sanctioned wrapper).
+        //
+        // There is now a second sanctioned wrapper on the same pattern:
+        // server/lib/i18n/messages.ts re-exports the compiled Paraglide
+        // catalogue, which lives at app/paraglide/ because that is where the
+        // outdir points — generated data, not app code. Its disable is inline
+        // for the same reason the keyring's is: scoped to one file, so every
+        // other server module still fails the rule and has to go through the
+        // wrapper. Keep new exceptions inline; an entry here would apply to all
+        // of server/ and is how this list would start growing.
+        files: ['server/**/*.ts'],
+        rules: {
+            'no-restricted-imports': ['error', {
+                paths: [
+                    {
+                        name: 'hono/jwt',
+                        importNames: ['sign', 'verify'],
+                        message: 'Use server/lib/jwt-keyring.ts (signJwt/verifyJwt) — direct hono/jwt sign/verify is forbidden (pins ES256 + kid). See CLAUDE.md JWT & Auth Security Rules.',
+                    },
+                ],
+                patterns: [
+                    {
+                        group: ['**/app/*', '**/app/**', '~/*'],
+                        message: 'server/ must not import from app/ (BFF boundary). Duplicate the pure util (see server/lib/format.ts twin) or move it to a shared location.',
+                    },
+                ],
+            }],
+        },
+    },
+    // The composition root is exempt from type-aware linting. It imports every
+    // route module, and giving a file with that fan-in full type information
+    // exhausts the heap: measured on server/index.ts, eslint died with SIGABRT
+    // after 91s at 4GB and after 189s at 6GB, needed 8GB to finish at all, and
+    // took ~3min there. With type-aware rules off it lints in 2.7s at 4GB.
+    //
+    // Splitting the file does NOT fix this — the cost is the import fan-in, not
+    // the length. Flattening the 157-line chained `.route()` accumulation into
+    // 81 separate statements still OOMed at 4GB (147s), and any file that mounts
+    // 81 routers imports all 81 of them.
+    //
+    // The trade is that the typed rules (all 'warn' here) stop covering this
+    // file, so nothing security-bearing may live in it. That is why the JWT
+    // middleware moved out to server/lib/middleware/jwt-auth.ts, where it keeps
+    // no-floating-promises and the rest. Keep this file as wiring: `app.use`,
+    // `app.route`, and small inline handlers.
+    // The capability resolvers are PURE and are imported into the browser
+    // bundle (app/components/inspection/AddPersonModal.tsx). A DB import here
+    // breaks the client build with a bundler error that reads as a build
+    // problem, not as the design violation it is. Overrides arrive as an
+    // argument; they are never read here.
+    {
+        files: ['server/lib/auth/capabilities.ts', 'server/lib/auth/capability-overrides.ts', 'server/lib/people/capabilities.ts'],
+        rules: {
+            'no-restricted-imports': ['error', {
+                patterns: [
+                    { group: ['drizzle-orm', 'drizzle-orm/*'], message: 'capabilities.ts is pure and ships in the browser bundle — take overrides as an argument, never query for them.' },
+                    { group: ['**/db/schema', '**/db/schema/**'], message: 'capabilities.ts is pure and ships in the browser bundle — take overrides as an argument, never query for them.' },
+                    { group: ['**/services/**'], message: 'capabilities.ts is pure and ships in the browser bundle — take overrides as an argument, never query for them.' },
+                ],
+            }],
+        },
+    },
+    {
+        files: ['server/index.ts'],
+        ...tseslint.configs.disableTypeChecked,
+    }
+);

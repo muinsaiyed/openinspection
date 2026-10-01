@@ -1,0 +1,530 @@
+// Report lifecycle sub-router: complete, publish-readiness gate, confirm,
+// publish, re-inspection create + candidates, the report review state machine
+// (submit / return / unpublish), and the PDF render pipeline (refresh +
+// download). The read/delivery side (report-data, repair list, recipients,
+// people, hub, send-pdf, agent share) lives in ./report-delivery.ts; the
+// agreement signing envelope lives in ./agreements.ts; the cancellation axis in
+// both directions (cancel / uncancel / quote) lives in ./cancellation.ts.
+// Behavior-preserving extraction from inspections.ts — handler bodies + route
+// definitions are byte-identical to the original (only their location changed).
+import { createRoute, z } from '@hono/zod-openapi';
+import { createApiRouter } from '../../lib/openapi-router';
+import { requireRole } from '../../lib/middleware/rbac';
+import { requireCapability } from '../../lib/middleware/require-capability';
+import { auditFromContext } from '../../lib/audit';
+import { getBookingHost, resolveTenantSlug } from '../../lib/url';
+import { buildRenderReportUrl } from '../../lib/public-urls';
+import { logger } from '../../lib/logger';
+import { createApiResponseSchema, SuccessResponseSchema } from '../../lib/validations/shared.schema';
+import { PublishInspectionSchema, CreateReinspectionSchema } from '../../lib/validations/inspection.schema';
+import { inspections as inspectionTable } from '../../lib/db/schema';
+import { INSPECTION_STATUS } from '../../lib/status/inspection-status';
+import { REPORT_STATUS } from '../../lib/status/report-status';
+import { fireAutomation } from '../../services/inspection/shared';
+import { refuseLeaveCancelledViaStatusWrite } from './cancel-write-path';
+import { eq, and } from 'drizzle-orm';
+import { getTenantId, getDrizzle } from '../../lib/route-helpers';
+import { translateOnPublishForRequest } from '../../lib/translation/on-publish';
+import { withMcpMetadata } from '../../lib/route-metadata-standards';
+
+/**
+ * POST /api/inspections/:id/complete
+ */
+const completeInspectionRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/{id}/complete',
+    tags: ["inspections"],
+    summary: "Complete inspection for current tenant",
+    request: {
+        params: z.object({ id: z.string().trim().min(1).describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration'),
+    },
+    middleware: [requireRole('owner', 'manager', 'inspector')],
+    responses: {
+        200: {
+            content: {
+                'application/json': {
+                    schema: SuccessResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration'),
+                },
+            },
+            description: 'Success',
+        },
+        400: { description: 'The inspection is cancelled. Bring it back with POST /{id}/uncancel first (#81).' },
+    },
+    operationId: "completeInspection",
+    description: "Marks the on-site work as finished. Advisory: publishing a report does not require it. Idempotent, and refuses a cancelled inspection."
+}, { scopes: ['write'], tier: 'extended' }));
+
+/**
+ * GET /api/inspections/:id/publish-readiness
+ *
+ * Task 12 — pre-publish gate: reports which included defects are missing
+ * required fields (location + trade). The frontend pre-publish modal
+ * consumes this before allowing the inspector to publish the report.
+ */
+const PublishDefectEntrySchema = z.object({
+    sectionId:        z.string(),
+    sectionTitle:     z.string(),
+    itemId:           z.string(),
+    itemLabel:        z.string(),
+    cannedId:         z.string(),
+    cannedTitle:      z.string(),
+    missing:          z.array(z.enum(['location', 'trade'])),
+    unresolvedTokens: z.array(z.string()),
+});
+
+const publishReadinessRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/{id}/publish-readiness',
+    tags: ['inspections'],
+    summary: 'Check whether an inspection is ready to publish (required defect fields filled)',
+    request: {
+        params: z.object({ id: z.string().min(1).describe('Inspection identifier to evaluate for publish readiness') }),
+    },
+    responses: {
+        200: {
+            description: 'Readiness payload',
+            content: {
+                'application/json': {
+                    schema: z.object({
+                        ready: z.boolean(),
+                        blockingDefects: z.array(PublishDefectEntrySchema),
+                        // Track H (IA-7) — incomplete-but-not-required defects:
+                        // yellow warning on the gate, never a block.
+                        warningDefects: z.array(PublishDefectEntrySchema),
+                    }),
+                },
+            },
+        },
+    },
+    operationId: 'getInspectionPublishReadiness',
+    description: 'Returns ready=true when every included defect has its REQUIRED fields filled (configurable per tenant/inspection — Track H IA-7); non-required gaps surface as warningDefects.',
+}, { scopes: ['read'], tier: 'extended' }));
+
+/**
+ * POST /api/inspections/:id/submit
+ * Submits a completed report for review (in_progress → submitted).
+ * Does NOT require the `publish` capability — any inspector/manager/owner can submit.
+ */
+const submitReportRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/{id}/submit',
+    tags: ['inspections'],
+    summary: 'Submit report for review',
+    middleware: [requireRole('owner', 'manager', 'inspector')] as const,
+    request: {
+        params: z.object({ id: z.string().describe('Inspection id') }),
+    },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: createApiResponseSchema(z.object({ reportStatus: z.string() })) } },
+            description: 'Report submitted for review',
+        },
+        400: { description: 'Invalid precondition (e.g. report already submitted, inspection not completed)' },
+    },
+    operationId: 'submitReport',
+    description: 'Transitions reportStatus from in_progress → submitted. Requires inspection.status === completed.',
+}, { scopes: ['write'], tier: 'extended' }));
+
+/**
+ * POST /api/inspections/:id/return
+ * Returns a submitted report to the inspector for revision (submitted → in_progress).
+ * Requires the `publish` capability (owner/manager by default; inspector only if not overridden).
+ */
+const returnReportRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/{id}/return',
+    tags: ['inspections'],
+    summary: 'Return submitted report to inspector for revision',
+    middleware: [requireRole('owner', 'manager', 'inspector'), requireCapability('publish')] as const,
+    request: {
+        params: z.object({ id: z.string().describe('Inspection id') }),
+    },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: createApiResponseSchema(z.object({ reportStatus: z.string() })) } },
+            description: 'Report returned to inspector',
+        },
+        400: { description: 'Invalid precondition (report is not in submitted state)' },
+        403: { description: 'Missing publish capability' },
+    },
+    operationId: 'returnReport',
+    description: 'Transitions reportStatus from submitted → in_progress. Requires publish capability.',
+}, { scopes: ['write'], tier: 'extended', capability: 'publish' }));
+
+/**
+ * POST /api/inspections/:id/unpublish
+ * Unpublishes a published report, reverting it to in_progress (published → in_progress).
+ * Requires the `publish` capability.
+ */
+const unpublishReportRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/{id}/unpublish',
+    tags: ['inspections'],
+    summary: 'Unpublish a published report',
+    middleware: [requireRole('owner', 'manager', 'inspector'), requireCapability('publish')] as const,
+    request: {
+        params: z.object({ id: z.string().describe('Inspection id') }),
+    },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: createApiResponseSchema(z.object({ reportStatus: z.string() })) } },
+            description: 'Report unpublished',
+        },
+        400: { description: 'Invalid precondition (report is not published)' },
+        403: { description: 'Missing publish capability' },
+    },
+    operationId: 'unpublishReport',
+    description: 'Transitions reportStatus from published → in_progress. Requires publish capability.',
+}, { scopes: ['write'], tier: 'extended', capability: 'publish' }));
+
+/**
+ * POST /api/inspections/:id/publish
+ */
+const publishRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/{id}/publish',
+    tags: ["inspections"],
+    summary: "Publish inspection for current tenant",
+    // Task 10 — publish capability layered on top of the role gate. owner/admin
+    // always pass; an inspector with permission_overrides {publish:false}
+    // ("requires review") is 403'd here.
+    middleware: [requireRole('owner', 'manager', 'inspector'), requireCapability('publish')] as const,
+    request: {
+        params: z.object({ id: z.string().describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration'),
+        body: {
+            content: {
+                'application/json': {
+                    schema: PublishInspectionSchema.describe('TODO describe schema field for the OpenInspection MCP integration'),
+                },
+            },
+        },
+    },
+    responses: {
+        200: {
+            content: {
+                'application/json': {
+                    schema: createApiResponseSchema(z.object({ reportUrl: z.string().describe('TODO describe reportUrl field for the OpenInspection MCP integration'), reportStatus: z.string().describe('TODO describe reportStatus field for the OpenInspection MCP integration'), isnSync: z.object({ ok: z.boolean(), isnReportId: z.string().optional(), error: z.string().optional() }).nullable().describe('Outcome of adding the report link to the ISN order named in Reference Number; null when ISN is not configured or the inspection has no Reference Number.') })),
+                },
+            },
+            description: 'Published',
+        },
+    },
+    operationId: "publishInspection",
+    description: "Auto-generated placeholder for publishInspection (POST /{id}/publish, inspections domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['write'], tier: 'extended', capability: 'publish' }));
+
+/**
+ * Issue #119 (Re-inspections) Task 4 — POST /api/inspections/:id/reinspect
+ * Creates a new linked inspection that carries forward the selected still-open
+ * flagged items from a published baseline report. 400 when the baseline is not
+ * published.
+ */
+const reinspectRoute = createRoute(withMcpMetadata({
+    method: 'post',
+    path: '/{id}/reinspect',
+    tags: ['inspections'],
+    summary: 'Create a re-inspection from this (published) baseline report',
+    middleware: [requireRole('owner', 'manager', 'inspector')] as const,
+    request: {
+        params: z.object({ id: z.string().describe('Baseline inspection id (original or a prior re-inspection; must be published).') }),
+        body: { content: { 'application/json': { schema: CreateReinspectionSchema } } },
+    },
+    responses: {
+        200: { content: { 'application/json': { schema: createApiResponseSchema(z.object({ id: z.string(), reinspectionRound: z.number() })) } }, description: 'Re-inspection created' },
+        400: { description: 'Baseline not published / invalid' },
+    },
+    operationId: 'createReinspection',
+    description: 'Creates a new linked inspection that carries forward the selected still-open flagged items from a published baseline report.',
+}, { scopes: ['write'], tier: 'extended' }));
+
+/**
+ * Issue #119 (Re-inspections) Task 6 — GET /api/inspections/:id/reinspect-candidates
+ * The still-open flagged items off a published baseline, so the hub's
+ * "Create re-inspection" modal can list them with the carry-forward set
+ * pre-checked. Empty array when the baseline is unpublished.
+ */
+const reinspectCandidatesRoute = createRoute(withMcpMetadata({
+    method: 'get',
+    path: '/{id}/reinspect-candidates',
+    tags: ['inspections'],
+    summary: 'Candidate carry-forward items for a re-inspection',
+    middleware: [requireRole('owner', 'manager', 'inspector')] as const,
+    request: { params: z.object({ id: z.string().min(1).describe('Baseline inspection id (the published report to re-inspect).') }) },
+    responses: {
+        200: {
+            content: { 'application/json': { schema: createApiResponseSchema(z.object({
+                candidates: z.array(z.object({
+                    itemId: z.string(),
+                    label: z.string(),
+                    originalNotes: z.string().nullable(),
+                    open: z.boolean(),
+                })),
+            })) } },
+            description: 'Re-inspection candidate items',
+        },
+    },
+    operationId: 'getReinspectCandidates',
+    description: 'Returns the baseline report\'s flagged items (still-open ones pre-flagged) so the inspector can choose which to carry forward into a new re-inspection.',
+}, { scopes: ['read'], tier: 'extended' }));
+
+
+// Shared body for the three report state-machine transitions (submit / return /
+// unpublish): run the service mutation, mapping a thrown error to a 400-ready
+// failure message. The per-route handlers keep their own valid('param') reads
+// and c.json() calls so each route's typed request/response shape stays exact.
+type ReportTransitionResult = { ok: true } | { ok: false; message: string };
+async function runReportTransition(
+    mutate: () => Promise<unknown>,
+    fallbackMessage: string,
+): Promise<ReportTransitionResult> {
+    try {
+        await mutate();
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : fallbackMessage };
+    }
+}
+
+const publishRoutes = createApiRouter()
+    .openapi(completeInspectionRoute, async (c) => {
+        const { id } = c.req.valid('param');
+        const tenantId = getTenantId(c);
+        const service = c.var.services.inspection;
+        const { inspection } = await service.getInspection(id, tenantId);
+
+        // Idempotency: if already completed, short-circuit so a retry on a
+        // network error or double-click does not re-run the admin notification.
+        if (inspection.status === INSPECTION_STATUS.COMPLETED) {
+            return c.json({ success: true }, 200);
+        }
+
+        // #81 — a fourth way out of `cancelled`, and it leaked the same way the
+        // bulk one did: straight to `completed` with `cancel_reason` still
+        // attached. `confirmInspection` has always refused a cancelled
+        // inspection; this route is the same claim about the same axis ("the
+        // visit happened") and had no guard at all. Recovery goes through
+        // `POST /:id/uncancel` first, then the visit can be marked complete.
+        const leaveRefusal = refuseLeaveCancelledViaStatusWrite(inspection.status);
+        if (leaveRefusal) return c.json({ success: false as const, error: leaveRefusal }, 400);
+
+        const db = getDrizzle(c);
+        await db.update(inspectionTable).set({ status: INSPECTION_STATUS.COMPLETED }).where(and(eq(inspectionTable.id, id), eq(inspectionTable.tenantId, tenantId)));
+
+        // Report DELIVERY is still not fired here: `report.published` is a
+        // report event, produced solely by the publish path, and firing it on
+        // completion would deliver a report that may never have been published
+        // (IA-30). The primary-client lookup that used to sit here fed the
+        // removed notification's metadata and had no other reader.
+
+        // B3 — was a direct staff notification TYPED `report.published`, on the
+        // route that COMPLETES an inspection. Completing is not publishing (the
+        // comment above says so itself), so the mislabel went with the
+        // migration: this fires the real `inspection.completed` trigger and the
+        // seeded `Office alert — inspection completed` rule raises the notice,
+        // through the same path every other recipient uses.
+        c.executionCtx.waitUntil(
+            fireAutomation(c.env.DB, tenantId, id, 'inspection.completed'),
+        );
+
+        auditFromContext(c, 'inspection.complete', 'inspection', {
+            entityId: id,
+            metadata: { propertyAddress: inspection.propertyAddress },
+        });
+        return c.json({ success: true }, 200);
+    })
+    .openapi(publishReadinessRoute, async (c) => {
+        const tenantId = c.get('tenantId') as string;
+        const { id } = c.req.valid('param');
+        const service = c.var.services.inspection;
+        const readiness = await service.computePublishReadiness(id, tenantId);
+        return c.json(readiness, 200);
+    })
+    .openapi(createRoute(withMcpMetadata({
+        method: 'post', path: '/{id}/confirm',
+        tags: ["inspections"], summary: "Confirm inspection for current tenant",
+        middleware: [requireRole('owner', 'manager', 'inspector')] as const,
+        request: { params: z.object({ id: z.string().describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration') },
+        responses: { 200: { content: { 'application/json': { schema: SuccessResponseSchema.describe('TODO describe schema field for the OpenInspection MCP integration') } }, description: 'Confirmed' } },
+        operationId: "confirmInspection",
+        description: "Auto-generated placeholder for confirmInspection (POST /{id}/confirm, inspections domain). TODO: replace with a real description sourced from the handler."
+    }, { scopes: ['write'], tier: 'extended' })), async (c) => {
+        const tenantId = c.get('tenantId');
+        const { id } = c.req.valid('param');
+        await c.var.services.inspection.confirmInspection(tenantId, id);
+        return c.json({ success: true });
+    })
+    // POST /{id}/cancel AND POST /{id}/uncancel both live in ./cancellation.ts,
+    // which owns the cancellation axis in both directions: the quote, the fee
+    // acknowledgement, the refund, and the one door back (#81). Neither is a
+    // report-lifecycle event, which is what this file is for.
+    .openapi(publishRoute, async (c) => {
+        const tenantId = getTenantId(c);
+        const { id } = c.req.valid('param');
+        const body = c.req.valid('json');
+        const service = c.var.services.inspection;
+        // Build the publish options explicitly so `recipients` is omitted (not
+        // set to `undefined`) when absent — exactOptionalPropertyTypes rejects
+        // `recipients: X[] | undefined` against the service's optional param.
+        const publishOptions: Parameters<typeof service.publishInspection>[2] = {
+            theme: body.theme,
+            requireSignature: body.requireSignature,
+            requirePayment: body.requirePayment,
+            sendAgreementCopy: body.sendAgreementCopy,
+            ...(body.recipients ? { recipients: body.recipients } : {}),
+            ...(body.reportId ? { reportId: body.reportId } : {}),
+        };
+        const result = await service.publishInspection(id, tenantId, publishOptions);
+
+        // The only record that a PERSON published this, and the only one that
+        // survives a later unpublish. Written HERE rather than beside the
+        // `return`: everything between is best-effort follow-on work, and the
+        // PDF pipeline's slug/hash/footer lookups are awaited outside a try — a
+        // throw there would drop the row for a publish that already happened.
+        // F79 — says WHAT was published, deliberately not WHO was told. It used to
+        // copy `notifyClient`/`notifyAgent` out of the body and nothing honoured
+        // them: `publishInspection` never read those options, and delivery is the
+        // workspace's `report.published` automation rules' decision. A publish
+        // marked "notify nobody" was therefore RECORDED as having notified nobody
+        // while every rule fired and the mail went out — the record stating the
+        // opposite of the event, in the artefact someone later reads to answer "who
+        // was told, and when". An always-guessed field is worse than an absent one;
+        // who was told is recorded in the automation logs and the delivery rows.
+        auditFromContext(c, 'inspection.published', 'inspection', {
+            entityId: id,
+            metadata: { reportId: body.reportId },
+        });
+
+        // #23 — the courtesy translation, when the publisher asked for one on
+        // THIS publish. Never blocks: a translation that could not be produced
+        // leaves the English report published and correct, which is the state
+        // the feature degrades to by design. See lib/translation/on-publish.ts.
+        c.executionCtx.waitUntil(
+            translateOnPublishForRequest(c, id, body.translateTo ?? null, body.reportId),
+        );
+
+        // Design System 0520 subsystem D phase 9 — Republish snapshot.
+        // After the inspection's status flips to published, persist a frozen
+        // snapshot into report_versions so the customer-facing viewer can
+        // browse history + diff. Best-effort: failures log but do NOT block
+        // the publish response. snapshot-too-large (> 1 MB) downgrades to a
+        // warning audit entry rather than a 5xx — the report itself remains
+        // viewable through the existing /reports/:id path.
+        const userId = (c.get('user') as { sub?: string } | undefined)?.sub;
+        let publishedVersion: number | null = null;
+        if (userId) {
+            try {
+                // The version chain is per REPORT. Passing the id through is
+                // what keeps two deliverables on one order from interleaving
+                // into a single chain, which fails verification for both.
+                const out = await c.var.services.reportVersion.snapshotOnPublish(
+                    tenantId, id, userId, body.summary, body.reportId,
+                );
+                publishedVersion = out.versionNumber;
+                logger.info('report-version snapshot saved', {
+                    inspectionId:  id,
+                    versionNumber: out.versionNumber,
+                });
+            } catch (err) {
+                logger.warn('report-version snapshot failed (non-fatal)', {
+                    inspectionId: id,
+                    error:        err instanceof Error ? err.message : String(err),
+                });
+            }
+        }
+
+        // Purge transient (versionNumber=null) cached PDFs now that a frozen version
+        // exists. Subsequent everyday downloads will render fresh current content
+        // rather than serving a stale pre-publish snapshot. Best-effort: failures
+        // are logged but never block the publish response.
+        try {
+            await c.var.services.reportPdf.purgeTransientPdfs(id, tenantId);
+        } catch (e) {
+            logger.warn('purge transient pdfs failed', { inspectionId: id, error: String(e) });
+        }
+
+        // Spec 5A.5 — enqueue + background-render Summary + Full PDFs after
+        // publish. Best-effort: failures log but never block the publish
+        // response. Persistent record in report_pdfs lets the client UI poll
+        // (status: queued -> rendering -> ready) and offer Refresh PDFs.
+        //
+        // Gated by tenant_configs.enable_pdf_pipeline (default
+        // OFF). Free-plan tenants and Paid tenants who don't want the spend
+        // skip rendering entirely; the report viewer's window.print() button
+        // remains the universal fallback.
+        const reportPdf = c.var.services.reportPdf;
+        if (await reportPdf.isPipelineEnabled(tenantId)) {
+            const tenantSlug = await resolveTenantSlug(c, tenantId);
+            // renderUrl: token-bearing URL for the headless browser PDF render.
+            const renderUrl = await buildRenderReportUrl(getBookingHost(c), tenantSlug, id, c.env.JWT_SECRET);
+            const sourceVersion = Date.now();
+            // Content hash enables post-publish owner/client downloads to reuse this
+            // render instead of triggering a second Browser Rendering call.
+            const contentHash = await c.var.services.inspection.getReportContentHash(id, tenantId);
+            const footer = await c.var.services.inspection.getReportPdfFooterContext(id, tenantId);
+            const renderBoth = async () => {
+                try {
+                    await Promise.all([
+                        reportPdf.markQueued(id, tenantId, 'summary', publishedVersion),
+                        reportPdf.markQueued(id, tenantId, 'full', publishedVersion),
+                    ]);
+                    await Promise.allSettled([
+                        reportPdf.renderAndStore(id, tenantId, 'summary', { reportUrl: renderUrl, sourceVersion, versionNumber: publishedVersion, contentHash, footer }),
+                        reportPdf.renderAndStore(id, tenantId, 'full',    { reportUrl: renderUrl, sourceVersion, versionNumber: publishedVersion, contentHash, footer }),
+                    ]);
+                } catch (err) {
+                    logger.error('[publish] PDF render enqueue failed', { inspectionId: id }, err instanceof Error ? err : undefined);
+                }
+            };
+            c.executionCtx.waitUntil(renderBoth());
+        }
+
+        return c.json({ success: true, data: { ...result, isnSync: await (await import('../../services/isn/report-link-sync')).syncPublishedReportToIsn(c, tenantId, id, body.reportId) } }, 200);
+    })
+    .openapi(reinspectRoute, async (c) => {
+        const tenantId = c.get('tenantId') as string;
+        const { id } = c.req.valid('param');
+        const body = c.req.valid('json');
+        try {
+            // The validated body IS the options object (selectedItemIds +
+            // optional inspectorId/scheduledDate); restating the fields here is
+            // how F47's scheduledDate could have been added and silently dropped.
+            const created = await c.var.services.inspection.createReinspection(tenantId, id, body);
+            return c.json({ success: true, data: { id: created.id, reinspectionRound: created.reinspectionRound } }, 200);
+        } catch (err) {
+            return c.json({ success: false, error: { code: 'BAD_REQUEST', message: err instanceof Error ? err.message : 'Failed to create re-inspection' } }, 400);
+        }
+    })
+    .openapi(reinspectCandidatesRoute, async (c) => {
+        const tenantId = c.get('tenantId') as string;
+        const { id } = c.req.valid('param');
+        const candidates = await c.var.services.inspection.getReinspectCandidates(tenantId, id);
+        return c.json({ success: true, data: { candidates } }, 200);
+    })
+    .openapi(submitReportRoute, async (c) => {
+        const tenantId = getTenantId(c);
+        const { id } = c.req.valid('param');
+        const result = await runReportTransition(() => c.var.services.inspection.submitReport(id, tenantId), 'Failed to submit report');
+        if (!result.ok) return c.json({ success: false as const, error: { code: 'BAD_REQUEST', message: result.message } }, 400);
+        return c.json({ success: true as const, data: { reportStatus: REPORT_STATUS.SUBMITTED } }, 200);
+    })
+    .openapi(returnReportRoute, async (c) => {
+        const tenantId = getTenantId(c);
+        const { id } = c.req.valid('param');
+        const result = await runReportTransition(() => c.var.services.inspection.returnReport(id, tenantId), 'Failed to return report');
+        if (!result.ok) return c.json({ success: false as const, error: { code: 'BAD_REQUEST', message: result.message } }, 400);
+        return c.json({ success: true as const, data: { reportStatus: REPORT_STATUS.IN_PROGRESS } }, 200);
+    })
+    .openapi(unpublishReportRoute, async (c) => {
+        const tenantId = getTenantId(c);
+        const { id } = c.req.valid('param');
+        const result = await runReportTransition(() => c.var.services.inspection.unpublishReport(id, tenantId), 'Failed to unpublish report');
+        if (!result.ok) return c.json({ success: false as const, error: { code: 'BAD_REQUEST', message: result.message } }, 400);
+        // IA-36 — unpublishing retracts the report, so the links that point at
+        // it must stop working too; otherwise a recipient keeps a live URL to a
+        // report the inspector has withdrawn. Expire all of this inspection's
+        // access tokens immediately.
+        await c.var.services.portalAccess.setExpiryForInspection(tenantId, id, Date.now());
+        return c.json({ success: true as const, data: { reportStatus: REPORT_STATUS.IN_PROGRESS } }, 200);
+    });
+
+export default publishRoutes;

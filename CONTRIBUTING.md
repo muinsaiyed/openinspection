@@ -1,0 +1,99 @@
+# Contributing to OpenInspection
+
+Thanks for considering a contribution. OpenInspection is an open-source home inspection app built on Cloudflare Workers. We welcome bug reports, feature ideas, documentation improvements, and code contributions from anyone running their own deployment or building on top of the codebase.
+
+## Quick links
+
+- 🐛 [Report a bug](https://github.com/InspectorHub/OpenInspection/issues/new?template=bug_report.yml)
+- 💡 [Suggest a feature](https://github.com/InspectorHub/OpenInspection/issues/new?template=feature_request.yml)
+- 💬 [Ask a question](https://github.com/InspectorHub/OpenInspection/discussions/categories/q-a)
+- 📣 [Roadmap & releases](https://github.com/InspectorHub/OpenInspection/discussions/categories/announcements)
+- 🧪 [Start a free trial](https://inspectorhub.io/register)
+
+## Development setup
+
+```bash
+git clone https://github.com/InspectorHub/OpenInspection.git
+cd OpenInspection
+npm install
+npm run setup:cloudflare    # provisions D1 / R2 / KV (or use --local)
+npm run dev                 # http://localhost:8787
+```
+
+Detailed setup including Cloudflare bindings and environment variables: [`docs/operate/deploy.md`](docs/operate/deploy.md). Architecture overview: [`docs/develop/architecture.md`](docs/develop/architecture.md). Everything else: [`docs/README.md`](docs/README.md).
+
+## Code conventions
+
+These are summarized from `CLAUDE.md` — read that file for the canonical, exhaustive rules.
+
+- **Language**: TypeScript with strict mode. All source code, comments, docs, commit messages, and user-facing strings in **English only**.
+- **Validation**: Every API endpoint uses Zod. Schemas live in `server/lib/validations/*.schema.ts`. No manual `if (!field)` checks.
+- **Auth**: **ES256** JWT (a versioned keyring, `kid` in the header) in an HttpOnly `__Host-` cookie, PBKDF2-SHA256 password hashing. `JWT_SECRET` is KDF input only and never signs a JWT. Never use a fallback secret. Read `CLAUDE.md` § JWT & Auth Security Rules and [`docs/operate/rotate-jwt-keyring.md`](docs/operate/rotate-jwt-keyring.md).
+- **Multi-tenant**: Every D1 table includes `tenant_id`. Use `c.var.services.xxx` (DI proxy) — services auto-scope to the tenant.
+- **Logging**: Server-side code uses `import { logger } from '../lib/logger'`. Browser-side `console.*` is fine.
+- **CSS**: Tailwind v4 utilities + the Design System 0523 token layer defined in `app/styles/tailwind.css` (`bg-ih-*`, `text-ih-*`, `shadow-ih-*`). No raw palette classes (`bg-slate-200`, `shadow-lg`, ...) — enforced by `npm run lint:ds`. Full reference: [`docs/develop/design-system.md`](docs/develop/design-system.md).
+
+## Commit style
+
+```
+<type>(<scope>): <short summary>
+
+<body explaining why, not what>
+```
+
+Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `build`, `ci`, `perf`. Scope: `core`, `infra`, `docs`, etc.
+
+Example:
+
+```
+feat(core): item-aware quick comments ranking
+
+Active item gets a 100-point boost; section match adds 10; rating
+bucket adds 5. Avoids the case where Roof comments dominate the
+panel when active item is Gutters & Downspouts.
+```
+
+## Versioning & Deprecation Policy
+
+OpenInspection follows [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`). Releases are automated with [release-please](https://github.com/googleapis/release-please), which reads the [Conventional Commits](https://www.conventionalcommits.org/) history (see [Commit style](#commit-style)) to compute the next version and generate the `CHANGELOG`. This is a contract for self-hosters deciding when and how to upgrade.
+
+- **Breaking changes** ship only in a **major** version bump. A `feat!:` / `fix!:` commit or a `BREAKING CHANGE:` footer drives the major increment; the change is described in the release's breaking-change section.
+- **Deprecations** are announced in the `CHANGELOG` and kept for **at least one minor version** before removal, giving self-hosters a window to migrate.
+- **Migrations are forward-only** — there is no down migration and no downgrade path (matching the schema-first Drizzle policy). Back up D1 before upgrading. A major version may additionally **rebuild the baseline migration**, regenerating `0000_baseline.sql` and removing the forward files it now covers; because `wrangler` matches applied migrations by filename, an existing database needs a documented one-time reconcile in that case and the automated migrate step will not perform it. Such a release carries a `BREAKING CHANGE:` footer. See the [upgrade guide](docs/operate/upgrade.md).
+- **Security fixes** are called out explicitly in the release notes so operators can prioritize the upgrade. Report vulnerabilities privately (see [Security disclosures](#security-disclosures)).
+
+## Pull requests
+
+1. Fork → branch off `master` → make your changes
+2. Run `npm run type-check && npm run lint && npm run test:unit` (all green)
+3. Manual smoke for any UI change at 1440 px AND 375 px
+4. Open PR using the template — describe **what + why** (not how)
+5. Maintainers aim to review within 7 days
+
+## What gets fast-tracked
+
+- Bug fixes with regression tests
+- Performance improvements with before/after benchmarks
+- Accessibility fixes with reproduction case
+- New seed templates (open-source license, ≥ 8 sections)
+- Translation contributions to public-facing strings — i18n has landed (paraglide, `messages/`); read [`docs/develop/conventions/i18n-glossary.md`](docs/develop/conventions/i18n-glossary.md) first, because term choices are fixed there and gated
+- Integration scaffolds (Zapier, QuickBooks, Make.com, etc.)
+
+## What gets pushed back
+
+- Library swaps (Drizzle → another ORM, Hono → another framework)
+- Closed-source dependencies
+- Features that lock customers into a single payment or scheduling provider
+- Mass file moves without prior spec discussion
+
+## Code of Conduct
+
+By contributing, you agree to abide by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security disclosures
+
+Never report a vulnerability in a public issue or discussion. Use [GitHub Security Advisories](https://github.com/InspectorHub/OpenInspection/security/advisories) — see [`SECURITY.md`](SECURITY.md) if present.
+
+## License
+
+Source code is licensed under [GNU Affero General Public License v3.0](LICENSE).

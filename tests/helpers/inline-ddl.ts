@@ -1,0 +1,122 @@
+/**
+ * Hand-maintained CREATE TABLE DDL for the workers-runtime specs that talk to
+ * the `env.DB` D1 binding DIRECTLY (cmd-consumer / cmd-fixtures) rather than
+ * replaying the real migration .sql files (the harness pattern those specs use
+ * — see report-amendments.spec.ts for the migration-replay alternative).
+ *
+ * `tenant_configs` grows a column with almost every feature (PDF settings, SMS,
+ * concierge, role templates, …). When the Drizzle schema gains a column, the
+ * cmd-apply path binds it on upsert — but this hand-written DDL would lack it,
+ * so the statement references a missing column, `applyTenantUpdate` parks, and
+ * `test:workers` fails. That exact drift blocked #164.
+ *
+ * `tests/unit/inline-ddl-schema-sync.spec.ts` asserts this DDL covers every
+ * Drizzle `tenantConfigs` column, so the drift is caught as a fast unit test
+ * instead of a real-workerd failure. Both consumers import this single source.
+ *
+ * ⚠️ `tenant_configs` IS AT D1's 100-COLUMN CEILING, and the ceiling is why the
+ * legacy `secrets` column is no longer in the DDL below. That column is not in
+ * the Drizzle schema at all — it was a harmless extra, and the sync assertion
+ * next door asserts COVERAGE rather than equality precisely so extras are
+ * allowed. It stopped being harmless the day the schema reached 100 columns of
+ * its own: with the extra, the CREATE is 101 and D1 refuses it outright ("too
+ * many columns on tenant_configs"), so the DDL could no longer be brought into
+ * sync at all. Both halves of that were live at once — `is_courtesy_translation_enabled`
+ * had been added to the schema without being added here, so `test:workers` was
+ * already failing on every fixture that upserts a config, and the obvious repair
+ * hit the ceiling.
+ *
+ * SO THE NEXT COLUMN ADDED TO `tenant_configs` HAS NOWHERE TO GO. There is no
+ * second extra left to trade, and this file cannot be made correct again by
+ * editing it. That is a schema problem — a table that cannot be CREATEd on the
+ * platform it runs on — and it needs solving in the schema, not here.
+ *
+ * `inspection_results` is here for the same reason and learned it the same way:
+ * the DDL was copy-pasted into four collab specs, the Drizzle table gained
+ * `report_id`, and the only thing that noticed was the DO's persist() blowing up
+ * inside real workerd — after the three-suite gate had gone green. One source,
+ * one sync assertion.
+ */
+export const TENANT_CONFIGS_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS tenant_configs (tenant_id TEXT PRIMARY KEY, company_name TEXT, primary_color TEXT, logo_url TEXT, support_email TEXT, sender_email TEXT, reply_to TEXT, email_mode TEXT, video_mode TEXT, sms_mode TEXT, sender_display_name TEXT, point_of_contact TEXT, billing_url TEXT, review_url TEXT, company_phone TEXT, integration_config TEXT, secrets_enc TEXT, dek_enc TEXT, ics_token TEXT, widget_allowed_origins TEXT, default_profile_id TEXT, attention_thresholds TEXT, inspection_prefs TEXT, is_repair_list_enabled INTEGER, is_customer_repair_export_enabled INTEGER, is_unpaid_blocked INTEGER, is_unsigned_agreement_blocked INTEGER, custom_referral_sources TEXT, dashboard_column_prefs TEXT, is_concierge_review_required INTEGER, is_inspector_choice_allowed INTEGER, is_pdf_pipeline_enabled INTEGER, auto_sign_on_publish_default INTEGER, is_team_mode_default TEXT, require_defect_fields TEXT, agreement_retention_years INTEGER, reinspection_statuses TEXT, is_collab_editing_enabled INTEGER NOT NULL DEFAULT 1, company_address TEXT, is_pdf_footer_shown INTEGER, is_pdf_page_numbers_shown INTEGER, is_pdf_license_shown INTEGER, sms_byo_provider TEXT, email_byo_provider TEXT, is_managed_eligible INTEGER NOT NULL DEFAULT 0, managed_provider TEXT NOT NULL DEFAULT \'twilio\', is_reserve_schedule_enabled INTEGER, reserve_term_years INTEGER, inflation_rate_bps INTEGER, default_timezone TEXT NOT NULL DEFAULT \'UTC\', booking_slot_mode TEXT NOT NULL DEFAULT \'fixed\', booking_slot_interval_min INTEGER NOT NULL DEFAULT 30, holiday_region TEXT, holiday_public_policy TEXT NOT NULL DEFAULT \'open\', holiday_internal_policy TEXT NOT NULL DEFAULT \'advisory\', default_locale TEXT NOT NULL DEFAULT \'en-US\', currency TEXT NOT NULL DEFAULT \'USD\', is_archive_revoking_access INTEGER NOT NULL DEFAULT 0, legal_mode TEXT NOT NULL DEFAULT \'hosted\', custom_privacy_url TEXT, custom_terms_url TEXT, privacy_body TEXT, terms_body TEXT, date_format TEXT NOT NULL DEFAULT \'us\', time_format TEXT NOT NULL DEFAULT \'12h\', booking_conflict_policy TEXT NOT NULL DEFAULT \'advisory\', cancellation_policy TEXT, cancellation_clause_agreement_id TEXT, cancellation_clause_version INTEGER, cancellation_clause_attested_at INTEGER, deposit_policy TEXT, booking_routing_strategy TEXT NOT NULL DEFAULT \'first_available\', booking_min_lead_hours INTEGER NOT NULL DEFAULT 0, booking_same_day_cutoff_time TEXT, company_lat REAL, company_lng REAL, company_geocoded_at INTEGER, repair_quick_phrases TEXT, legal_name TEXT, invoice_seq INTEGER NOT NULL DEFAULT 1000, report_pdf_retention_years INTEGER NOT NULL DEFAULT 7, is_report_view_counting_enabled INTEGER NOT NULL DEFAULT false, updated_at INTEGER);';
+
+/**
+ * `users` is here for the third time the same lesson was learned, and this one
+ * cost a CI-only failure: `applyAdminCredential` does
+ * `db.insert(users).values({...})` with a PARTIAL object, and drizzle still
+ * emits every column of the table — filling the rest with null. So a users
+ * column that exists in the Drizzle schema and not in this DDL parks the
+ * credential apply with `table users has no column named …`, and neither
+ * `test:unit` nor `test:web` can see it.
+ *
+ * The drift guard covered tenant_configs and inspection_results but not this
+ * table, which is why adding `service_origin_*` went green three gates deep.
+ * It covers users now.
+ */
+export const USERS_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, tenant_id TEXT, email TEXT NOT NULL, password_hash TEXT NOT NULL, name TEXT, phone TEXT, photo_url TEXT, default_signature_base64 TEXT, is_signature_enabled INTEGER NOT NULL DEFAULT true, bio TEXT, service_areas TEXT, slug TEXT, role TEXT NOT NULL DEFAULT \'admin\', google_refresh_token TEXT, google_calendar_id TEXT, google_access_token TEXT, google_token_expiry INTEGER, locale TEXT, onboarding_state TEXT, created_at INTEGER NOT NULL, totp_secret TEXT, is_totp_enabled INTEGER NOT NULL DEFAULT false, totp_recovery_codes TEXT, totp_verified_at INTEGER, is_referral_notification_enabled INTEGER NOT NULL DEFAULT true, is_report_notification_enabled INTEGER NOT NULL DEFAULT true, is_paid_notification_enabled INTEGER NOT NULL DEFAULT false, last_active_at INTEGER, signup_role TEXT, deleted_at INTEGER, terms_accepted TEXT, permission_overrides TEXT, timezone TEXT, date_format TEXT, time_format TEXT, service_origin_address TEXT, service_origin_lat REAL, service_origin_lng REAL, statutory_license_type TEXT, statutory_qualification TEXT);';
+
+/**
+ * `account_acceptances` is here because `applyAdminCredential` now writes it in
+ * the SAME `db.batch()` as the `users` row.
+ * A missing table here does not park quietly — it fails the whole batch, which
+ * is the correct behaviour and an incomprehensible test failure.
+ *
+ * THE UNIQUE INDEX IS PART OF THE DDL, not decoration. It is what makes a
+ * redelivered command unable to mint a second acceptance row, so a workers spec
+ * created without it would exercise a table that agrees to something production
+ * refuses — and the at-least-once seam is exactly what these specs drive.
+ */
+export const ACCOUNT_ACCEPTANCES_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS account_acceptances (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, actor_identity_ref TEXT, doc TEXT NOT NULL, version TEXT NOT NULL, content_hash TEXT NOT NULL, authority_basis TEXT NOT NULL, accepted_at INTEGER NOT NULL, created_at INTEGER NOT NULL);';
+
+export const ACCOUNT_ACCEPTANCES_TEST_INDEX_DDL =
+    'CREATE UNIQUE INDEX IF NOT EXISTS uq_account_acceptances_user_doc_version ON account_acceptances (user_id, doc, version);';
+
+export const INSPECTION_RESULTS_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS inspection_results (id TEXT PRIMARY KEY NOT NULL, tenant_id TEXT NOT NULL, inspection_id TEXT NOT NULL, data TEXT NOT NULL, ydoc_state BLOB, last_synced_at INTEGER NOT NULL, rating_system_id TEXT, rating_system_snapshot TEXT, report_id TEXT);';
+
+/**
+ * The assisted-import tables, added for the workers spec that drives the three
+ * `cmd.migration.*` commands through the real consumer.
+ *
+ * Same reasoning as the three above, and one addition specific to these: the
+ * deliver applier inserts one `migration_rows` row per staged entity and one
+ * `audit_logs` row naming the platform person, and BOTH inserts bind every
+ * column of their table. A column added to either schema without being added
+ * here parks the command — which, on this seam, means the delivery is retried
+ * to exhaustion and dies in the dead-letter queue rather than failing loudly.
+ */
+export const MIGRATION_BATCHES_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS migration_batches (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, created_by TEXT NOT NULL, intent TEXT NOT NULL, target_id TEXT, vendor TEXT NOT NULL, adapter_name TEXT NOT NULL, adapter_version TEXT NOT NULL, manifest TEXT NOT NULL, conflict_policy TEXT, status TEXT NOT NULL DEFAULT \'staged\', created_at INTEGER NOT NULL, applied_at INTEGER, reverted_at INTEGER, source_key TEXT, expires_at INTEGER, upload_authorized_by TEXT, upload_authorized_at INTEGER, upload_authorization_version TEXT, staff_access_authorized_by TEXT, staff_access_authorized_at INTEGER, staff_access_authorization_version TEXT);';
+
+export const MIGRATION_ROWS_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS migration_rows (id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, tenant_id TEXT NOT NULL, entity TEXT NOT NULL, position INTEGER NOT NULL, payload TEXT NOT NULL, conflict_with TEXT, resolution TEXT, status TEXT NOT NULL DEFAULT \'pending\', outcome TEXT, created_id TEXT, prior_state TEXT, applied_at INTEGER);';
+
+export const AUDIT_LOGS_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS audit_logs (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT, metadata TEXT, ip_address TEXT, inspector_slug TEXT, created_at INTEGER NOT NULL, actor_kind TEXT NOT NULL DEFAULT \'tenant_user\', platform_actor_id TEXT);';
+
+/**
+ * `tenants` is the fourth table to learn this, and it learned it the worst way:
+ * the DDL was copy-pasted into SEVEN cmd specs, so it was not one hand-written
+ * statement drifting from the schema but seven of them, and adding
+ * `content_version` to the schema broke 20 tests across two files while
+ * `test:unit`, `test:web` and every pre-commit gate stayed green. The header of
+ * this file already said "one source, one sync assertion"; `tenants` simply was
+ * not in it.
+ *
+ * The reason it bites here and not everywhere is the same as for `users`:
+ * `handleTenantUpdate` does `db.insert(tenants).values({...})` with a partial
+ * object, and drizzle emits EVERY column of the table, filling the rest with
+ * null. So a column in the Drizzle schema and not in this DDL is not a missing
+ * default — it is `table tenants has no column named ...`, at real-workerd time.
+ *
+ * ⚠️ Two specs deliberately keep their own narrower `tenants` DDL and are NOT
+ * converted: `quota-cap-concurrency.spec.ts` creates four columns because that
+ * is all its fixture needs, and `cmd-migration-deliver.spec.ts` omits
+ * `stripe_connect_account_id`. Neither inserts through drizzle's full column
+ * list, which is why neither broke. They are left alone rather than quietly
+ * widened, because a fixture that states what it needs is not drift.
+ */
+export const TENANTS_TEST_DDL =
+    'CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, slug TEXT UNIQUE NOT NULL, tier TEXT NOT NULL DEFAULT \'free\', stripe_connect_account_id TEXT, status TEXT NOT NULL DEFAULT \'pending\', max_users INTEGER NOT NULL DEFAULT 5, deployment_mode TEXT NOT NULL DEFAULT \'shared\', applied_cmd_seq INTEGER NOT NULL DEFAULT 0, applied_cred_seq INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, content_version TEXT);';

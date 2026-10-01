@@ -1,0 +1,359 @@
+import { createRoute, z } from '@hono/zod-openapi';
+import { and, eq } from 'drizzle-orm';
+import { createApiRouter } from '../lib/openapi-router';
+import { requireRole } from '../lib/middleware/rbac';
+import { requireCapability } from '../lib/middleware/require-capability';
+import {
+    CreateInvoiceSchema,
+    INVOICE_ID,
+    InvoiceResponseSchema,
+    MarkInvoicePaidSchema,
+    RequestPaymentSchema,
+    RequestPaymentResponseSchema,
+} from '../lib/validations/invoice.schema';
+import { withMcpMetadata } from "../lib/route-metadata-standards";
+import { normalizePaymentMethod } from '../lib/payment-method';
+import { inspections, inspectionServices, tenantConfigs } from '../lib/db/schema';
+import { Errors } from '../lib/errors';
+import { getBookingHost } from '../lib/url';
+import { paymentUrl } from '../lib/public-urls';
+import { resolveSignatureInspector } from '../lib/signature-helpers';
+import { getTenantId, getDrizzle } from '../lib/route-helpers';
+import { resolveLocale } from '../lib/locale';
+import { formatCurrency } from '../lib/format';
+import { qboPaymentKey } from '../lib/qbo-payment-key';
+import invoicePaymentRoutes from './invoices/payments';
+
+import { fireAndForget } from '../lib/fire-and-forget';
+
+const listInvoicesRoute = createRoute(withMcpMetadata({
+    method: 'get', path: '/',
+    tags: ["invoices"], summary: "List invoices for current tenant",
+    // Task 10 — financial capability gates the primary financial-data read.
+    // owner/admin always pass; layered here so an inspector granted
+    // {financial:true} (and added to the role list in a future change) would be
+    // governed by the capability rather than a bare role check.
+    middleware: [requireRole('owner', 'manager', 'inspector'), requireCapability('financial')],
+    responses: {
+        200: {
+            content: { 'application/json': { schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration'), data: z.array(InvoiceResponseSchema).describe('TODO describe data field for the OpenInspection MCP integration') }) } },
+            description: 'Success',
+        },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "listInvoices",
+    description: "Auto-generated placeholder for listInvoices (GET /, invoices domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['read'], tier: 'primary', capability: 'financial' }));
+
+const createInvoiceRoute = createRoute(withMcpMetadata({
+    method: 'post', path: '/',
+    tags: ["invoices"], summary: "Create invoice for current tenant",
+    middleware: [requireRole('owner', 'manager')],
+    request: { body: { content: { 'application/json': { schema: CreateInvoiceSchema.describe('TODO describe schema field for the OpenInspection MCP integration') } } } },
+    responses: {
+        201: {
+            content: { 'application/json': { schema: z.object({ success: z.literal(true).describe('TODO describe success field for the OpenInspection MCP integration'), data: z.object({ invoice: InvoiceResponseSchema.describe('TODO describe invoice field for the OpenInspection MCP integration') }).describe('TODO describe data field for the OpenInspection MCP integration') }) } },
+            description: 'Created',
+        },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "createInvoice",
+    description: "Auto-generated placeholder for createInvoice (POST /, invoices domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['write'], tier: 'primary' }));
+
+const markSentRoute = createRoute(withMcpMetadata({
+    method: 'post', path: '/{id}/mark-sent',
+    tags: ["invoices"], summary: 'Mark invoice as sent',
+    middleware: [requireRole('owner', 'manager')],
+    request: { params: z.object({ id: INVOICE_ID.describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration') },
+    responses: {
+        200: { content: { 'application/json': { schema: z.object({ success: z.boolean().describe('TODO describe success field for the OpenInspection MCP integration') }).describe('TODO describe schema field for the OpenInspection MCP integration') } }, description: 'Success' },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "markSentInvoice",
+    description: "Auto-generated placeholder for markSentInvoice (POST /{id}/mark-sent, invoices domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['write'], tier: 'extended' }));
+
+const markPaidRoute = createRoute(withMcpMetadata({
+    method: 'post', path: '/{id}/mark-paid',
+    tags: ["invoices"], summary: 'Mark invoice as paid',
+    middleware: [requireRole('owner', 'manager')],
+    request: {
+        params: z.object({ id: INVOICE_ID.describe('Invoice id to mark as paid.') }).describe('Path params for the mark-paid endpoint.'),
+        body: { content: { 'application/json': { schema: MarkInvoicePaidSchema } } },
+    },
+    responses: {
+        200: { content: { 'application/json': { schema: z.object({ success: z.boolean().describe('Whether the invoice was marked paid.') }).describe('Mark-paid result.') } }, description: 'Success' },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "markPaidInvoice",
+    description: "Marks an invoice as paid and records the payment method. Manual offline/check payments flip the linked inspection's payment gate so the report unlocks; syncs the payment to QuickBooks when connected."
+}, { scopes: ['write'], tier: 'extended' }));
+
+const deleteInvoiceRoute = createRoute(withMcpMetadata({
+    method: 'delete', path: '/{id}',
+    tags: ["invoices"], summary: "Delete invoice for current tenant",
+    middleware: [requireRole('owner', 'manager')],
+    request: { params: z.object({ id: INVOICE_ID.describe('TODO describe id field for the OpenInspection MCP integration') }).describe('TODO describe params field for the OpenInspection MCP integration') },
+    responses: {
+        200: { content: { 'application/json': { schema: z.object({ success: z.boolean().describe('TODO describe success field for the OpenInspection MCP integration') }).describe('TODO describe schema field for the OpenInspection MCP integration') } }, description: 'Deleted' },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: "deleteInvoice",
+    description: "Auto-generated placeholder for deleteInvoice (DELETE /{id}, invoices domain). TODO: replace with a real description sourced from the handler."
+}, { scopes: ['write'], tier: 'primary' }));
+
+/**
+ * Task 8 (Issue #111) — POST /api/invoices/request-payment.
+ *
+ * The hub Invoice card "Request payment" button posts here. Resolves (or
+ * creates) the inspection's invoice per the money authority chain (Σ service
+ * snapshots → inspections.price), marks it sent, and emails the client a link
+ * to the public `/invoice/:id` payment page. Reuses any existing draft/sent
+ * invoice rather than duplicating; rejects an already-paid invoice (409) and a
+ * recipient-less or zero-amount inspection (422).
+ */
+const requestPaymentRoute = createRoute(withMcpMetadata({
+    method: 'post', path: '/request-payment',
+    tags: ['invoices'], summary: 'Create + email an invoice payment request for an inspection',
+    middleware: [requireRole('owner', 'manager', 'inspector')] as const,
+    request: { body: { content: { 'application/json': { schema: RequestPaymentSchema } } } },
+    responses: {
+        200: { content: { 'application/json': { schema: RequestPaymentResponseSchema } }, description: 'Invoice marked sent and emailed' },
+        404: { description: 'Inspection not found in this tenant' },
+        409: { description: 'Invoice already paid' },
+        422: { description: 'No client email, or amount resolves to zero' },
+    },
+    security: [{ bearerAuth: [] }],
+    operationId: 'requestInvoicePayment',
+    description: 'Resolves or creates the inspection invoice (money authority chain), marks it sent, and emails the client a link to the public payment page.',
+}, { scopes: ['write'], tier: 'extended' }));
+
+const invoiceRoutes = createApiRouter()
+    // `/{id}/payments*` — the append-only payment ledger, its own sub-resource
+    // with its own `financial` capability gate. See ./invoices/payments.
+    .route('/', invoicePaymentRoutes)
+    .openapi(listInvoicesRoute, async (c) => {
+        const rows = await c.var.services.invoice.listInvoices(c.get('tenantId'));
+        return c.json({ success: true as const, data: rows }, 200);
+    })
+    .openapi(createInvoiceRoute, async (c) => {
+        const tenantId = c.get('tenantId');
+        // The third argument is the invoice.created automation's home. Without
+        // it the service AWAITS the trigger, which is correct but pays for it in
+        // response latency; a route has an execution context, so it does not
+        // have to.
+        const invoice = await c.var.services.invoice.createInvoice(
+            tenantId,
+            c.req.valid('json'),
+            work => fireAndForget(c, work, 'automation trigger', { event: 'invoice.created', tenantId }),
+        );
+        if (c.env.QBO_CLIENT_ID) {
+            c.executionCtx.waitUntil(
+                c.var.services.qbo.upsertInvoice(tenantId, {
+                    id:        invoice.id,
+                    // The document number the customer sees in QuickBooks.
+                    // Omitted until now, which is why it fell back to a UUID.
+                    invoiceNumber: invoice.invoiceNumber,
+                    // Required by QuickBooks, and omitted here for as long as
+                    // this call existed. The push it produced was refused every
+                    // time with `CustomerRef is required`.
+                    contactId: invoice.contactId,
+                    dueDate:     invoice.dueDate,
+                    lineItems:   invoice.lineItems,
+                    amountCents: invoice.amountCents,
+                    status:      invoice.status,
+                }),
+            );
+        }
+        return c.json({ success: true as const, data: { invoice } }, 201);
+    })
+    .openapi(markSentRoute, async (c) => {
+        const id = c.req.valid('param').id as string;
+        const tenantId = c.get('tenantId');
+        await c.var.services.invoice.markSent(id, tenantId);
+        if (c.env.QBO_CLIENT_ID) {
+            const inv = (await c.var.services.invoice.listInvoices(tenantId)).find(
+                (i: Awaited<ReturnType<typeof c.var.services.invoice.listInvoices>>[number]) => i.id === id,
+            );
+            if (inv) {
+                c.executionCtx.waitUntil(
+                    c.var.services.qbo.upsertInvoice(tenantId, {
+                        id:        inv.id,
+                        invoiceNumber: inv.invoiceNumber,
+                        contactId: inv.contactId ?? null,
+                        dueDate:     inv.dueDate,
+                        lineItems:   inv.lineItems,
+                        amountCents: inv.amountCents,
+                        status:      'sent',
+                    }),
+                );
+            }
+        }
+        return c.json({ success: true }, 200);
+    })
+    .openapi(markPaidRoute, async (c) => {
+        const id = c.req.valid('param').id as string;
+        const { method } = c.req.valid('json');
+        const tenantId = c.get('tenantId');
+        const paymentMethod = normalizePaymentMethod(method);
+        const appended = await c.var.services.invoice.markPaid(id, tenantId, 'oi', paymentMethod);
+
+        const inv = await c.var.services.invoice.findById(tenantId, id);
+        // Manual payment must also close the report's payment gate (markPaid only
+        // touches the invoice row; the gate reads inspections.paymentStatus).
+        if (inv?.inspectionId) {
+            await c.var.services.inspection.markPaymentReceived(tenantId, inv.inspectionId);
+        }
+        // What goes to QuickBooks is the ROW that was appended — the remainder
+        // collected on this occasion — not the invoice total. Once a $90 deposit
+        // exists on a $450 invoice, pushing the total books $450 against an
+        // invoice that only just received $360, and the deposit push already
+        // there makes $540 of recorded revenue out of $450 of money.
+        //
+        // No row appended (already paid, or the ledger already covers it) means
+        // nothing happened, so there is nothing to tell them about.
+        if (c.env.QBO_CLIENT_ID && appended) {
+            c.executionCtx.waitUntil(
+                c.var.services.qbo.recordPayment(
+                    tenantId, id, appended.amountCents / 100, qboPaymentKey(appended.id),
+                    appended.occurredAt,
+                ),
+            );
+        }
+        return c.json({ success: true }, 200);
+    })
+    .openapi(deleteInvoiceRoute, async (c) => {
+        const id = c.req.valid('param').id as string;
+        const tenantId = c.get('tenantId');
+        await c.var.services.invoice.deleteInvoice(id, tenantId);
+        if (c.env.QBO_CLIENT_ID) {
+            c.executionCtx.waitUntil(
+                c.var.services.qbo.voidInvoice(tenantId, id),
+            );
+        }
+        return c.json({ success: true }, 200);
+    })
+    .openapi(requestPaymentRoute, async (c) => {
+        const tenantId = getTenantId(c);
+        const { inspectionId } = c.req.valid('json');
+        const db = getDrizzle(c);
+
+        // 404 if the inspection is missing or belongs to another tenant.
+        const inspection = await db.select().from(inspections)
+            .where(and(eq(inspections.id, inspectionId), eq(inspections.tenantId, tenantId))).get();
+        if (!inspection) throw Errors.NotFound('Inspection not found');
+
+        // Recipient is mandatory — we cannot request payment with nowhere to send it.
+        // Task 9a (people-role-profiles) — resolve via the inspection_people
+        // join (PeopleService) instead of the legacy inspection.clientEmail/
+        // .clientName columns, which are being dropped.
+        const primaryClient = await c.var.services.people.getPrimaryClient(tenantId, inspectionId);
+        const clientEmail = primaryClient?.email ?? null;
+        if (!clientEmail) {
+            throw Errors.UnprocessableEntity('No client email on this inspection. Add a client email before requesting payment.');
+        }
+
+        // Reuse the most recent invoice for this inspection when one exists.
+        const existing = await c.var.services.invoice.findByInspectionId(tenantId, inspectionId);
+        if (existing?.status === 'paid') {
+            throw Errors.Conflict('This invoice is already paid.');
+        }
+
+        let invoiceId: string;
+        let amountCents: number;
+        // Currency label comes from the invoice's own snapshot (Phase B), not the
+        // live tenant setting — a paid CAD invoice keeps reading CAD after a switch.
+        let invoiceCurrency: string;
+        if (existing) {
+            // Existing draft/sent/partial — reuse it as-is (authority already set).
+            invoiceId = existing.id;
+            amountCents = existing.amountCents;
+            invoiceCurrency = existing.currency;
+        } else {
+            // No invoice yet — resolve the amount via the money authority chain:
+            // Σ service snapshots (override ?? snapshot) when any exist, else the
+            // denormalized inspections.price cache. 422 if it resolves to zero.
+            const serviceRows = await db.select({
+                name:          inspectionServices.nameSnapshot,
+                priceSnapshot: inspectionServices.priceSnapshot,
+                priceOverride: inspectionServices.priceOverride,
+            }).from(inspectionServices)
+                .where(and(
+                    eq(inspectionServices.tenantId, tenantId),
+                    eq(inspectionServices.inspectionId, inspectionId),
+                    // A declined line must not appear on the invoice.
+                    eq(inspectionServices.active, true),
+                ))
+                .all();
+
+            let lineItems: Array<{ description: string; amountCents: number }>;
+            if (serviceRows.length > 0) {
+                lineItems = serviceRows.map(s => ({ description: s.name, amountCents: s.priceOverride ?? s.priceSnapshot }));
+                amountCents = lineItems.reduce((sum, li) => sum + li.amountCents, 0);
+            } else {
+                amountCents = inspection.price ?? 0;
+                lineItems = [{ description: 'Inspection services', amountCents }];
+            }
+            if (!amountCents || amountCents <= 0) {
+                throw Errors.UnprocessableEntity('This inspection has no amount to invoice. Add a price or service before requesting payment.');
+            }
+
+            const created = await c.var.services.invoice.createInvoice(tenantId, {
+                inspectionId,
+                clientName: primaryClient?.name ?? clientEmail,
+                clientEmail,
+                amountCents,
+                lineItems,
+            }, work => fireAndForget(c, work, 'automation trigger', { event: 'invoice.created', tenantId }));
+            invoiceId = created.id;
+            invoiceCurrency = created.currency;
+        }
+
+        // Mark sent (tenant-scoped inside the service) before notifying.
+        await c.var.services.invoice.markSent(invoiceId, tenantId);
+
+        // Build the public pay URL exactly like the agreement send path's host
+        // resolution; `/invoice/:id` is keyed by inspection id (no slug).
+        // IA-34 — the pay page and its pay-intent endpoint require a live
+        // client grant, so mint (idempotently) the recipient's persistent
+        // portal token and carry it on the link. Re-sends reuse the same token,
+        // so older copies of the email keep working.
+        const payToken = await c.var.services.portalAccess.issueToken({
+            tenantId, inspectionId, recipientEmail: clientEmail, role: 'client',
+        });
+        const payUrl = paymentUrl(getBookingHost(c), inspectionId, payToken);
+        // Format the amount in the RECIPIENT's locale (external client, no user row,
+        // so the tenant default locale) but in the INVOICE's snapshot currency (Phase B).
+        const cfg = await db.select({ defaultLocale: tenantConfigs.defaultLocale })
+            .from(tenantConfigs)
+            .where(eq(tenantConfigs.tenantId, tenantId))
+            .get();
+        const amountLabel = formatCurrency(amountCents, {
+            locale: resolveLocale(cfg?.defaultLocale),
+            currency: invoiceCurrency,
+        });
+
+        // Sign the email with the assigned inspector's rebooking footer (B-4).
+        const sigInspector = await resolveSignatureInspector(c, inspection.inspectorId, tenantId);
+
+        // Bare await — let an email failure surface as a 502 so the row stays
+        // truthful (Task 7's reviewer-endorsed choice). markSent already ran, so
+        // a failed send means "sent, delivery failed", which the user can retry.
+        await c.var.services.email.sendInvoiceRequest(
+            clientEmail, primaryClient?.name ?? null, amountLabel, payUrl, sigInspector, getBookingHost(c),
+        );
+
+        // Re-read for the canonical post-send status + sentAt.
+        const sent = await c.var.services.invoice.findByInspectionId(tenantId, inspectionId);
+        return c.json({
+            id:          invoiceId,
+            status:      sent?.status ?? 'sent',
+            amountCents,
+            sentAt:      sent?.sentAt ?? null,
+        }, 200);
+    });
+
+export type InvoicesApi = typeof invoiceRoutes;
+
+export default invoiceRoutes;

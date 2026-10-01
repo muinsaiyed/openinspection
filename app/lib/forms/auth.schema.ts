@@ -1,0 +1,196 @@
+import { z } from "zod";
+import { requiredText } from "~/lib/forms/required-text";
+// i18n Phase C (auth pilot) — locale-aware validation messages. `m.*()` resolves
+// to the active locale via paraglide's ALS (server) / cookie (client), so schemas
+// carrying user-facing messages are built by a FACTORY called per validation
+// (never a module-level const, which would freeze the message at import time).
+import { m } from "~/paraglide/messages";
+
+/**
+ * Form schemas, mirroring the API's validation rules
+ * (server/lib/validations/auth.schema.ts). Kept as plain zod (no `.openapi()`)
+ * so the SAME schema runs in the action (`parseWithZod`) and in the browser via
+ * Conform's `onValidate` — one validation source, progressive-enhancement safe.
+ *
+ * NOTE (rollout): the API schemas use `@hono/zod-openapi`'s `z`. To make these
+ * a single shared source of truth, extract the plain-zod base of each schema
+ * into a `packages/shared-schemas` consumed by both api and frontend. For now
+ * these are co-located mirrors.
+ */
+export function makeLoginSchema() {
+  return z.object({
+    email: requiredText(m.auth_validation_email_required())
+      .min(1, m.auth_validation_email_required())
+      .email(m.auth_validation_email_invalid()),
+    password: requiredText(m.auth_validation_password_required()).min(1, m.auth_validation_password_required()),
+  });
+}
+
+/**
+ * Shared strong-password rule, mirroring the API's `passwordSchema`
+ * (server/lib/validations/shared.schema.ts): min 8 chars with at least one
+ * uppercase letter, one digit, and one special character. Built by a FACTORY
+ * (not a module const) so its user-facing messages resolve per validation
+ * against the active locale (paraglide ALS/cookie) instead of freezing at
+ * import time.
+ */
+function makeStrongPassword() {
+  return requiredText(m.auth_validation_password_min8())
+    .min(8, m.auth_validation_password_min8())
+    .regex(/[A-Z]/, m.auth_validation_password_uppercase())
+    .regex(/[0-9]/, m.auth_validation_password_number())
+    .regex(/[^A-Za-z0-9]/, m.auth_validation_password_special());
+}
+
+/**
+ * Setup (first-run) — mirrors the API's `SetupSchema`. The form field names
+ * (`workspaceName` → companyName, `adminName`, `setupCode` → verificationCode)
+ * are preserved; the action maps them to the API body. `setupCode` is required
+ * by the form (min 6), matching the operator-provisioned SETUP_CODE.
+ */
+export function makeSetupSchema() {
+  return z.object({
+    workspaceName: requiredText(m.auth_validation_workspace_name_required()).min(2, m.auth_validation_workspace_name_required()),
+    adminName: requiredText(m.auth_validation_your_name_required())
+      .min(2, m.auth_validation_your_name_required())
+      .max(120, m.auth_validation_name_too_long()),
+    email: requiredText(m.auth_validation_email_required())
+      .min(1, m.auth_validation_email_required())
+      .email(m.auth_validation_email_invalid()),
+    password: makeStrongPassword(),
+    setupCode: requiredText(m.auth_validation_setup_code_min()).min(6, m.auth_validation_setup_code_min()),
+  });
+}
+
+/**
+ * Human-readable strong-password requirement, shown next to password inputs on
+ * the reset and join pages. A factory (not a const) so the copy tracks the
+ * active locale; stays in sync with `makeStrongPassword()` above.
+ */
+export function makePasswordHint() {
+  return m.auth_password_hint();
+}
+
+/**
+ * Forgot-password request (`/forgot-password`). Only the email is user-entered;
+ * the backend answers 200 unconditionally (anti-enumeration).
+ */
+export function makeForgotPasswordSchema() {
+  return z.object({
+    email: requiredText(m.auth_validation_email_required())
+      .min(1, m.auth_validation_email_required())
+      .email(m.auth_validation_email_invalid()),
+  });
+}
+
+/**
+ * Reset-password submit (`/reset-password`). The token rides as a hidden field
+ * (sourced from the URL via the loader), NOT a schema field — the schema only
+ * validates the new password. Field name is `newPassword`, matching the API's
+ * `ResetPasswordSchema` (server/lib/validations/auth.schema.ts).
+ */
+export function makeResetPasswordSchema() {
+  return z.object({
+    newPassword: makeStrongPassword(),
+  });
+}
+
+/**
+ * Team-invite accept (`/join`). Token comes from the URL, NOT the form — the
+ * schema only validates the user-entered name + password. Mirrors the API's
+ * `JoinTeamSchema` password strength.
+ */
+export function makeJoinSchema() {
+  return z.object({
+    name: requiredText(m.auth_validation_name_required())
+      .min(1, m.auth_validation_name_required())
+      .max(120, m.auth_validation_name_too_long()),
+    password: makeStrongPassword(),
+  });
+}
+
+/**
+ * Partner-agent self-signup (`/agent-signup`). Mirrors the API's
+ * `SignupBodySchema`: name min 2/max 120, email, password min 12/max 120.
+ * The Turnstile token is not a validated form field — it passes through.
+ */
+export function makeAgentSignupSchema() {
+  return z.object({
+    name: requiredText(m.auth_validation_full_name_required())
+      .min(2, m.auth_validation_full_name_required())
+      .max(120, m.auth_validation_name_too_long()),
+    email: requiredText(m.auth_validation_email_required())
+      .min(1, m.auth_validation_email_required())
+      .email(m.auth_validation_email_invalid()),
+    password: requiredText(m.auth_validation_password_min12())
+      .min(12, m.auth_validation_password_min12())
+      .max(120, m.auth_validation_password_too_long()),
+    // An agent is a third party with a direct relationship to the operator and no
+    // company behind it, so neither a tenant's Privacy text nor a company's
+    // contract governs them. The tick is REQUIRED and the
+    // account is not created without it: recording a consent somebody did not
+    // give is worse than lacking one.
+    //
+    // Only the tick lives here. The version and content hash of the text shown
+    // are recorded SERVER-SIDE from the document in force — a client-supplied
+    // version would be the client asserting what it read, which is exactly the
+    // evidence the record exists to replace.
+    // An unchecked box submits NOTHING, so the failure has to be expressible for
+    // an absent field as well as a wrong one — hence `requiredText` (the file's
+    // own helper, which carries the message through both) rather than a literal
+    // with a custom error map.
+    agentTerms: requiredText(m.auth_validation_agent_terms_required())
+      .refine((v) => v === "on", m.auth_validation_agent_terms_required()),
+  });
+}
+
+/**
+ * The same tick, for an account that already exists (`/agent-accept-terms`).
+ *
+ * Deliberately its own schema rather than a `.pick()` off the signup one. They
+ * validate different forms with different fields, and the day signup gains a
+ * field, a derived schema would either drag it onto this page or need a second
+ * edit anyway. The one field they share is the one that matters, and it carries
+ * the same message on both.
+ */
+export function makeAgentTermsAcceptSchema() {
+  return z.object({
+    agentTerms: requiredText(m.auth_validation_agent_terms_required())
+      .refine((v) => v === "on", m.auth_validation_agent_terms_required()),
+  });
+}
+
+/**
+ * Task 5 — core agent password login (`/agent-login`, primary form). Mirrors
+ * the API's `AgentLoginSchema` (server/lib/validations/agent-login.schema.ts):
+ * email + password min(1) — this authenticates an EXISTING account, so no
+ * strength rule applies here (unlike signup's makeAgentSignupSchema).
+ */
+export function makeAgentLoginSchema() {
+  return z.object({
+    email: requiredText(m.auth_validation_email_required())
+      .min(1, m.auth_validation_email_required())
+      .email(m.auth_validation_email_invalid()),
+    password: requiredText(m.auth_validation_password_required()).min(1, m.auth_validation_password_required()),
+  });
+}
+
+/**
+ * Task 5 — core agent login's magic-link fallback form (`/agent-login`,
+ * secondary form). One address, same validation as the password form's.
+ *
+ * The field is `linkEmail`, not `email`, and that is the fix for a real defect
+ * rather than a naming preference: `/agent-login` renders BOTH forms at once, so
+ * two inputs carried the name `email` and the same "Email address" label, one
+ * above the other with only an `OR` rule between them. A password manager sees
+ * one page with two identical fields, and a person filling top-to-bottom cannot
+ * tell which button belongs to which box. The API body is still `{ email }` —
+ * the route maps it — because nothing outside this page has the ambiguity.
+ */
+export function makeAgentLoginLinkSchema() {
+  return z.object({
+    linkEmail: requiredText(m.auth_validation_email_required())
+      .min(1, m.auth_validation_email_required())
+      .email(m.auth_validation_email_invalid()),
+  });
+}

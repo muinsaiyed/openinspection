@@ -1,0 +1,185 @@
+import { useState } from "react";
+import { useLoaderData, useFetcher } from "react-router";
+import type { Route } from "./+types/rating-systems";
+import { requireToken } from "~/lib/session.server";
+import { createApi } from "~/lib/api-client.server";
+import { PageHeader, Card, Button, EmptyState } from "@core/shared-ui";
+import { Breadcrumb } from "~/components/Breadcrumb";
+import { RatingSystemEditor, type EditorSystem } from "~/components/RatingSystemEditor";
+import type { Severity } from "~/lib/severity";
+import { SEVERITY_LABEL } from "~/lib/severity";
+import { m } from "~/paraglide/messages";
+import { LoadFailedNotice } from "~/components/LoadFailedNotice";
+
+export function meta() {
+  return [{ title: m.library_rating_meta_title() }];
+}
+
+type Level = { id: string; abbreviation: string; label: string; color: string; severity: Severity; isDefect?: boolean; pausesAdvance?: boolean; hotkey?: string; order?: number };
+type System = { id: string; name: string; slug: string; description?: string | null; isDefault?: boolean; isSeed?: boolean; levels: Level[] };
+
+export async function loader({ request, context }: Route.LoaderArgs) {
+  const token = await requireToken(context, request);
+  try {
+    const api = createApi(context, { token });
+    const res = await api.ratingSystems.index.$get();
+    const body = res.ok ? ((await res.json()) as Record<string, unknown>) : { data: [] };
+    return { systems: (body.data ?? []) as System[], loadFailed: false };
+  } catch {
+    return { systems: [] as System[], loadFailed: true };
+  }
+}
+
+export async function action({ request, context }: Route.ActionArgs) {
+  const token = await requireToken(context, request);
+  const form = await request.formData();
+  const intent = form.get("intent");
+  const api = createApi(context, { token });
+
+  if (intent === "delete") {
+    const id = String(form.get("id") || "");
+    const res = await api.ratingSystems[":id"].$delete({ param: { id } });
+    return { ok: res.ok, intent: "delete" as const };
+  }
+
+  if (intent === "save") {
+    const id = form.get("id") ? String(form.get("id")) : null;
+    let levels: unknown;
+    try { levels = JSON.parse(String(form.get("levels") || "[]")); } catch { return { ok: false, error: m.library_rating_err_invalid_levels() }; }
+    const json = {
+      name: String(form.get("name") || ""),
+      slug: String(form.get("slug") || ""),
+      description: String(form.get("description") || "") || undefined,
+      isDefault: form.get("isDefault") === "true",
+      levels: levels as Level[],
+    };
+    const res = id
+      ? await api.ratingSystems[":id"].$put({ param: { id }, json })
+      : await api.ratingSystems.index.$post({ json });
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+      return { ok: false, error: errBody?.error?.message || m.library_rating_err_save_failed() };
+    }
+    return { ok: true, intent: "save" as const };
+  }
+
+  return { ok: false };
+}
+
+const SEVERITY_RING: Record<Severity, string> = {
+  good: "ring-ih-ok/30", marginal: "ring-ih-watch/30", significant: "ring-ih-bad/30", minor: "ring-ih-border-strong/30",
+};
+
+export default function RatingSystemsPage() {
+  const { systems, loadFailed } = useLoaderData<typeof loader>();
+  const deleteFetcher = useFetcher();
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editing, setEditing] = useState<EditorSystem | null>(null);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+
+  function openNew() {
+    setEditing(null);
+    setEditorOpen(true);
+  }
+  function openEdit(sys: System) {
+    // Guard `levels`: a system row may arrive without a `levels` array (the card
+    // render already defends with `?? []`). Without the same guard here, spreading
+    // `undefined` throws inside the click handler, so the Edit button silently does
+    // nothing — exactly the "unresponsive" symptom.
+    const levels = [...(sys.levels ?? [])]
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      .map((l) => ({
+        id: l.id, abbreviation: l.abbreviation, label: l.label, color: l.color, severity: l.severity,
+        isDefect: l.isDefect ?? false, pausesAdvance: l.pausesAdvance, hotkey: l.hotkey,
+      }));
+    setEditing({
+      id: sys.id,
+      name: sys.name,
+      slug: sys.slug,
+      description: sys.description ?? "",
+      isDefault: sys.isDefault,
+      levels,
+    });
+    setEditorOpen(true);
+  }
+
+  return (
+    <div className="space-y-ih-list">
+      {/* IA-118 — an empty list here is a conclusion; say when it is not a real one. */}
+      {loadFailed && <LoadFailedNotice />}
+
+      <Breadcrumb items={[{ label: m.library_layout_title(), href: "/library" }, { label: m.library_rating_heading() }]} />
+      <PageHeader
+        title={m.library_rating_heading()}
+        meta={systems.length === 1 ? m.library_rating_meta_one({ count: systems.length }) : m.library_rating_meta_other({ count: systems.length })}
+        actions={<Button variant="primary" onClick={openNew}>{m.library_rating_new()}</Button>}
+      />
+
+      {systems.length === 0 ? (
+        <Card>
+          <EmptyState
+            title={m.library_rating_empty_title()}
+            description={m.library_rating_empty_desc()}
+          />
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {systems.map((sys) => {
+            const levels = [...(sys.levels ?? [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+            const confirming = confirmId === sys.id;
+            return (
+              <Card key={sys.id} className="p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="text-[13px] font-semibold text-ih-fg-1 truncate">{sys.name}</p>
+                      {sys.isDefault && (
+                        <span className="shrink-0 inline-flex items-center h-4 px-1.5 rounded text-[9px] font-bold uppercase tracking-wide bg-ih-primary-tint text-ih-primary-text">{m.library_rating_default_badge()}</span>
+                      )}
+                    </div>
+                    {sys.description && (
+                      <p className="text-[13px] text-ih-fg-3 mt-1 line-clamp-2">{sys.description}</p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button onClick={() => openEdit(sys)} className="text-[13px] text-ih-primary-text hover:opacity-80 font-semibold px-1">
+                      {m.common_edit()}
+                    </button>
+                    {!sys.isSeed && (
+                      confirming ? (
+                        <deleteFetcher.Form method="post" onSubmit={() => setConfirmId(null)}>
+                          <input type="hidden" name="intent" value="delete" />
+                          <input type="hidden" name="id" value={sys.id} />
+                          <button type="submit" className="text-[12px] font-bold text-ih-bad-fg hover:opacity-80 px-1">{m.library_action_confirm()}</button>
+                        </deleteFetcher.Form>
+                      ) : (
+                        <button onClick={() => setConfirmId(sys.id)} className="text-[13px] text-ih-fg-3 hover:text-ih-bad-fg font-semibold px-1" title={m.common_delete()}>{m.common_delete()}</button>
+                      )
+                    )}
+                  </div>
+                </div>
+
+                {levels.length > 0 && (
+                  <div className="flex items-center flex-wrap gap-1.5 mt-3">
+                    {levels.map((l) => (
+                      <span
+                        key={l.id || l.abbreviation}
+                        className={`inline-flex items-center h-6 px-2 rounded text-[11px] font-bold ring-1 ${SEVERITY_RING[l.severity] ?? "ring-ih-border-strong/30"}`}
+                        style={{ backgroundColor: l.color ? `${l.color}1a` : undefined, color: l.color || undefined }}
+                        title={`${l.label} · ${SEVERITY_LABEL[l.severity]}`}
+                      >
+                        {l.abbreviation || l.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      <RatingSystemEditor open={editorOpen} onClose={() => setEditorOpen(false)} system={editing} />
+    </div>
+  );
+}

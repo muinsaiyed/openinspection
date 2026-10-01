@@ -1,0 +1,222 @@
+import { useState } from "react";
+import { useLoaderData } from "react-router";
+import type { Route } from "./+types/repair-items";
+import { requireToken } from "~/lib/session.server";
+import { createApi } from "~/lib/api-client.server";
+import { PageHeader, Card, Pill, Button, EmptyState } from "@core/shared-ui";
+import { Breadcrumb } from "~/components/Breadcrumb";
+import { ConfirmDialog } from "~/components/ConfirmDialog";
+import { useGuardedSubmit } from "~/hooks/useGuardedSubmit";
+import { m } from "~/paraglide/messages";
+import { LoadFailedNotice } from "~/components/LoadFailedNotice";
+
+export function meta() {
+  return [{ title: m.repair_items_meta_title() }];
+}
+
+interface RepairItem {
+  id: string;
+  name: string;
+  category: string | null;
+  severity: "good" | "marginal" | "significant" | "minor";
+  // Scope of work only. A repair item carries no price: a figure printed on a
+  // report is read as this company's figure, and a catalogue default knows
+  // nothing about the property, the trade market, or the week. Money on an
+  // inspection is written by the buyer or their agent, in the repair request.
+  defaultRepairSummary: string;
+  recommendedContractorTypeId: string | null;
+}
+interface ContractorType { id: string; name: string }
+
+export async function loader({ request, context }: Route.LoaderArgs) {
+  const token = await requireToken(context, request);
+  const api = createApi(context, { token });
+  try {
+    const [recRes, ctRes] = await Promise.all([
+      api.recommendations.index.$get({ query: {} }),
+      api.contractorTypes.index.$get(),
+    ]);
+    // IA-118 — "no repair items" reads as "nothing needs fixing", which is a
+    // claim about a property. A failed fetch must not make it.
+    if (!recRes.ok) throw new Error(`recommendations ${recRes.status}`);
+    const recBody = (await recRes.json()) as { data?: RepairItem[] };
+    // The contractor-type catalogue only populates a filter; an empty one
+    // narrows nothing and asserts nothing, so it stays best-effort.
+    const ctBody = ctRes.ok ? ((await ctRes.json()) as { data?: ContractorType[] }) : { data: [] };
+    return { items: recBody.data ?? [], contractorTypes: ctBody.data ?? [], loadFailed: false };
+  } catch {
+    return { items: [] as RepairItem[], contractorTypes: [] as ContractorType[], loadFailed: true };
+  }
+}
+
+export async function action({ request, context }: Route.ActionArgs) {
+  const token = await requireToken(context, request);
+  const api = createApi(context, { token });
+  const form = await request.formData();
+  const intent = String(form.get("intent"));
+
+  const buildJson = () => ({
+    name: String(form.get("name") ?? ""),
+    category: (String(form.get("category") ?? "").trim() || null),
+    severity: (String(form.get("severity") ?? "significant")) as RepairItem["severity"],
+    defaultRepairSummary: String(form.get("defaultRepairSummary") ?? ""),
+    recommendedContractorTypeId: (String(form.get("recommendedContractorTypeId") ?? "").trim() || null),
+  });
+
+  try {
+    if (intent === "create") {
+      const res = await api.recommendations.index.$post({ json: buildJson() });
+      return { ok: res.ok, intent };
+    }
+    if (intent === "update") {
+      const id = String(form.get("id"));
+      const res = await api.recommendations[":id"].$put({ param: { id }, json: buildJson() });
+      return { ok: res.ok, intent };
+    }
+    if (intent === "delete") {
+      const id = String(form.get("id"));
+      const res = await api.recommendations[":id"].$delete({ param: { id } });
+      return { ok: res.ok, intent };
+    }
+  } catch {
+    return { ok: false, intent };
+  }
+  return { ok: false, intent };
+}
+
+const SEVERITY_TONE: Record<string, "sat" | "monitor" | "defect"> = {
+  good: "sat", marginal: "monitor", significant: "defect",
+};
+
+const EMPTY = {
+  id: "", name: "", category: "", severity: "significant" as RepairItem["severity"],
+  defaultRepairSummary: "", recommendedContractorTypeId: "",
+};
+
+export default function RepairItemsPage() {
+  const { items, contractorTypes, loadFailed } = useLoaderData<typeof loader>();
+  // #106 - the editor writes a library item and the delete removes one. Two
+  // guards so the modal save and a delete cannot abort one another.
+  const { submit: submitItem, busy: saving } = useGuardedSubmit<typeof action>();
+  const { submit: submitDelete, busy: deleting } = useGuardedSubmit<typeof action>();
+  const [pendingDelete, setPendingDelete] = useState<RepairItem | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [form, setForm] = useState(EMPTY);
+  const ctName = (id: string | null) => contractorTypes.find((c) => c.id === id)?.name ?? null;
+
+  function openCreate() { setForm(EMPTY); setModalOpen(true); }
+  function openEdit(it: RepairItem) {
+    setForm({
+      id: it.id, name: it.name, category: it.category ?? "", severity: it.severity,
+      defaultRepairSummary: it.defaultRepairSummary, recommendedContractorTypeId: it.recommendedContractorTypeId ?? "",
+    });
+    setModalOpen(true);
+  }
+  function submit(intent: string) {
+    // Close only on a call the guard accepted, so a refused second click does
+    // not discard what is in the form.
+    if (submitItem({ ...form, intent }, { method: "POST" })) setModalOpen(false);
+  }
+
+  return (
+    <div className="space-y-ih-list">
+      <Breadcrumb items={[{ label: m.library_layout_title(), href: "/library" }, { label: m.repair_items_heading() }]} />
+      {/* IA-118 — "no repair items" reads as "nothing needs fixing", a claim
+          about a property. Do not make it on a failed fetch. */}
+      {loadFailed && <LoadFailedNotice what={m.repair_items_heading()} />}
+      <PageHeader
+        title={m.repair_items_heading()}
+        meta={m.repair_items_meta({ count: items.length })}
+        actions={<Button variant="primary" onClick={openCreate}>{m.repair_items_add()}</Button>}
+      />
+
+      {items.length === 0 ? (
+        <Card>
+          <EmptyState title={m.repair_items_empty_title()} description={m.repair_items_empty_desc()} />
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {items.map((it) => (
+            <Card key={it.id} className="p-4">
+              <div className="flex items-start justify-between gap-2">
+                <p className="text-[13px] font-semibold text-ih-fg-1">{it.name}</p>
+                <Pill tone={SEVERITY_TONE[it.severity] || "gen"}>{it.severity}</Pill>
+              </div>
+              {it.defaultRepairSummary && (
+                <p className="text-[13px] text-ih-fg-3 mt-1 line-clamp-2">{it.defaultRepairSummary}</p>
+              )}
+              <div className="flex items-center gap-2 mt-2 flex-wrap">
+                {it.category && <Pill tone="gen">{it.category}</Pill>}
+                {ctName(it.recommendedContractorTypeId) && (
+                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-ih-info-bg text-ih-info-fg">{ctName(it.recommendedContractorTypeId)}</span>
+                )}
+              </div>
+              <div className="mt-3 flex gap-3">
+                <button onClick={() => openEdit(it)} className="text-[12px] text-ih-primary-text hover:underline font-bold">{m.common_edit()}</button>
+                <button onClick={() => setPendingDelete(it)} className="text-[12px] text-ih-bad-fg hover:underline font-bold">{m.common_delete()}</button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {modalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-ih-backdrop" onClick={() => setModalOpen(false)} />
+          <div className="relative bg-ih-bg-card border border-ih-border rounded-lg shadow-ih-popover w-full max-w-md mx-4 p-6 space-y-4">
+            <h3 className="text-[16px] font-bold text-ih-fg-1">{form.id ? m.repair_items_modal_edit_title() : m.repair_items_modal_new_title()}</h3>
+            <div className="space-y-3">
+              <Field label={m.repair_items_field_name()}><input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder={m.repair_items_placeholder_name()} className={INPUT} /></Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label={m.repair_items_field_category()}><input value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} placeholder={m.repair_items_placeholder_category()} className={INPUT} /></Field>
+                <Field label={m.repair_items_field_severity()}>
+                  <select value={form.severity} onChange={(e) => setForm((f) => ({ ...f, severity: e.target.value as RepairItem["severity"] }))} className={INPUT}>
+                    <option value="good">{m.repair_items_severity_good()}</option>
+                    <option value="marginal">{m.repair_items_severity_marginal()}</option>
+                    <option value="significant">{m.repair_items_severity_significant()}</option>
+                  </select>
+                </Field>
+              </div>
+              <Field label={m.repair_items_field_summary()}><textarea value={form.defaultRepairSummary} onChange={(e) => setForm((f) => ({ ...f, defaultRepairSummary: e.target.value }))} rows={3} className={INPUT} /></Field>
+              <Field label={m.repair_items_field_contractor()}>
+                <select value={form.recommendedContractorTypeId} onChange={(e) => setForm((f) => ({ ...f, recommendedContractorTypeId: e.target.value }))} className={INPUT}>
+                  <option value="">{m.repair_items_contractor_none()}</option>
+                  {contractorTypes.map((ct) => <option key={ct.id} value={ct.id}>{ct.name}</option>)}
+                </select>
+              </Field>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button onClick={() => setModalOpen(false)} className="px-4 py-2 rounded-md border border-ih-border text-[13px] font-bold text-ih-fg-2 hover:bg-ih-bg-muted transition-colors">{m.common_cancel()}</button>
+              <button onClick={() => submit(form.id ? "update" : "create")} disabled={saving || !form.name.trim() || !form.defaultRepairSummary.trim()} aria-busy={saving || undefined} className="px-4 py-2 rounded-md bg-ih-primary text-ih-fg-inverse text-[13px] font-bold hover:bg-ih-primary-600 transition-colors disabled:opacity-50">{m.common_save()}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title={m.repair_items_delete_title()}
+        message={pendingDelete ? m.repair_items_delete_message({ name: pendingDelete.name }) : ""}
+        busy={deleting}
+        onConfirm={() => {
+          if (!pendingDelete) return;
+          if (submitDelete({ intent: "delete", id: pendingDelete.id }, { method: "POST" })) {
+            setPendingDelete(null);
+          }
+        }}
+        onCancel={() => setPendingDelete(null)}
+      />
+    </div>
+  );
+}
+
+const INPUT ="w-full px-3 py-2 rounded-md border border-ih-border bg-ih-bg-card text-[13px] text-ih-fg-1 focus:border-ih-primary focus:shadow-ih-focus outline-none";
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="block text-[11px] font-bold text-ih-fg-3 mb-1 uppercase tracking-widest">{label}</span>
+      {children}
+    </label>
+  );
+}

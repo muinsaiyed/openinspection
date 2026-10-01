@@ -1,0 +1,116 @@
+/**
+ * Shared, locale-aware formatting boundary. All user-facing date/time/number/
+ * currency rendering should go through here (Phase A migrates the ~38 legacy
+ * toLocaleString('en-US') call sites). locale/timeZone/currency are injected so
+ * this stays pure and testable; the client supplies them via useDisplayLocale/
+ * useDisplayTimeZone, the server resolves them per request. Formatting runs on
+ * the edge — workerd ships full ICU (see tests/workers/intl-icu-locale-data).
+ */
+
+export type DateInput = string | number | Date | null | undefined;
+
+/** Normalize input to a Date. Bare YYYY-MM-DD is anchored at UTC midnight (a
+ *  civil date, no zone); everything else is parsed as-is. null on invalid. */
+function toDate(value: DateInput): Date | null {
+  if (value == null || value === "") return null;
+  const civil = typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+  const d = value instanceof Date ? value : new Date(civil ? `${value}T00:00:00.000Z` : value);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+export function formatDate(
+  value: DateInput,
+  opts: { locale: string; timeZone?: string; month?: "short" | "long" },
+): string {
+  const d = toDate(value);
+  if (!d) return "";
+  return new Intl.DateTimeFormat(opts.locale, {
+    year: "numeric",
+    month: opts.month ?? "short",
+    day: "numeric",
+    ...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
+  }).format(d);
+}
+
+/** Largest-first, so the first unit the gap clears is the one we render. */
+const RELATIVE_UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
+  ["year", 31_536_000_000],
+  ["month", 2_592_000_000],
+  ["day", 86_400_000],
+  ["hour", 3_600_000],
+  ["minute", 60_000],
+];
+
+/**
+ * Locale-aware "1 hour ago" / "in 3 days". `now` is injected so callers stay
+ * testable and so server and client agree on a rendered value.
+ */
+export function formatRelativeTime(
+  value: DateInput,
+  opts: { locale: string; now?: number; style?: Intl.RelativeTimeFormatStyle },
+): string {
+  const d = toDate(value);
+  if (!d) return "";
+  const diffMs = d.getTime() - (opts.now ?? Date.now());
+  const fmt = new Intl.RelativeTimeFormat(opts.locale, {
+    numeric: "auto",
+    style: opts.style ?? "long",
+  });
+  for (const [unit, unitMs] of RELATIVE_UNITS) {
+    if (Math.abs(diffMs) >= unitMs) return fmt.format(Math.round(diffMs / unitMs), unit);
+  }
+  return fmt.format(0, "minute");
+}
+
+/**
+ * `hourCycle` is the CLOCK, which is a separate axis from the locale (#270):
+ * en-US implies h12 and en-GB implies h23, but "English words, 24-hour clock"
+ * is a normal field preference and no locale expresses it. Omit it to keep the
+ * locale's own convention.
+ */
+export function formatTime(
+  value: DateInput,
+  opts: {
+    locale: string;
+    timeZone?: string;
+    timeZoneName?: "short" | "long";
+    hourCycle?: "h12" | "h23";
+  },
+): string {
+  const d = toDate(value);
+  if (!d) return "";
+  return new Intl.DateTimeFormat(opts.locale, {
+    hour: opts.hourCycle === "h23" ? "2-digit" : "numeric",
+    minute: "2-digit",
+    ...(opts.hourCycle ? { hourCycle: opts.hourCycle } : {}),
+    ...(opts.timeZone
+      ? { timeZone: opts.timeZone, ...(opts.timeZoneName ? { timeZoneName: opts.timeZoneName } : {}) }
+      : {}),
+  }).format(d);
+}
+
+export function formatDateTime(value: DateInput, opts: { locale: string; timeZone?: string }): string {
+  const d = toDate(value);
+  if (!d) return "";
+  return new Intl.DateTimeFormat(opts.locale, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    ...(opts.timeZone ? { timeZone: opts.timeZone, timeZoneName: "short" } : {}),
+  }).format(d);
+}
+
+export function formatNumber(n: number, opts: { locale: string }): string {
+  return new Intl.NumberFormat(opts.locale).format(n);
+}
+
+/** Integer cents -> localized currency string, symbol form (`$1,234.50`). */
+export function formatCurrency(cents: number, opts: { locale: string; currency: string }): string {
+  return new Intl.NumberFormat(opts.locale, {
+    style: "currency",
+    currency: opts.currency,
+    currencyDisplay: "narrowSymbol",
+  }).format(cents / 100);
+}

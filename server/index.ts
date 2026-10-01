@@ -1,0 +1,746 @@
+import { OpenAPIHono } from '@hono/zod-openapi';
+import type { Context } from 'hono';
+import { cors } from 'hono/cors';
+import { serveStatic } from 'hono/cloudflare-workers';
+import { drizzle } from 'drizzle-orm/d1';
+import { eq } from 'drizzle-orm';
+import * as schema from './lib/db/schema';
+
+import { brandingMiddleware } from './lib/middleware/branding';
+import { contextBootstrap } from './lib/middleware/context-bootstrap';
+import { integrationSecretsMiddleware } from './lib/middleware/integration-secrets';
+import { enforceTenantActive } from './lib/middleware/tenant-status-guard';
+import { inspectorPaletteMiddleware } from './lib/middleware/inspector-palette';
+import { touchLastActiveMiddleware } from './lib/middleware/touch-last-active';
+import { tenantRouter } from './features/tenant-routing';
+import { diMiddleware } from './lib/middleware/di';
+import { checkRateLimit } from './lib/rate-limit';
+import { securityHeaders } from './lib/middleware/security-headers';
+import { AppError, ErrorCode } from './lib/errors';
+import { sendError } from './lib/response';
+import type { HonoConfig } from './types/hono';
+import { logger } from './lib/logger';
+import { BUILD } from './generated/version';
+import { r2Keys } from './lib/r2-keys';
+
+import { setupWizardRoutes } from './features/setup-wizard';
+
+import { jwtAuthMiddleware } from './lib/middleware/jwt-auth';
+import { agentTermsGate } from './lib/middleware/agent-terms-gate';
+import { idempotencyMiddleware } from './lib/middleware/idempotency';
+import { agreementSignPath, agreementRenderPath } from './lib/public-urls';
+import { loadVerifyData } from './lib/verify-data';
+
+
+import coreAuthRoutes, { ssoRootRoutes } from './api/auth';
+import testHooksRoutes from './api/test-hooks';
+import identityRoutes from './api/identity';
+import integrationsApiRoutes from './api/integrations';
+import integrationsAiRoutes from './api/integrations-ai';
+import analyticsRoutes from './api/analytics';
+import billingRoutes from './api/billing';
+import usageRoutes from './api/usage';
+import { registerPortalIntegration } from './portal/integration.module';
+import { inspectionsRoutes } from './api/inspections';
+import tenantPresenceRoutes from './api/tenant-presence';
+import inspectionPrefsRoutes from './api/inspection-prefs';
+import aiRoutes from './api/ai';
+import { bookingsRoutes } from './api/bookings';
+import { smsPublicRoutes, smsWebhookRoutes, smsAdminRoutes } from './api/sms';
+import adminRoutes from './api/admin';
+import adminBrandingRoutes from './api/admin/branding';
+import adminDefectCategoriesRoutes from './api/admin/admin-defect-categories';
+import secretsRoutes from './api/secrets';
+import emailTemplateRoutes from './api/email-templates';
+import agentRoutes from './api/agent';
+import agentsRoutes from './api/agents';
+import agentSignupRoutes from './api/agent-signup';
+import { agentMagicLoginRequestRoutes, agentMagicLoginRedeemRoutes } from './api/agent/magic-login';
+import { agentReportContextRoutes } from './api/agent/report-context'; // Spec 3 Task 3
+import { agentNoticeRoutes } from './api/agent/notices'; // C3 — agent Notices inbox
+import { agentLoginRoutes } from './api/agent/login'; // Spec 3 Task 5
+import { agentTermsRoutes } from './api/agent/terms'; // the way out of the agent-terms gate
+import placesRoutes from './api/places';
+import { availabilityRoutes } from './api/availability';
+import calendarRoutes from './api/calendar';
+import calendarEventsRoutes from './api/calendar-events';
+import scheduleWeekSummaryRoutes from './api/schedule-week-summary';
+import teamRoutes from './api/team';
+import contactRoutes from './api/contacts';
+import contactsImportRoutes from './api/contacts/import';
+import migrationIntakeRoutes from './api/migration-intake';
+import invoiceRoutes from './api/invoices';
+import { servicesRoutes } from './api/services';
+import automationsRoutes from './api/automations';
+import messageTemplateRoutes from './api/message-templates';
+import metricsRoutes from './api/metrics';
+import auditRoutes from './api/audit';
+import marketplaceRoutes from './api/marketplace';
+import dataRoutes from './api/data';
+import icsRoutes from './api/ics';
+import userRoutes from './api/users';
+import messageRoutes, { inspectorMessageRoutes, clientMessageRoutes } from './api/messages';
+import widgetRoutes from './api/widget';
+import notificationsRoutes from './api/notifications';
+import notificationPreferenceRoutes from './api/notification-preferences';
+import inspectionSyncRoutes from './api/inspection-sync';
+import recommendationsRoutes from './api/recommendations';
+import contractorTypesRoutes from './api/contractor-types';
+import credentialsRoutes from './api/credentials';
+import roleProfilesRoutes from './api/role-profiles';
+import ratingSystemsRoutes from './api/rating-systems';
+import eventsRoutes from './api/events';
+import inspectionTypesRoutes from './api/inspection-types';
+import inspectionRequestsRoutes from './api/inspection-requests';
+import repairBuilderRoutes from './api/repair-builder';
+import portalRoutes from './api/portal';
+import portalNoticeRoutes from './api/portal/notices';
+import portalNotificationPreferenceRoutes from './api/portal/notification-preferences';
+import tagsRoutes, { inspectionTagRoutes } from './api/tags';
+import publicSlugRoutes from './api/public-slug';
+import unsubscribeRoutes from './api/unsubscribe';
+import publicShareRoutes from './api/public-share';
+import publicReportRoutes from './api/public-report';
+import clientDocumentsRoutes, { inspectorDocumentsRoutes } from './api/client-documents';
+import profileRoutes from './api/profile';
+import conciergeRoutes from './api/concierge';
+import sessionContextRoutes from './api/session-context';
+import qboRoutes from './api/qbo';
+import qboWebhookRoutes from './api/qbo-webhook';
+import qboOauthRoutes from './api/qbo-oauth';
+import { QBO_OAUTH_MOUNT } from './lib/qbo-oauth-paths';
+import stripeWebhookRoutes from './api/stripe-webhook';
+import agreementsRenderRoutes from './api/agreements-render';
+import evidenceRoutes from './api/evidence';
+import wellKnownRoutes from './api/well-known';
+import mcpGrantsRoutes from './api/mcp-grants';
+
+const app = new OpenAPIHono<HonoConfig>({
+    // Intercept Zod validation failures so the response body carries a readable
+    // `error.message` + per-field map, instead of the default ZodError dump that
+    // leaks `[ { expected, code, path, message } ]` to the UI.
+    defaultHook: (result, c) => {
+        if (result.success) return;
+        const issues = result.error.issues;
+        const fields: Record<string, string> = {};
+        for (const i of issues) {
+            const key = i.path.length ? i.path.join('.') : '_';
+            if (!fields[key]) fields[key] = i.message;
+        }
+        const summary = issues
+            .map((i) => (i.path.length ? `${i.path.join('.')}: ${i.message}` : i.message))
+            .join('; ');
+        return c.json({
+            success: false,
+            error: {
+                code: 'VALIDATION_ERROR',
+                message: summary || 'Validation failed',
+                fields,
+            },
+        }, 400);
+    },
+});
+
+// CORS — allows React Router v7 frontend (separate origin in dev) to call API endpoints.
+// In production both share the same origin; this is primarily for local dev
+// where Vite runs on :5173 and the API Worker runs on :8787.
+app.use('/api/*', cors({
+    origin: (origin) => origin,
+    credentials: true,
+    allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Token-Relay'],
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    exposeHeaders: ['Set-Cookie'],
+}));
+
+// Global request logger
+app.use('*', async (c, next) => {
+    const start = Date.now();
+    await next();
+    const duration = Date.now() - start;
+    logger.info('Request processed', {
+        method: c.req.method,
+        path: c.req.path,
+        status: c.res.status,
+        duration: `${duration}ms`,
+        tenantId: c.get('tenantId'), // Might be unset but that's okay
+    });
+});
+
+// Health check
+app.get('/status', (c) => c.json({
+    status: 'ok',
+    app: 'openinspection-core',
+    version: BUILD.version,
+    commit: BUILD.shortCommit,
+    branch: BUILD.branch,
+    buildTime: BUILD.buildTime,
+    timestamp: new Date().toISOString(),
+}));
+
+
+/**
+ * Global Error Handler
+ * Standardizes all application errors into a JSON response.
+ */
+app.onError((err: unknown, c: Context<HonoConfig>) => {
+    // Robust check for AppError or any object carrying a status and code
+    const isAppError = err instanceof AppError || (
+        typeof err === 'object' && err !== null &&
+        'status' in err && typeof (err as Record<string, unknown>).status === 'number' &&
+        'code' in err && typeof (err as Record<string, unknown>).code === 'string'
+    );
+
+    if (isAppError) {
+        const appErr = err as Record<string, unknown>;
+        const status = appErr.status as number;
+        return sendError(c, appErr.message as string, appErr.code as string, status as 500, appErr.details as Record<string, unknown> | undefined);
+    }
+
+    // Strip the query string before logging so one-shot secrets in URLs (e.g. ?reset_token=…)
+    // don't get captured by downstream log sinks.
+    const pathOnly = c.req.url.split('?')[0];
+    logger.error('Unhandled application error', {
+        method: c.req.method,
+        url: pathOnly,
+    }, err instanceof Error ? err : undefined);
+
+    return sendError(c, 'Internal server error', ErrorCode.INTERNAL_ERROR, 500);
+});
+
+// Static assets
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const staticOpts = (opts: Record<string, string>): any => opts;
+app.get('/favicon.svg', serveStatic(staticOpts({ path: './favicon.svg' })));
+app.get('/logo.svg', serveStatic(staticOpts({ path: './logo.svg' })));
+app.get('/vendor/*', serveStatic(staticOpts({ root: './' })));
+app.get('/fonts.css', serveStatic(staticOpts({ path: './fonts.css' })));
+app.get('/fonts/*', serveStatic(staticOpts({ root: './' })));
+
+// Booking #7 Sprint C-1 — public R2 photo passthrough used by inspector
+// profile photos uploaded via POST /api/profile/photo. The R2 key is
+// tenant-prefixed and includes the userId, so it isn't guessable; only
+// inspector-photos/* paths are exposed to keep other tenant assets private.
+app.get('/photos/:tenantId/inspector-photos/:filename', async (c) => {
+    const tenantId = c.req.param('tenantId');
+    const filename = c.req.param('filename');
+    if (!c.env.PHOTOS) return c.notFound();
+    const key = r2Keys.inspectorPhotoServe(tenantId, filename);
+    const obj = await c.env.PHOTOS.get(key);
+    if (!obj) return c.notFound();
+    const headers = new Headers();
+    obj.writeHttpMetadata(headers);
+    headers.set('Cache-Control', 'public, max-age=86400');
+    headers.set('etag', obj.httpEtag);
+    return new Response(obj.body, { headers });
+});
+
+// Global Middlewares.
+//
+// ORDERING (A-16): the chain is two-phase around the JWT middleware.
+//   Before JWT: contextBootstrap (profile + keyring — JWT awaits the keyring),
+//   tenantRouter / branding / tenant-active (host- and slug-derived context).
+//   After JWT:  integrationSecretsMiddleware + diMiddleware — both are
+//   tenant-scoped and must see the JWT's `tenantId`. They used to run BEFORE
+//   the JWT middleware, so on authed API requests the tenant was still unknown:
+//   di's email/AI preloads never loaded (per-tenant sender identity + Gemini
+//   BYOK silently fell back to platform defaults) and, in saas mode, the
+//   tenant's integration secrets never merged into c.env.
+app.use('*', securityHeaders);
+app.use('*', contextBootstrap);
+app.use('*', tenantRouter);
+app.use('*', brandingMiddleware);
+app.use('*', enforceTenantActive);
+
+// Global JWT Middleware — extracts tenantId / userRole from Bearer token or
+// cookie. Defined in server/lib/middleware/jwt-auth.ts, not here: this file is
+// exempt from type-aware linting (its import fan-in blows the heap — see
+// eslint.config.js), and authentication code must not be.
+app.use('*', jwtAuthMiddleware);
+
+// The agent terms, in front of every authenticated agent request. Position is
+// load-bearing and pinned by tests/unit/legal/agent-terms-gate.spec.ts: AFTER
+// the JWT middleware (which is what sets the `agentUserId` this reads) and
+// BEFORE the idempotency guard (a stored 428 would be replayed to an agent who
+// has since accepted). Why it is on `*` rather than on the agent route groups is
+// in the middleware's own header.
+app.use('*', agentTermsGate);
+
+// Idempotency guard (portal #107) — claims an `Idempotency-Key`, replays the
+// stored response on a repeat, and answers 409 while the first attempt is still
+// running. MUST stay AFTER the JWT middleware: the key is scoped to the
+// authenticated tenant, and a bare key is a global namespace in which two
+// tenants that minted the same key would replay EACH OTHER's stored response.
+// That is a cross-tenant leak introduced by a correctness fix — worse than the
+// duplicate it prevents. Pinned by tests/unit/platform/middleware-order.spec.ts.
+export const idempotencyGuard = idempotencyMiddleware();
+app.use('*', idempotencyGuard);
+
+
+// Secrets UI — load encrypted integration secrets from DB and merge into
+// c.env. Tenant comes from the JWT (authed API) or tenantRouter (standalone /
+// public slug paths) — see the ORDERING note above. Worker env vars take
+// precedence except for the tenant-owned Stripe trio.
+app.use('*', integrationSecretsMiddleware);
+
+// Service registry + tenant email/AI config (see the ORDERING note above —
+// must run after the JWT middleware so `tenantId` is resolved).
+app.use('*', diMiddleware);
+
+// Sprint B-1 — after auth + branding, hydrate the booking-palette context
+// (slug + booking host) into branding so MainLayout's <CommandPalette/> can
+// render the "Copy my booking link" action without each page having to plumb
+// the slug through manually.
+app.use('*', inspectorPaletteMiddleware);
+
+// Design System 0520 subsystem B phase 1 — debounced last-active touch. Runs
+// after every authenticated request (30 s window per user / worker isolate)
+// so TeamStrip's "last active Nm ago" pill stays accurate without hammering
+// D1 on every fetch.
+app.use('/api/*', touchLastActiveMiddleware);
+
+// API Routes
+
+// Module Routes — chained so that `typeof routes` accumulates every sub-router's
+// path schema, enabling typed `hc<CoreApiType>()` API calls in the future.
+//
+// Currently the sub-routers themselves use void `.openapi()` calls, so the
+// merged schema carries only path shapes (not request/response types). Once
+// sub-routers are also refactored to chain their `.openapi()` calls, the full
+// endpoint types will propagate automatically through this chain.
+//
+// Middleware `.use()` and inline `.get()` handlers are kept as separate `app.*`
+// statements (above and below) since they don't affect the route type signature.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- referenced via `typeof routes` on line 800 (CoreApiType export)
+const routes = app
+  // Auth mounts ONCE. `GET /sso` alone also answers at the root, because portal mints that absolute URL and the browser follows it.
+  .route('/api/auth', coreAuthRoutes)
+  .route('/', ssoRootRoutes)
+  // Agent unified link (Spec 3 Task 2) — GET /agent/magic-login redeem. Root
+  // mount (not /api) mirrors the /sso pattern above; workers/app.ts forwards
+  // this exact path to the API app since it isn't under /api/*.
+  .route('/', agentMagicLoginRedeemRoutes)
+  // Test-only hooks, fail-closed behind E2E_EMAIL_SINK (404 in prod). See test-hooks.ts.
+  .route('/api/__test__', testHooksRoutes)
+  .route('/api/billing', billingRoutes)
+  .route('/api/usage', usageRoutes)
+  // Design System 0520 subsystem E — identity / integrations / analytics.
+  .route('/api/identities', identityRoutes)
+  .route('/api/integrations', integrationsApiRoutes)
+  // Its own base path, not a second router on /api/integrations: two routers
+  // under one path collapse to the first in the typed client, so the second's
+  // routes would exist at runtime and be uncallable from a loader.
+  .route('/api/integrations/ai', integrationsAiRoutes)
+  .route('/api/analytics', analyticsRoutes)
+  .route('/api/inspections', inspectionsRoutes)
+  .route('/api/credentials', credentialsRoutes)
+  // Design System 0520 subsystem B phase 2 — tenant-level presence channel
+  // (one WS per dashboard tab). Per-inspection presence is mounted inline on
+  // inspectionsRoutes above as /api/inspections/:id/presence/ws.
+  .route('/api/tenant', tenantPresenceRoutes)
+  // Workflow shortcuts PR — tenant-scoped editor preferences (clone defaults,
+  // auto-advance delay, pinned tag ids). GET returns merged defaults; PATCH
+  // validates and persists.
+  .route('/api/tenant/inspection-prefs', inspectionPrefsRoutes)
+  .route('/api/inspections', inspectionSyncRoutes)
+  // Sprint 3 S3-3 — tag link/unlink endpoints share the /api/inspections root
+  // so the URL carries inspection id + item id directly. Mounted before the
+  // generic inspection routes finish registering so OpenAPI catches both.
+  .route('/api/inspections', inspectionTagRoutes)
+  // Unified client portal ⑦ — authed INSPECTOR document routes. Shares the
+  // /api/inspections root (paths are /:id/documents). Behind the global JWT
+  // gate by default (/api/inspections/* is not in the isPublic allowlist).
+  .route('/api/inspections', inspectorDocumentsRoutes)
+  // Customer messaging ⑥ — authed INSPECTOR message routes. Shares the
+  // /api/inspections root (paths are /:id/messages...). Behind the global JWT
+  // gate by default (mirrors inspectorDocumentsRoutes). The static "messages"
+  // segment after :id keeps it disjoint from the per-id document/tag routes.
+  .route('/api/inspections', inspectorMessageRoutes)
+  .route('/api/tags', tagsRoutes)
+  .route('/api/inspection-requests', inspectionRequestsRoutes)
+  .route('/api/ai', aiRoutes)
+  // C-10 residual ③-A — public token-gated report/observe/invoice/inspector
+  // endpoints. Mounted first so its static paths win over the other public routers.
+  .route('/api/public', publicReportRoutes)
+  .route('/api/public', bookingsRoutes)
+  .route('/api/public/widget', widgetRoutes)
+  // Booking #7 Sprint A — slug availability check; under /api/public so the slug
+  // input on /settings/profile (and any future un-authed page) needs no JWT.
+  .route('/api/public', publicSlugRoutes)
+  // Booking #7 Sprint A — authenticated profile endpoints (slug write).
+  .route('/api/profile', profileRoutes)
+  // RRB builder CRUD — interactive repair request list authoring (Task 4).
+  .route('/api/public', repairBuilderRoutes)
+  // UC-C-7 — public share-token mint (customer Forward report flow).
+  .route('/api/public', publicShareRoutes)
+  // Unified client portal ⑦ — client document streaming upload/list/download/delete
+  // (router defines /inspections/:id/documents). Session- OR token-gated; the
+  // global JWT middleware skips /api/public/* so auth is performed in-route.
+  .route('/api/public', clientDocumentsRoutes)
+  // Customer messaging ⑥ — client message routes (router defines
+  // /inspections/:id/messages...). Session- OR token-gated via resolveClientActor;
+  // the global JWT middleware skips /api/public/* so auth is performed in-route.
+  .route('/api/public', clientMessageRoutes)
+  // Track L (D6) — the SMS opt-in pair (resolve/confirm) a person opens.
+  .route('/api/public', smsPublicRoutes)
+  // Signed email unsubscribe. MUST stay under /api/public — that prefix is what
+  // keeps it outside the agent-terms gate; see server/api/unsubscribe.ts.
+  .route('/api/public', unsubscribeRoutes)
+  // Unified client portal — magic-link request/redeem + session-gated data routes.
+  // The :tenant slug lives inside the route definitions (tenantRouter resolves it).
+  .route('/api/portal', portalRoutes)
+  // C3 — the client's Notices inbox, its own module under the same prefix.
+  .route('/api/portal', portalNoticeRoutes)
+  // The client's own notification settings (§4.1) — same portal-session auth.
+  .route('/api/portal', portalNotificationPreferenceRoutes)
+  .route('/api/admin', adminRoutes)
+  // Branding sub-router — extracted to fix hono/client type-collapse (C-10)
+  .route('/api/admin', adminBrandingRoutes)
+  // Evidence download — GET /api/admin/agreement-requests/:id/pdf + certificate.pdf
+  .route('/api/admin', evidenceRoutes)
+  // Secrets UI — GET/PUT/POST /api/admin/secrets for all 14 integration keys
+  .route('/api/admin', secretsRoutes)
+  // Track L — authed SMS consent attestation + test-send + consent status.
+  .route('/api/admin', smsAdminRoutes)
+  // Email-template CRUD + preview — GET/PUT/POST /api/admin/email-templates
+  .route('/api/admin', emailTemplateRoutes)
+  // Settings + Library IA — GET/POST/PUT/DELETE /api/admin/inspection-types
+  .route('/api/admin', inspectionTypesRoutes)
+  // Authoring unification Plan-4 module K — GET/POST/PUT/DELETE /api/admin/defect-categories
+  .route('/api/admin', adminDefectCategoriesRoutes)
+  .route('/api/agent', agentRoutes)
+  // Agent unified link (Spec 3 Task 2) — POST /api/agent/magic-login/request.
+  // The GET /agent/magic-login redeem endpoint is mounted at root, below
+  // (not under /api — see workers/app.ts's explicit forward for that path).
+  .route('/api/agent', agentMagicLoginRequestRoutes)
+  .route('/api/agent', agentReportContextRoutes) // Spec 3 Task 3 — POST /api/agent/report-context
+  .route('/api/agent', agentNoticeRoutes) // C3 — the agent's Notices inbox
+  // Spec 3 Task 5 — POST /api/agent/login + POST /api/agent/login-link (core
+  // dual-mode front door: password primary, magic-link fallback).
+  .route('/api/agent', agentLoginRoutes)
+  // POST /api/agent/accept-terms — the door in the agent-terms gate.
+  .route('/api/agent', agentTermsRoutes)
+  // Agent Accounts A1 — invite + accept endpoints
+  .route('/api/agents', agentsRoutes)
+  // Agent Accounts A1 — self-serve signup
+  .route('/api/agent-signup', agentSignupRoutes)
+  // Agent Accounts A3 — concierge magic-link confirmation (public, no JWT)
+  .route('/api/concierge', conciergeRoutes)
+  // React Router v7 frontend session context (branding + user + deployment info)
+  .route('/api/session', sessionContextRoutes)
+  .route('/api/places', placesRoutes)
+  .route('/api/availability', availabilityRoutes)
+  // Mount /api/calendar/events BEFORE /api/calendar so the more-specific path takes precedence.
+  .route('/api/calendar/events', calendarEventsRoutes)
+  .route('/api/calendar', calendarRoutes)
+  .route('/api/schedule', scheduleWeekSummaryRoutes)
+  .route('/api/team', teamRoutes)
+  .route('/api/contacts', contactRoutes)
+  // Import sub-router — extracted to fix hono/client type-collapse (C-10)
+  .route('/api/contacts', contactsImportRoutes)
+  .route('/api/imports', migrationIntakeRoutes)
+  .route('/api/recommendations', recommendationsRoutes)
+  .route('/api/contractor-types', contractorTypesRoutes)
+  .route('/api/role-profiles', roleProfilesRoutes)
+  .route('/api/rating-systems', ratingSystemsRoutes)
+  .route('/api', eventsRoutes)
+  .route('/api/invoices', invoiceRoutes)
+  .route('/api/services', servicesRoutes)
+  .route('/api/automations', automationsRoutes)
+  .route('/api/message-templates', messageTemplateRoutes)
+  .route('/api/metrics', metricsRoutes)
+  .route('/api/audit', auditRoutes)
+  .route('/api/templates/marketplace', marketplaceRoutes)
+  .route('/api/data', dataRoutes)
+  .route('/api/ics', icsRoutes)
+  .route('/api/users', userRoutes)
+  // Lone cross-cutting messages summary: GET /api/messages/unread-count (sidebar
+  // badge). Per-inspection message routes live under /api/inspections or /api/public.
+  .route('/api/messages', messageRoutes)
+  .route('/api/notifications', notificationsRoutes)
+  .route('/api', notificationPreferenceRoutes)   // reader's own preferences (§4)
+  // Inbound webhooks mount at the TOP LEVEL, never under /api/: the producer
+  // owns the body schema, headers and signature, and none of the /api/*
+  // middleware applies — no CORS, no last-active touch, no idempotency guard
+  // (they dedupe via processed_webhook_events), and emphatically no
+  // subscription gate: a lapsed tenant is when a provider most needs delivery.
+  .route('/webhooks/quickbooks', qboWebhookRoutes)
+  // Browser-facing OAuth pair (/connect, /callback). The redirect_uri Intuit
+  // matches byte-for-byte comes from one constant; see lib/qbo-oauth-paths.ts.
+  .route(QBO_OAUTH_MOUNT, qboOauthRoutes)
+  // Management API, same prefix but AFTER the pair — its router-wide use('*')
+  // guards would else 401 Intuit's cookie-less /callback (qbo-api-mount.spec).
+  .route('/api/integrations/qbo', qboRoutes)
+  // :tenant is load-bearing — Stripe's verifier secret is per-tenant, so
+  // PUBLIC_PREFIXES must resolve it BEFORE the signature can be checked.
+  .route('/webhooks/stripe/:tenant', stripeWebhookRoutes)
+  .route('/webhooks/stripe', stripeWebhookRoutes)
+  // Track L (D9) — SMS inbound/status, compliance-status, email events.
+  .route('/webhooks', smsWebhookRoutes)
+  // Remote MCP OAuth — grant management API (self list/revoke + admin oversight).
+  // Mounted at /api/mcp so paths become /api/mcp/grants*.
+  .route('/api/mcp', mcpGrantsRoutes)
+  // Spec 5H — signed agreement render for Browser-Run PDF export (token-in-URL, no JWT).
+  .route('/m2m', agreementsRenderRoutes)
+  // Spec 5H — public key discovery for independent verification of tenant signing keys.
+  .route('/.well-known', wellKnownRoutes)
+  // Profile-gated setup wizard — 404s in saas modes (see features/setup-wizard).
+  .route('/setup', setupWizardRoutes())
+;
+
+// Mount the SaaS portal M2M integration routes (the one composition seam).
+// No-op surface for standalone. The worker entry 404s these in standalone
+// (APP_MODE ≠ saas).
+registerPortalIntegration(app);
+
+// OpenAPI Documentation
+//
+// ⚠️ NOT `app.doc()`. That registers a handler which rebuilds the whole document
+// on EVERY request, walking every route on this app and running every Zod schema
+// through the converter. Measured in production over 24h: `GET /doc` averaged
+// **999.5ms of CPU** with a max of 1022ms — ten times the next most expensive
+// endpoint, and about a hundred times the median request.
+//
+// Two reasons that matters more than its two hits a day suggest. The worker runs
+// on a plan whose CPU ceiling is 10ms per invocation, so this single endpoint is
+// a hundred times over it. And it is PUBLIC and unauthenticated: one second of
+// CPU per request, repeatable by anyone, is a denial-of-service primitive
+// pointed at the whole worker rather than a slow page.
+//
+// The document is a pure function of the route table and the static config
+// below, both fixed at module load, so it cannot vary between requests of one
+// build. Generated once per isolate and reused.
+const OPENAPI_CONFIG = {
+    openapi: '3.0.0',
+    info: {
+        version: '1.0.0-rc.1',
+        title: 'OpenInspection Core API',
+        description: 'Advanced property inspection platform API documentation.'
+    },
+} as const;
+
+// The memoization does not bound the attack above: `??=` makes a WARM isolate
+// cheap and the lever is arranging for COLD ones. Hence two more, neither enough
+// alone — an IP-keyed limiter does nothing distributed, a cache header is walked
+// past by a cache-busting query, and only the header helps a cold isolate (by
+// never reaching it). Ordering and rationale: openapi-doc-cost.spec.ts.
+// ⚠️ Requiring auth, or dropping this outside standalone, is NOT done here —
+// both change WHO may read the API surface, which is a product call.
+let openApiDocument: ReturnType<typeof app.getOpenAPIDocument> | undefined;
+app.get('/doc', async (c) => {
+    // Before the build. Refusing after it pays the CPU, then withholds it.
+    await checkRateLimit(c, 'openapi-doc');
+    openApiDocument ??= app.getOpenAPIDocument(OPENAPI_CONFIG);
+    c.header('Cache-Control', 'public, max-age=3600');
+    return c.json(openApiDocument);
+});
+
+
+// Swagger UI moved to a React Router route (GET /ui -> app/routes/docs.tsx) so hono
+// renders no browser pages. The OpenAPI document is still served here at /doc above.
+
+// ---------- SSR page handlers removed — React Router v7 frontend serves all HTML pages ----------
+
+// Booking #7 Sprint C-2 — busy-only iCal feed. Subscribers (partner agents,
+// the inspector's own personal calendar) see opaque "Busy" blocks with no
+// addresses, client names, or emails. Cancelled inspections drop out so
+// freed slots become bookable again.
+//
+// PR 2 T9: path carries the tenant slug because the path-tenant resolver
+// (T1) eats the first segment after /inspector/. Without :tenant the
+// resolver would treat the inspector slug as the tenant in shared/silo
+// modes. Standalone deploys would still work via fixed-tenant fallback,
+// but the unified shape applies across all modes.
+app.get('/inspector/:tenant/:slug/calendar.ics', async (c) => {
+    const slug = c.req.param('slug');
+    const tenantSlugFromPath = c.req.param('tenant');
+    const tenantId = c.get('resolvedTenantId') || c.get('tenantId');
+    // Tenant slug from path must match what tenant-router resolved.
+    // The middleware only sets resolvedTenantId on a successful match,
+    // so an unresolved path tenant manifests as a 404 here.
+    if (!tenantId || c.get('requestedTenantSlug') !== tenantSlugFromPath) {
+        return c.text('Not found', 404);
+    }
+    const ics = await c.var.services.ics.busyFeedForInspector(tenantId, slug);
+    return new Response(ics, {
+        status: 200,
+        headers: {
+            'Content-Type': 'text/calendar; charset=utf-8',
+            'Cache-Control': 'public, max-age=300',
+            'Content-Disposition': `inline; filename="${slug}-busy.ics"`,
+        },
+    });
+});
+
+// Sprint 1 C-2 — friendly redirects for token-less agreement / report links.
+// Inspectors and customers occasionally type or share the bare path; without
+// these handlers the request would fall through to the generic Hono 404.
+app.get('/agreement-sign', (c) => c.redirect('/not-found?from=agreement-sign', 302));
+app.get('/agreements/sign', (c) => c.redirect('/not-found?from=agreement-sign', 302));
+
+// iter-2 production bug #9 — `/sign/:id` redirect target for the
+// ReportGatePage "Sign agreement" CTA. Sprint 1 D-7 minted the URL
+// `${baseUrl}/sign/${id}` with id = inspection id, but no route was
+// registered, so the customer who hit the gate landed on a 404.
+//
+// Resolves the inspection's most recent non-terminal agreement request
+// and 302s to the canonical token-gated page `/agreements/sign/:token`.
+// When no live request exists (every row is signed / declined / expired
+// / never created), redirects to the friendly not-found page so the
+// customer at least sees branded copy instead of the bare 404.
+//
+// Public — no JWT required. tenantId resolves from the slug via
+// tenantRouter middleware (`resolvedTenantId`), the same way the public
+// `/report/:id` viewer is scoped.
+app.get('/sign/:tenant/:id', async (c) => {
+    const id = c.req.param('id') as string;
+    const tenantSlugFromPath = c.req.param('tenant');
+    const tenantId = c.get('resolvedTenantId') || c.get('tenantId');
+    // Tenant slug from path must match what tenant-router resolved.
+    // The middleware only sets resolvedTenantId on a successful match,
+    // so an unresolved path tenant manifests as a 404 here. Use the
+    // friendly not-found page to match the rest of this handler's
+    // failure modes (token miss / no live request).
+    if (!tenantId || c.get('requestedTenantSlug') !== tenantSlugFromPath) {
+        return c.redirect('/not-found?from=agreement-sign', 302);
+    }
+
+    try {
+        const pending = await c.var.services.agreement.findPendingByInspectionId(tenantId as string, id);
+        if (pending) {
+            // The signer's real tier-2 link is the ONLY thing worth redirecting
+            // to; the service is DI-constructed with the JWT secret so it can
+            // reconstruct the sealed token server-side. The old fallback to the
+            // envelope's own `token` column is gone with the plaintext lookup
+            // that resolved it — it could now only send a customer to a 404, and
+            // no link beats a broken one.
+            const signerLink = await c.var.services.agreement.getFirstOutstandingSignerLink(tenantId as string, id);
+            if (signerLink) {
+                return c.redirect(agreementSignPath(tenantSlugFromPath as string, signerLink), 302);
+            }
+        }
+    } catch (e) {
+        logger.warn('sign-redirect: lookup failed', { inspectionId: id.slice(0, 8), error: (e as Error).message });
+    }
+    return c.redirect('/not-found?from=agreement-sign', 302);
+});
+
+// Spec 5H P2 — Public verifier (no-auth, court-friendly). The base JSON route
+// `GET /api/public/verify/:envelopeId` is now the typed route in
+// server/api/public-report.ts; these siblings stay raw (not consumed via hc).
+// `loadVerifyData` moved to server/lib/verify-data.ts.
+app.get('/api/public/verify/:envelopeId/public-key', async (c) => {
+    const envelopeId = c.req.param('envelopeId') as string;
+    const data = await loadVerifyData(c, envelopeId);
+    if (!data || !data.pubKey) return c.text('Not found', 404);
+    c.header('Content-Type', 'application/x-pem-file');
+    c.header('Content-Disposition', `attachment; filename="pubkey-${envelopeId.slice(0, 8)}.pem"`);
+    return c.body(data.pubKeyPem);
+});
+
+// Spec 5H D-patch — view the signed document.
+//
+// Redirects to the renderer, which is keyed by the envelope's requestId. It
+// used to redirect to /agreements/sign/{token} built from the envelope-level
+// `token` column, and that stopped working when envelope lookup went hash-only:
+// nothing resolves that value any more, so the reader followed a verification
+// link and landed on a 404. The rest of the codebase had already moved to the
+// requestId-keyed renderer; this route was the one that had not.
+app.get('/api/public/verify/:envelopeId/document', async (c) => {
+    const envelopeId = c.req.param('envelopeId') as string;
+    const data = await loadVerifyData(c, envelopeId);
+    if (!data) return c.text('Not found', 404);
+    return c.redirect(agreementRenderPath(data.tenantSlug, data.reqRow.id), 302);
+});
+
+app.get('/api/public/verify-by-token/:token', async (c) => {
+    const token = c.req.param('token') as string;
+    const db = drizzle(c.env.DB, { schema });
+    const row = await db.select({ id: schema.agreementRequests.id })
+        .from(schema.agreementRequests)
+        .where(eq(schema.agreementRequests.verificationToken, token))
+        .get();
+    if (!row) return c.json({ success: false, error: { message: 'Not found', code: 'NOT_FOUND' } }, 404);
+    return c.json({ success: true, data: { envelopeId: row.id } });
+});
+
+app.get('/api/public/verify/:envelopeId/audit-trail', async (c) => {
+    const envelopeId = c.req.param('envelopeId') as string;
+    const data = await loadVerifyData(c, envelopeId);
+    if (!data) return c.json({ error: 'Not found' }, 404);
+    const payload = {
+        envelopeId,
+        algorithm: 'Ed25519',
+        publicKeyPem: data.pubKey?.pem ?? null,
+        keyFingerprint: data.pubKey?.fingerprint ?? null,
+        events: data.auditRows.map((r) => ({
+            id: r.id, event: r.event, createdAt: r.createdAt,
+            payloadJson: r.payloadJson, prevHash: r.prevHash,
+            hash: r.hash, signature: r.signature, keyFingerprint: r.keyFingerprint,
+        })),
+        chainValid: data.verify.valid,
+        exportedAt: new Date().toISOString(),
+    };
+    c.header('Content-Type', 'application/json');
+    c.header('Content-Disposition', `attachment; filename="audit-${envelopeId.slice(0, 8)}.json"`);
+    return c.body(JSON.stringify(payload, null, 2));
+});
+
+app.get('/', (c) => c.redirect('/inspections'));
+
+// Global catch-all 404. API requests get JSON; everything else gets plain text
+// (the React Router v7 frontend handles HTML 404 rendering).
+app.notFound((c) => {
+    const url = new URL(c.req.url);
+    if (url.pathname.startsWith('/api/')) {
+        return c.json({ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } }, 404);
+    }
+    return c.text('Not found', 404);
+});
+
+// CF Workers ESM expects { fetch, scheduled } on the default export.
+// Named exports of `scheduled` aren't recognized by the runtime —
+// without this `Handler does not export a scheduled() function` fires
+// on every cron tick and the automation flush never runs.
+import { scheduled as baseScheduled } from './scheduled';
+import { queue as queueConsumer } from './queue';
+export default {
+    fetch: app.fetch.bind(app),
+    scheduled: async (event: ScheduledEvent, env: HonoConfig['Bindings'], ctx: ExecutionContext) => {
+        await baseScheduled(event, env, ctx);
+    },
+    // Queue consumers: the Word export queue (`openinspection-word-export`,
+    // Commercial PCA Phase W — async .docx build), the cron queue
+    // (`openinspection-cron`, one background job per message), the cmd queue
+    // (`inspectorhub-cmd-saas`, portal→core commands — A-21), and the sync DLQ
+    // (`inspectorhub-sync-dlq-saas`, dead core→portal envelopes → outbox
+    // `failed` writeback). Never throws.
+    //
+    // The body moved to `./queue` so `workers/app.ts` can reach it without
+    // evaluating this module (and with it every route). This export stays so
+    // the default export keeps its full shape for any other consumer.
+    queue: queueConsumer,
+};
+export { SignCompletionWorkflow } from './workflows/sign-completion-workflow';
+
+// Design System 0520 subsystem B phase 2 — presence Durable Objects.
+// wrangler needs them re-exported from the entrypoint so it can discover
+// the class names referenced by [[durable_objects.bindings]] in wrangler.jsonc.
+export { InspectionPresenceDO } from './durable-objects/inspection-presence';
+export { TenantPresenceDO     } from './durable-objects/tenant-presence';
+export { InspectionDocDO      } from './durable-objects/inspection-doc';
+
+// Exported for the route-metadata vitest gate; OpenAPIHono.getOpenAPIDocument()
+// inspects the doc without needing a live request.
+export { app };
+
+// React Router v7 migration — typed RPC client for the frontend React Router v7 app.
+// `routes` carries the accumulated path schemas from all chained `.route()`
+// calls. Currently the sub-routers use void `.openapi()` calls (not chained),
+// so request/response types are blank. Once sub-routers also chain their
+// `.openapi()` calls, `hc<CoreApiType>()` will provide full type inference.
+//
+// Known limitation: TypeScript can't verify that the deeply nested
+// `OpenAPIHono<E, S_merged, B>` satisfies `Hono<any,any,any>` when S_merged
+// has 40+ intersected MergeSchemaPath entries. The frontend uses `as any` to
+// bridge this constraint until sub-router types are individually chained.
+export type CoreApiType = typeof routes;

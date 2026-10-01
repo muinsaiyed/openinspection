@@ -1,0 +1,104 @@
+/**
+ * URL builders for tenant-scoped public routes. Uniform shape across
+ * standalone / saas-shared / saas-silo: /<prefix>/<tenant>/<slug-or-id>.
+ *
+ * Caller supplies the host. For request-relative links use
+ *   c.req.header('host') with deriveBaseUrl(c)
+ * For canonical links (emails / PDFs) use env.APP_BASE_URL.
+ */
+import { signRenderToken } from './render-token';
+
+function scheme(host: string): string {
+    return host.startsWith('localhost') || host.startsWith('127.0.0.1') ? 'http' : 'https';
+}
+
+function joinUrl(host: string, path: string): string {
+    return `${scheme(host)}://${host}${path}`;
+}
+
+// The company booking page is the only public booking URL form. Per-inspector
+// deep links (`/book/<tenant>/<slug>` and `/embed/<tenant>/<slug>`) are retired;
+// inspector-shared links point at the company page and the server auto-assigns.
+
+/** Company-level embed — no inspector slug required. */
+export function embedBookingCompanyUrl(host: string, tenantSlug: string): string {
+    return joinUrl(host, `/embed/${tenantSlug}`);
+}
+
+export function reportUrl(host: string, tenantSlug: string, inspectionId: string): string {
+    // Canonical published-report renderer is `/report-view/` (report-card-stack):
+    // the maintained, repair-item-aware view that matches the current
+    // getReportData shape. The legacy `/report/` route now 302-redirects here
+    // (preserving ?token=/?view=), so older emails + the PDF pipeline still work.
+    return joinUrl(host, `/report-view/${tenantSlug}/${inspectionId}`);
+}
+
+/**
+ * Report URL for HEADLESS rendering: carries a short-TTL render token so the
+ * cookieless browser can load real report data + photos. Use for the PDF
+ * pipeline + email attachment generation + on-demand download; never for links
+ * sent to humans (render tokens are server-internal and short-lived).
+ */
+export async function buildRenderReportUrl(
+    host: string, tenantSlug: string, inspectionId: string, secret: string,
+    versionNumber?: number,
+): Promise<string> {
+    const base = reportUrl(host, tenantSlug, inspectionId); // no query
+    // `versionNumber` names a PUBLISHED version, and the page then renders that
+    // version's snapshot instead of live tables. It travels inside the signed
+    // render token, never as a query param — see render-token.ts.
+    const token = await signRenderToken(inspectionId, secret, undefined, versionNumber);
+    return `${base}?render=${encodeURIComponent(token)}`;
+}
+
+/**
+ * Public invoice payment page (Task 8 / #111). Unlike report/sign links this
+ * route is keyed only by inspection id (`/invoice/:id`) — the public payment
+ * page resolves the tenant itself — so no slug segment is required.
+ *
+ * IA-34 — the id is an identifier, not a credential: the invoice + pay-intent
+ * endpoints behind this page require a live client/co_client grant. Callers
+ * MUST pass the recipient's persistent portal token (PortalAccessService
+ * .issueToken, idempotent per (inspection, recipient)) so the emailed link
+ * authenticates its own recipient.
+ */
+export function paymentUrl(host: string, inspectionId: string, token?: string): string {
+    const query = token ? `?token=${encodeURIComponent(token)}` : '';
+    return joinUrl(host, `/invoice/${inspectionId}${query}`);
+}
+
+export function signUrl(host: string, tenantSlug: string, inspectionId: string): string {
+    return joinUrl(host, `/sign/${tenantSlug}/${inspectionId}`);
+}
+
+export function agreementSignUrl(host: string, tenantSlug: string, token: string): string {
+    return joinUrl(host, `/agreements/sign/${tenantSlug}/${token}`);
+}
+
+export function agreementSignPath(tenantSlug: string, token: string): string {
+    return `/agreements/sign/${tenantSlug}/${token}`;
+}
+
+/**
+ * Track I-a Task 8 — combined Sign & pay link. Used in agreement-request
+ * emails when the inspection requires payment AND has an outstanding invoice;
+ * otherwise the standalone agreementSignUrl is used.
+ */
+export function checkoutUrl(host: string, tenantSlug: string, token: string): string {
+    return joinUrl(host, `/checkout/${tenantSlug}/${token}`);
+}
+
+/**
+ * Track I-a — keyed by the stable envelope requestId. Signer tokens live
+ * per-signer; the envelope never had a distributable one of its own.
+ *
+ * Path form, for anything a browser follows. Absolute URLs are for mail.
+ */
+export function agreementRenderPath(tenantSlug: string, requestId: string): string {
+    return `/m2m/agreement-render/${tenantSlug}/${requestId}`;
+}
+
+/** Absolute form of {@link agreementRenderPath}, for Browser Rendering and mail. */
+export function m2mAgreementRenderUrl(host: string, tenantSlug: string, requestId: string): string {
+    return joinUrl(host, agreementRenderPath(tenantSlug, requestId));
+}

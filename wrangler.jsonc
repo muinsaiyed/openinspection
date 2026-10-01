@@ -1,0 +1,121 @@
+{
+  // Committed STANDALONE config with PLACEHOLDER ids — the public OSS default and
+  // the "Deploy to Cloudflare" one-click target. Cloudflare auto-provisions the D1 /
+  // KV / R2 resources and injects real ids at deploy time, so no real account ids
+  // live in the repo. For local dev / your own remote deploy, `scripts/setup-cloudflare.js`
+  // writes a gitignored `wrangler.local.jsonc` with real ids (the build prefers it).
+  // SaaS mode uses a separate gitignored `wrangler.saas.jsonc`.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openinspection",
+  "main": "./workers/app.ts",
+  "compatibility_date": "2026-05-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./build/client", "binding": "ASSETS" },
+  "observability": { "enabled": true },
+  "upload_source_maps": true,
+  // Drives the scheduled() handler. Three expressions, not one:
+  //   */5 * * * *  the main tick — probes each job and enqueues the ones with
+  //                work onto CRON_QUEUE. It runs no job body itself.
+  //   0 3 * * *    daily R2 usage measurement.
+  //   0 4 * * *    daily log-retention sweep + intake expiry reminders.
+  // The two daily jobs used to ride the */5 tick behind a `getUTCHours()`
+  // guard, at the end of a thirteen-job serial chain — one qualifying tick a
+  // day, in the position an overrun cuts off first. Their own expressions give
+  // them their own invocations. SaaS mirrors this in wrangler.saas.jsonc.
+  "triggers": { "crons": ["*/5 * * * *", "0 3 * * *", "0 4 * * *"] },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "APP_MODE": "standalone",
+    "TURNSTILE_SITE_KEY": "1x00000000000000000000AA",
+    "SINGLE_TENANT_ID": "00000000-0000-0000-0000-000000000000",
+    "JWT_CURRENT_KID": "v1"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "openinspection-db",
+      "database_id": "098a8421-37ee-4c57-9892-d8b15ee56e1d",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    { "binding": "TENANT_CACHE", "id": "b0650b46b51242e5943c3f47faec616a" },
+    // OAUTH_KV: hardcoded binding name required by @cloudflare/workers-oauth-provider.
+    // Placeholder id — replaced by a real provisioned KV id in wrangler.local.jsonc / wrangler.saas.jsonc.
+    { "binding": "OAUTH_KV", "id": "aa10627ca65b4b789dcdd73f1fc75f7f" }
+  ],
+  "r2_buckets": [
+    { "binding": "PHOTOS", "bucket_name": "openinspection-photos","preview_bucket_name": "openinspection-photos" }
+  ],
+  // Commercial PCA Phase W — async .docx export. Unlike the SaaS-only cmd/sync
+  // queues (which live solely in the gitignored wrangler.saas.jsonc, since
+  // they carry portal<->core traffic that doesn't exist standalone), Word
+  // export is a standalone + one-click feature, so its producer AND consumer
+  // are committed here. A SaaS deploy adds a second `*-saas`-named
+  // producer/consumer pair to wrangler.saas.jsonc (not committed).
+  //
+  // The cron queue is committed here for the same reason: background jobs are
+  // not a SaaS feature, and a standalone deployment with no consumer would run
+  // no background work at all.
+  "queues": {
+    "producers": [
+      { "queue": "openinspection-word-export", "binding": "WORD_EXPORT_QUEUE" },
+      { "queue": "openinspection-cron", "binding": "CRON_QUEUE" }
+    ],
+    "consumers": [
+      { "queue": "openinspection-word-export", "max_batch_size": 1, "max_retries": 3 },
+      // One message per invocation, deliberately: batching would hand several
+      // jobs a single shared CPU budget, which is precisely what this queue
+      // exists to avoid.
+      { "queue": "openinspection-cron", "max_batch_size": 1, "max_retries": 3, "retry_delay": 30 }
+    ]
+  },
+  "browser": { "binding": "BROWSER" },
+  // Cloudflare Stream — video walk-through storage (Media Studio, Plan 7).
+  // No resource id: Stream is account-scoped; the binding is name-only. A real
+  // deploy must mirror this into the gitignored wrangler.local.jsonc /
+  // wrangler.saas.jsonc and set STREAM_CUSTOMER_SUBDOMAIN (no hardcoded fallback).
+  "stream": { "binding": "STREAM" },
+  // Cloudflare Images binding — used by the Word-export queue consumer to
+  // downscale Appendix B photos before embedding them in the .docx, so a large
+  // report stays well under the isolate memory limit (see
+  // server/services/report-export-consumer.ts). Account-scoped name-only binding
+  // like STREAM above: on an account without Images Transformations enabled the
+  // deploy still succeeds and env.IMAGES is simply unset at runtime — the
+  // consumer then falls back to a hard byte budget (photos beyond the budget are
+  // omitted) so it never OOMs. Enable Images > Transformations in the dashboard
+  // (Free plan includes 5,000 transformations/month) to get downscaled exports.
+  "images": { "binding": "IMAGES" },
+  "workflows": [
+    {
+      "binding": "SIGN_COMPLETION_WORKFLOW",
+      "name": "sign-completion-workflow",
+      "class_name": "SignCompletionWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "INSPECTION_PRESENCE", "class_name": "InspectionPresenceDO" },
+      { "name": "TENANT_PRESENCE", "class_name": "TenantPresenceDO" },
+      { "name": "INSPECTION_DOC", "class_name": "InspectionDocDO" },
+      // Remote MCP server DO. Binding name overrides McpAgent's default MCP_OBJECT
+      // (see Task A3 where McpAgent.serve() receives { binding: 'INSPECTOR_MCP' }).
+      { "name": "INSPECTOR_MCP", "class_name": "InspectorMcp" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["InspectionPresenceDO", "TenantPresenceDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["InspectionDocDO"] },
+    { "tag": "v3", "new_sqlite_classes": ["InspectorMcp"] }
+  ],
+  "unsafe": {
+    "bindings": [
+      {
+        "type": "ratelimit",
+        "name": "RATE_LIMITER",
+        "namespace_id": "1001",
+        "simple": { "limit": 10, "period": 60 }
+      }
+    ]
+  }
+}

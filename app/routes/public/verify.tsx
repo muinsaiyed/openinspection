@@ -1,0 +1,243 @@
+import { useLoaderData } from "react-router";
+import type { Route } from "./+types/verify";
+import { createApi } from "~/lib/api-client.server";
+import { formatDateTime } from "~/lib/format";
+import { SanitizedHtml } from "~/components/SanitizedHtml";
+import { AgreementLanguageDisclosure } from "~/components/agreements/AgreementLanguageDisclosure";
+import { ViewerTimeZoneProvider, useViewerTimeZone } from "~/lib/viewer-timezone";
+import { LazyViewerTimeZoneNotice } from "~/components/public/LazyViewerTimeZoneNotice";
+import { m } from "~/paraglide/messages";
+
+export function meta() {
+  return [{ title: m.public_verify_meta_title() }];
+}
+
+interface VerifySigner {
+  name: string;
+  role: string;
+  status: string;
+  signedAt: string | null;
+  channel: string | null;
+}
+
+interface VerifyData {
+  envelopeId: string;
+  documentTitle: string | null;
+  clientName: string | null;
+  chainValid: boolean;
+  chainReason: string | null;
+  keyFingerprint: string | null;
+  keyAlgorithm: string;
+  eventCount: number;
+  // Track I-a — the pinned snapshot ("what was signed") + per-signer roster.
+  contentSnapshot: string | null;
+  contentHash: string | null;
+  signers: VerifySigner[];
+  // Server-decided: every signature here recorded the language-disclosure
+  // version that is live now, so this page may show that copy beside the
+  // snapshot as part of what these signers were shown. False on a pre-feature
+  // signature and on any surface the platform did not draw — the page then says
+  // nothing rather than showing today's words against an older signature.
+  languageDisclosureCurrent: boolean;
+}
+
+export async function loader({ params, context }: Route.LoaderArgs) {
+  try {
+    const api = createApi(context);
+    const res = await api.publicReport.verify[":envelopeId"].$get({
+      param: { envelopeId: params.envelopeId ?? "" },
+    });
+    const body = res.ok ? await res.json() : {};
+    const d = ((body as Record<string, unknown>).data ?? {}) as Record<string, unknown>;
+    const result = (Object.keys(d).length > 0 ? d : null) as VerifyData | null;
+    // Signer timestamps stay raw ISO here: this public verify link carries no
+    // tenant slug and no session, so there is no configured zone to anchor to.
+    // The page renders each timestamp in the viewer's own browser zone below.
+    return {
+      result,
+      error: res.ok ? null : m.public_verify_error_failed(),
+    };
+  } catch {
+    return { result: null, error: m.public_verify_error_unavailable() };
+  }
+}
+
+const roleLabel = (role: string): string => {
+  switch (role) {
+    case "client":
+      return m.public_verify_role_client();
+    case "co_client":
+      return m.public_verify_role_co_client();
+    case "agent":
+      return m.public_verify_role_agent();
+    default:
+      return m.public_verify_role_signer();
+  }
+};
+
+function StatusChip({ status }: { status: string }) {
+  const tone =
+    status === "signed"
+      ? "bg-ih-ok-bg text-ih-ok-fg"
+      : status === "declined" || status === "expired"
+        ? "bg-ih-bad-bg text-ih-bad-fg"
+        : "bg-ih-bg-muted text-ih-fg-3";
+  return (
+    <span
+      className={`inline-block rounded-full px-2 py-0.5 text-[11px] font-medium capitalize ${tone}`}
+    >
+      {status}
+    </span>
+  );
+}
+
+function VerifyBody() {
+  const { result, error } = useLoaderData<typeof loader>();
+  const tz = useViewerTimeZone();
+
+  if (error || !result) {
+    return (
+      <div className="p-8 text-center">
+        <h1 className="text-2xl font-bold">{m.public_verify_failed_heading()}</h1>
+        <p className="text-ih-fg-3 mt-2">
+          {error ?? m.public_verify_failed_fallback()}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-xl mx-auto p-6">
+      {/* Verification result */}
+      <div
+        className={`p-4 rounded-lg text-center mb-6 ${
+          result.chainValid
+            ? "bg-ih-ok-bg text-ih-ok-fg"
+            : "bg-ih-bad-bg text-ih-bad-fg"
+        }`}
+      >
+        <p className="text-lg font-bold">
+          {result.chainValid ? m.public_verify_result_valid() : m.public_verify_result_invalid()}
+        </p>
+        <p className="text-[13px] mt-1">
+          {result.documentTitle ?? m.public_verify_document_fallback()}
+          {result.clientName ? m.public_verify_for_client({ name: result.clientName }) : ""}
+        </p>
+        {/* The heading alone cannot carry this. The verification-copy policy:
+            a verification surface may state what the check established and no
+            more, and a failure must be attributed to the check rather than to
+            the signature or the signer — calling a real person's signature
+            "invalid" because OUR check could not complete is a statement against
+            their interest. The key-change case that once illustrated this is now
+            handled upstream: `verifyChain` reports `key_mismatch` rather than
+            `signature`, and rotation is unsupported by design. The rule stands
+            for every other reason a check can fail. */}
+        {/* No opacity here. Dimming this to 90% put it at 4.22:1 on the dark
+            failure background — under AA, and `lint:contrast` cannot see it
+            because it checks token pairs and not what an opacity composites to.
+            This is the sentence that stops a failed check reading as a verdict
+            on the signer; it does not get to be the faintest text on the page. */}
+        <p className="text-[12px] mt-2 text-left">
+          {result.chainValid
+            ? m.public_verify_result_valid_detail()
+            : m.public_verify_result_invalid_detail()}
+        </p>
+      </div>
+
+      {/* What was signed — pinned content snapshot */}
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-ih-fg-3 mb-3">
+        {m.public_verify_section_signed()}
+      </h2>
+      {result.contentSnapshot === null ? (
+        <div className="rounded-lg border border-ih-border bg-ih-bg-muted p-4 text-[13px] text-ih-fg-2 mb-6">
+          {m.public_verify_snapshot_unavailable()}
+        </div>
+      ) : (
+        <SanitizedHtml
+          // `ih-agreement-prose` — `prose prose-sm` matched no rule here
+          // (@tailwindcss/typography is not installed). This box shows the
+          // exact snapshot that was signed, so it above all must render the
+          // document's structure rather than flatten it.
+          className="ih-agreement-prose max-w-none rounded-lg border border-ih-border bg-ih-bg-card p-4 text-[13px] text-ih-fg-2 leading-relaxed mb-6"
+          html={result.contentSnapshot}
+        />
+      )}
+
+      {/* Outside the snapshot box, never inside it: that box is the string the
+          content hash is taken over, and this is the platform speaking about the
+          document rather than a term of it. Shown only when every signature on
+          this envelope recorded the version of the copy that is live now. */}
+      {result.languageDisclosureCurrent && (
+        <AgreementLanguageDisclosure className="rounded-lg border border-ih-border mb-6" />
+      )}
+
+      {/* Signers */}
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-ih-fg-3 mb-3">
+        {m.public_verify_section_signers()}
+      </h2>
+      <div className="space-y-2 mb-6">
+        {result.signers.length === 0 ? (
+          <p className="text-[13px] text-ih-fg-3">{m.public_verify_no_signers()}</p>
+        ) : (
+          result.signers.map((s, i) => (
+            <div
+              key={i}
+              className="flex items-center justify-between gap-3 text-[13px] p-3 rounded-lg border border-ih-border"
+            >
+              <div>
+                <p className="font-medium">
+                  {s.name}
+                  <span className="text-ih-fg-3 font-normal">
+                    {" "}
+                    · {roleLabel(s.role)}
+                  </span>
+                </p>
+                <p className="text-[11px] text-ih-fg-3">
+                  {s.signedAt
+                    ? m.public_verify_signed_at({
+                        signedAt: formatDateTime(s.signedAt, { locale: "en-US", timeZone: tz }),
+                      })
+                    : m.public_verify_not_signed()}
+                  {s.channel === "in_person" ? m.public_verify_channel_in_person() : ""}
+                </p>
+              </div>
+              <StatusChip status={s.status} />
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Chain summary */}
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-ih-fg-3 mb-3">
+        {m.public_verify_section_audit()}
+      </h2>
+      <div className="text-[13px] p-3 rounded-lg border border-ih-border space-y-1">
+        <p>
+          <span className="text-ih-fg-3">{m.public_verify_events_label()}</span> {result.eventCount}
+        </p>
+        <p>
+          <span className="text-ih-fg-3">{m.public_verify_algorithm_label()}</span> {result.keyAlgorithm}
+        </p>
+        {result.keyFingerprint && (
+          <p className="break-all">
+            <span className="text-ih-fg-3">{m.public_verify_fingerprint_label()}</span>{" "}
+            <code className="text-[11px]">{result.keyFingerprint}</code>
+          </p>
+        )}
+        {!result.chainValid && result.chainReason && (
+          <p className="text-ih-bad-fg">{result.chainReason}</p>
+        )}
+      </div>
+
+      {result.signers.some((s) => s.signedAt) && <LazyViewerTimeZoneNotice className="mt-4" />}
+    </div>
+  );
+}
+
+export default function VerifyPage() {
+  return (
+    <ViewerTimeZoneProvider>
+      <VerifyBody />
+    </ViewerTimeZoneProvider>
+  );
+}

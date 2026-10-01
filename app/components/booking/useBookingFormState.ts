@@ -1,0 +1,293 @@
+import { useState, useMemo, useRef, useEffect } from "react";
+import { useFetcher } from "react-router";
+import type { CompanyProfile } from "./booking-constants";
+import type { PublicAddressSuggestion } from "./PublicAddressAutocomplete";
+import { validateBookingDate } from "./booking-date-rules";
+import { resolveOrderDeposit } from "../../../server/lib/billing/deposit-policy";
+import { m } from "~/paraglide/messages";
+
+/** Where a returning visitor's own contact details are remembered (this device only). */
+const REMEMBERED_CONTACT_KEY = "oi.booking.contact";
+
+interface UseBookingFormStateArgs {
+  profile: CompanyProfile | null;
+  preselected: { id: string; name: string } | null;
+  tenant: string | undefined;
+  agentRefSlug: string | null;
+  /** Set when a signed-in agent is booking on behalf of a client. */
+  agentBooking?: { agentName: string; tenantId: string } | null;
+}
+
+export function useBookingFormState({ profile, preselected, tenant, agentRefSlug, agentBooking }: UseBookingFormStateArgs) {
+  const [step, setStep] = useState(0);
+
+  // Form state
+  const [address, setAddress] = useState("");
+  // The structured half of the address, set only when the visitor picks a
+  // suggestion. Null for a typed address — which is a real outcome the server
+  // reports, not a value to invent.
+  const [addressPick, setAddressPick] = useState<PublicAddressSuggestion | null>(null);
+  const [selectedServices, setSelectedServices] = useState<Set<string>>(new Set());
+  const [inspectionDate, setInspectionDate] = useState("");
+  const [timeWindow, setTimeWindow] = useState("morning");
+  const [customTime, setCustomTime] = useState("09:00");
+  const [clientName, setClientName] = useState("");
+  const [clientEmail, setClientEmail] = useState("");
+  // Track L (D6, path A) — unchecked-by-default SMS opt-in (TCPA consent).
+  const [smsOptin, setSmsOptin] = useState(false);
+  // The language the client asked to be addressed in. Starts null and is only
+  // ever set by them clicking an option: a default here would make every
+  // booking look like a stated preference.
+  const [locale, setLocale] = useState<string | null>(null);
+  const [chosenInspectorId, setChosenInspectorId] = useState<string | null>(preselected?.id ?? null);
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  /** Set once the booking exists — the capability the deposit-intent route keys on. */
+  const [bookedInspectionId, setBookedInspectionId] = useState<string | null>(null);
+  const turnstileRef = useRef<HTMLDivElement>(null);
+
+  // Repeat visitors re-typed their own name and email on every booking. Their
+  // OWN contact details are remembered on this device only — never the address
+  // or the services, which belong to one property, and never in an agent's
+  // booking, where the fields hold someone else's client.
+  const [prefilledFromDevice, setPrefilledFromDevice] = useState(false);
+  const rememberContact = !agentBooking;
+  useEffect(() => {
+    if (!rememberContact) return;
+    try {
+      const raw = localStorage.getItem(REMEMBERED_CONTACT_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw) as { name?: string; email?: string };
+      if (!saved.name && !saved.email) return;
+      setClientName((current) => current || saved.name || "");
+      setClientEmail((current) => current || saved.email || "");
+      setPrefilledFromDevice(true);
+    } catch {
+      // A malformed or blocked store just means no prefill.
+    }
+  }, [rememberContact]);
+
+  /** "Not you?" — a different person on a shared device starts clean. */
+  function clearRememberedContact() {
+    try {
+      localStorage.removeItem(REMEMBERED_CONTACT_KEY);
+    } catch {
+      // Nothing to do: the value was never readable in the first place.
+    }
+    setClientName("");
+    setClientEmail("");
+    setPrefilledFromDevice(false);
+  }
+
+  function saveRememberedContact() {
+    if (!rememberContact) return;
+    try {
+      localStorage.setItem(REMEMBERED_CONTACT_KEY, JSON.stringify({ name: clientName, email: clientEmail }));
+    } catch {
+      // Private mode / storage disabled — booking still succeeded.
+    }
+  }
+
+  const toggleService = (id: string) =>
+    setSelectedServices((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+
+  const totalPrice = useMemo(() => {
+    if (!profile) return 0;
+    return profile.services
+      .filter((s) => selectedServices.has(s.id))
+      .reduce((sum, s) => sum + s.price / 100, 0);
+  }, [selectedServices, profile]);
+
+  // A QUOTE of what will be asked for up front, from the same arithmetic the
+  // server runs. Shown before the client commits, because a charge discovered
+  // after clicking Book is a chargeback and a review. The authoritative figure
+  // comes back in the booking response and is what the payment step charges.
+  const depositQuoteCents = useMemo(() => {
+    if (!profile) return 0;
+    return resolveOrderDeposit({
+      tenant: profile.depositPolicy ?? null,
+      lines: profile.services
+        .filter((s) => selectedServices.has(s.id))
+        .map((s) => ({ priceCents: s.price, policy: s.depositPolicy ?? null })),
+    });
+  }, [selectedServices, profile]);
+
+  // What the SERVER froze, once the booking exists. Null until then; 0 means it
+  // asked for nothing, and the payment step is not rendered at all.
+  const [depositDueCents, setDepositDueCents] = useState<number | null>(null);
+
+  // An authenticated agent is not an anonymous visitor, so the bot challenge
+  // does not apply to them; every anonymous submit still faces it.
+  const needsTurnstile = !!profile?.turnstileSiteKey && !agentBooking;
+
+  /**
+   * F42 — why the chosen date cannot be submitted, or null.
+   *
+   * Recomputed on every render rather than stored: a value the visitor typed
+   * (which several browsers accept past `min`), a tab left open across midnight
+   * and a date pasted into the field all reach the same check this way. The
+   * server re-decides in the company's timezone; this is what stops the visitor
+   * filling in three more steps first.
+   */
+  const dateIssue = validateBookingDate(inspectionDate);
+  /** Set by the schedule step from `/api/public/slots`: nothing bookable that day. */
+  const [dateUnbookable, setDateUnbookable] = useState(false);
+
+  const canNext =
+    step === 0 ? address.length > 2 :
+    step === 1 ? selectedServices.size > 0 :
+    step === 2 ? inspectionDate.length > 0 && !dateIssue && !dateUnbookable
+      && clientName.length > 0 && clientEmail.length > 0 :
+    needsTurnstile ? !!turnstileToken : true;
+
+  /**
+   * F44 — what the total actually buys.
+   *
+   * The confirm step said `Services  1 selected` with `$450.00` on the next
+   * line, so the one number the client is agreeing to had no subject. The names
+   * come from the same catalogue rows the prices do.
+   */
+  const selectedServiceNames = useMemo(
+    () => (profile?.services ?? []).filter((s) => selectedServices.has(s.id)).map((s) => s.name),
+    [profile, selectedServices],
+  );
+
+  const inspectorOptions = useMemo(() => {
+    const base = profile?.allowInspectorChoice && profile.inspectors.length > 0 ? [...profile.inspectors] : [];
+    if (preselected && !base.some((i) => i.id === preselected.id)) {
+      base.push({ id: preselected.id, name: preselected.name, photoUrl: null });
+    }
+    return base;
+  }, [profile, preselected]);
+
+  const chosenInspectorName = useMemo(() => {
+    if (!chosenInspectorId) return m.helper_booking_inspector_first_available();
+    const found = inspectorOptions.find((i) => i.id === chosenInspectorId);
+    if (found) return found.name ?? m.helper_booking_inspector_default();
+    return m.helper_booking_inspector_default();
+  }, [chosenInspectorId, inspectorOptions]);
+
+  // The agent branch submits through the route action: the hold endpoint is
+  // authenticated and the session token never leaves the server side of this
+  // app. The anonymous branch keeps posting to the public endpoint directly.
+  const agentFetcher = useFetcher<{ ok?: boolean; error?: string }>();
+  useEffect(() => {
+    if (agentFetcher.state !== "idle" || !agentFetcher.data) return;
+    if (agentFetcher.data.ok) {
+      setMessage({ text: m.helper_booking_submit_success(), ok: true });
+      setStep(3);
+    } else {
+      setMessage({ text: agentFetcher.data.error || m.helper_booking_submit_error(), ok: false });
+    }
+  }, [agentFetcher.state, agentFetcher.data]);
+
+  function submitAgentHold() {
+    const fd = new FormData();
+    fd.append("_intent", "agent-book");
+    fd.append("address", address);
+    fd.append("date", inspectionDate);
+    fd.append("timeSlot", timeWindow === "custom" ? customTime : timeWindow);
+    if (chosenInspectorId) fd.append("inspectorId", chosenInspectorId);
+    for (const id of selectedServices) fd.append("serviceId", id);
+    fd.append("clientName", clientName);
+    fd.append("clientEmail", clientEmail);
+    agentFetcher.submit(fd, { method: "post" });
+  }
+
+  async function handleSubmit() {
+    if (agentBooking) {
+      submitAgentHold();
+      return;
+    }
+    setSubmitting(true);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/public/book`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tenant,
+          address,
+          // Sent only when a suggestion was picked. The server re-resolves the
+          // placeId through Places Details for the authoritative ZIP and the
+          // coordinates; the zip here is the client-side hint and the fallback
+          // when details cannot be reached.
+          ...(addressPick?.zip ? { addressZip: addressPick.zip } : {}),
+          ...(addressPick?.placeId ? { addressPlaceId: addressPick.placeId } : {}),
+          date: inspectionDate,
+          timeSlot: timeWindow === "custom" ? "custom" : timeWindow,
+          ...(timeWindow === "custom" ? { customTime } : {}),
+          ...(chosenInspectorId ? { inspectorId: chosenInspectorId } : {}),
+          services: [...selectedServices].map(id => ({ serviceId: id })),
+          clientName,
+          clientEmail,
+          ...(smsOptin ? { smsOptin: true } : {}),
+          // Omitted entirely when unanswered — the server stores NULL, which
+          // is not the same as storing 'en'.
+          ...(locale ? { locale } : {}),
+          ...(turnstileToken ? { turnstileToken } : {}),
+          ...(agentRefSlug ? { agentRefSlug } : {}),
+        }),
+      });
+      if (res.ok) {
+        saveRememberedContact();
+        const created = (await res.json().catch(() => ({}))) as {
+          data?: { inspectionId?: string; depositRequiredCents?: number };
+        };
+        setBookedInspectionId(created.data?.inspectionId ?? null);
+        setDepositDueCents(created.data?.depositRequiredCents ?? 0);
+        setMessage({ text: m.helper_booking_submit_success(), ok: true });
+        setStep(3);
+      } else {
+        const d = await res.json().catch(() => ({}));
+        setMessage({ text: (d as { error?: { message?: string } })?.error?.message || m.helper_booking_submit_error(), ok: false });
+      }
+    } catch {
+      setMessage({ text: m.helper_booking_network_error(), ok: false });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return {
+    step, setStep,
+    address, setAddress,
+    addressPick, setAddressPick,
+    selectedServices,
+    inspectionDate, setInspectionDate,
+    timeWindow, setTimeWindow,
+    customTime, setCustomTime,
+    clientName, setClientName,
+    clientEmail, setClientEmail,
+    smsOptin, setSmsOptin,
+    locale, setLocale,
+    chosenInspectorId, setChosenInspectorId,
+    submitting: submitting || agentFetcher.state === "submitting",
+    message,
+    turnstileToken, setTurnstileToken,
+    turnstileRef,
+    toggleService,
+    totalPrice,
+    depositQuoteCents,
+    depositDueCents,
+    bookedInspectionId,
+    currency: profile?.currency ?? "USD",
+    needsTurnstile,
+    canNext,
+    dateIssue,
+    dateUnbookable, setDateUnbookable,
+    selectedServiceNames,
+    inspectorOptions,
+    chosenInspectorName,
+    handleSubmit,
+    tenant,
+    prefilledFromDevice,
+    clearRememberedContact,
+    rememberContact,
+  };
+}

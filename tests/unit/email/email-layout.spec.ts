@@ -1,0 +1,84 @@
+import { describe, it, expect } from 'vitest';
+import { EmailLayout } from '../../../server/lib/email-templates/layout';
+
+const brand = { name: 'Acme Inspections', logoUrl: null, primaryColor: '#F55A1A' };
+
+describe('EmailLayout', () => {
+  it('renders heading + paragraphs + branded footer', () => {
+    const html = EmailLayout({ brand, heading: 'Report Ready', paragraphs: ['First line.', 'Second line.'] });
+    expect(html).toContain('Report Ready');
+    expect(html).toContain('First line.');
+    expect(html).toContain('Second line.');
+    expect(html).toContain('Acme Inspections');
+    expect(html.startsWith('<!DOCTYPE html>')).toBe(true);
+  });
+
+  it('drops a paragraph that resolved to nothing, rather than leaving a blank one', () => {
+    // A template block can be conditional in practice — `repair-request-share`
+    // carries the sender's optional note. Rendering `<p></p>` for the empty case
+    // leaves a visible gap, so the caller would have to build the block list
+    // dynamically and no template could ever declare an optional paragraph.
+    const withGap = EmailLayout({ brand, heading: 'H', paragraphs: ['Before.', '', '   ', 'After.'] });
+    expect(withGap).toContain('Before.');
+    expect(withGap).toContain('After.');
+    expect(withGap).not.toMatch(/<p[^>]*>\s*<\/p>/);
+  });
+
+  it('renders the CTA button with the primary color and url', () => {
+    const html = EmailLayout({ brand, heading: 'H', paragraphs: [], cta: { label: 'View Report', url: 'https://x/y' } });
+    expect(html).toContain('https://x/y');
+    expect(html).toContain('View Report');
+    expect(html).toContain('#F55A1A');
+  });
+
+  it('omits the CTA block when no cta given', () => {
+    const html = EmailLayout({ brand, heading: 'H', paragraphs: ['p'] });
+    expect(html).not.toContain('<a ');
+  });
+
+  it('renders a logo img when logoUrl is set, else the wordmark', () => {
+    const withLogo = EmailLayout({ brand: { ...brand, logoUrl: 'https://x/logo.png' }, heading: 'H', paragraphs: [] });
+    expect(withLogo).toContain('https://x/logo.png');
+  });
+
+  it('renders a system block (audit metadata) when provided', () => {
+    const html = EmailLayout({ brand, heading: 'H', paragraphs: [], systemHtml: '<div class="audit">Signed: now</div>' });
+    expect(html).toContain('Signed: now');
+  });
+
+  it('appends signatureHtml when provided', () => {
+    const html = EmailLayout({ brand, heading: 'H', paragraphs: [], signatureHtml: '<div>sig</div>' });
+    expect(html).toContain('<div>sig</div>');
+  });
+
+  it('escapes brand.name to prevent HTML injection', () => {
+    const html = EmailLayout({ brand: { name: '</span><script>x</script>', logoUrl: null, primaryColor: '#000' }, heading: 'H', paragraphs: [] });
+    expect(html).not.toContain('<script>x</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+});
+
+const sigBrand = { name: 'Acme', logoUrl: null, primaryColor: '#000' };
+const SIG = '<div id="sig">signature</div>';
+
+describe('EmailLayout — signature placement', () => {
+  it('auto-appends at the bottom when no token present', () => {
+    const html = EmailLayout({ brand: sigBrand, heading: 'Hi', paragraphs: ['Body text'], signatureHtml: SIG });
+    expect(html).toContain(SIG);
+    expect(html.indexOf(SIG)).toBeGreaterThan(html.indexOf('Body text'));
+  });
+  it('injects at the token position (own paragraph) and does NOT also bottom-append', () => {
+    const html = EmailLayout({ brand: sigBrand, heading: 'Hi', paragraphs: ['Intro', '{{signature}}', 'Outro'], signatureHtml: SIG });
+    expect(html.split(SIG).length - 1).toBe(1);
+    expect(html.indexOf(SIG)).toBeLessThan(html.indexOf('Outro'));
+    expect(html).not.toContain('{{signature}}');
+  });
+  it('renders the token paragraph raw (no <p> wrapper around the signature div)', () => {
+    const html = EmailLayout({ brand: sigBrand, heading: 'Hi', paragraphs: ['{{signature}}'], signatureHtml: SIG });
+    expect(html).not.toMatch(/<p[^>]*>\s*<div id="sig"/);
+  });
+  it('leaves the literal token when no signatureHtml is provided', () => {
+    const html = EmailLayout({ brand: sigBrand, heading: 'Hi', paragraphs: ['{{signature}}'] });
+    expect(html).toContain('{{signature}}');
+  });
+});

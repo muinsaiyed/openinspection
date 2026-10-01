@@ -1,0 +1,459 @@
+import type { Context, Next } from 'hono';
+import type { OAuthHelpers } from '@cloudflare/workers-oauth-provider';
+import type { HonoConfig, AppServices } from '../../types/hono';
+import { AdminService } from '../../services/admin.service';
+import { UnitService } from '../../services/unit.service';
+import { UnitSwitchService } from '../../services/unit-switch.service';
+import { ReportVersionService } from '../../services/report-version.service';
+import { buildTenantAiService } from '../ai/build-ai-service';
+import { resolveManagedAiCredential } from '../ai/managed-credential';
+import { AuthService } from '../../services/auth.service';
+import { OutboxService } from '../../portal/outbox.service';
+import { publishRow } from '../../portal/outbox.service';
+import { BookingService } from '../../services/booking.service';
+import { BrandingService } from '../../services/branding.service';
+import { LegalVersionService } from '../../services/legal-version.service';
+import { drizzle } from 'drizzle-orm/d1';
+import { assembleTenantEmailService, loadTenantEmailConfig, type LoadedEmailConfig } from '../email/build-email-service';
+import { InspectionService } from '../../services/inspection.service';
+import type { ImagesBinding } from '../media/strip-exif';
+import { PortalService } from '../../services/portal.service';
+import { TeamService } from '../../services/team.service';
+import { TemplateService } from '../../services/template.service';
+import { AgreementService } from '../../services/agreement.service';
+import { AvailabilityService } from '../../services/availability.service';
+import { ContactService } from '../../services/contact.service';
+import { InvoiceService } from '../../services/invoice.service';
+import { PortalAccessService } from '../../services/portal-access.service';
+import { PeopleService } from '../../services/people.service';
+import { ServiceService } from '../../services/service.service';
+import { AutomationService } from '../../services/automation.service';
+import { MarketplaceService } from '../../services/marketplace.service';
+import { MessageService } from '../../services/message.service';
+import { NotificationService } from '../../services/notification.service';
+import { WidgetService } from '../../services/widget.service';
+import { RecommendationService } from '../../services/recommendation.service';
+import { ContractorTypeService } from '../../services/contractor-type.service';
+import { CredentialService } from '../../services/credential.service';
+import { EventService } from '../../services/event.service';
+import { InspectionTypeService } from '../../services/inspection-type.service';
+import { TotpService } from '../../services/totp.service';
+import { TemplateSeedService } from '../../services/template-seed.service';
+import { ReportPdfService } from '../../services/report-pdf.service';
+import { ReportTranslationService } from '../../services/report-translation.service';
+import { ReportExportService } from '../../services/report-export.service';
+import { SigningKeyService } from '../../services/signing-key.service';
+import { AuditLogService } from '../../services/audit-log.service';
+import { ImportHistoryService } from '../../services/import-history.service';
+import { InspectionRequestService } from '../../services/inspection-request.service';
+import { RatingSystemService } from '../../services/rating-system.service';
+import { DashboardPrefsService } from '../../services/dashboard-prefs.service';
+import { TagService } from '../../services/tag.service';
+import { PropertyLookupService } from '../../services/property-lookup.service';
+import { UserService } from '../../services/user.service';
+import { IcsService } from '../../services/ics.service';
+import { AgentService } from '../../services/agent.service';
+import { ConciergeService } from '../../services/concierge.service';
+import { QBOService } from '../../services/qbo.service';
+import { IntegrationsService } from '../../services/integrations.service';
+import { AnalyticsService } from '../../services/analytics.service';
+import { RepairRequestService } from '../../services/repair-request.service';
+import { ClientDocumentService } from '../../services/client-document.service';
+import { ComplianceService } from '../../services/compliance/pca-compliance.service';
+import { StandaloneProvider } from '../integration/standalone';
+import { PortalProvider } from '../../portal/portal.provider';
+import { PlanQuotaGuard, readTenantPlan } from '../../features/plan-quota/guard';
+import type { TenantPlan } from '../../features/plan-quota/policy';
+import { tenantAiCapsLoader } from '../../features/plan-quota/ai-caps';
+import { memoOnce } from '../request-scope';
+
+/**
+ * Middleware that injects a lazy-loaded service registry into the Hono context.
+ * When env vars for email/AI are absent, falls back to AES-GCM-decrypted DB secrets.
+ *
+ * ORDERING (A-16): registered AFTER the JWT middleware. The tenant-scoped
+ * email/AI config below reads `c.get('tenantId')`, which the JWT middleware
+ * (authed API) or tenantRouter (standalone / public slug paths) sets — when
+ * this middleware ran first, the gate never opened and per-tenant email
+ * identity + Gemini BYOK silently fell back to platform defaults on every
+ * request. The profile/keyring bootstrap that earlier middlewares need lives
+ * in `contextBootstrap` now.
+ */
+export async function diMiddleware(c: Context<HonoConfig>, next: Next) {
+    const tenantId = c.get('tenantId');
+
+    // A-16 — one parallel batch (identity / brand / secrets / overrides)
+    // replacing four serial awaits. Only API requests consume these (email
+    // sends + AI), so page/asset requests skip the D1 reads entirely. The
+    // root-mounted auth duplicates (/forgot-password) send platform-branded
+    // mail by design, so the /api/ gate loses nothing there.
+    let emailCfg: LoadedEmailConfig = { dbSecrets: {} };
+    // The email free-tier pre-flight (below) needs the tenant's plan tier.
+    // `tenantTier` is only populated in session-context by the public/
+    // fixed-tenant tenant-routing resolvers (server/features/tenant-routing) —
+    // JWT-authenticated saas API requests never set it (see jwtAuthMiddleware
+    // in server/index.ts), so resolve it here once per request, under the same
+    // /api/ gate as emailCfg, whenever the usage-quota guard is active.
+    let tenantTierForQuota: string | undefined = c.get('tenantTier');
+    // The same row also answers the AI entitlement (`isPaidPlan` needs the
+    // status, not just the tier). Null wherever it was not read — a session
+    // tier carries no status, and null is deliberately NOT an entitlement.
+    let tenantPlan: TenantPlan | null = null;
+    if (tenantId && c.req.path.startsWith('/api/')) {
+        // Its own key, NOT the `secrets:` one — the shapes differ, so they
+        // cannot share an entry; see loadEmailSecrets for where the shared
+        // decrypt actually happens.
+        emailCfg = await memoOnce(c.env, `email-cfg:${tenantId}`, () => loadTenantEmailConfig(c.env, tenantId));
+        if (!tenantTierForQuota && c.var.profile.hasUsageQuota) {
+            tenantPlan = await memoOnce(c.env, `plan:${tenantId}`, () => readTenantPlan(c.env.DB, tenantId)).catch(() => null);
+            tenantTierForQuota = tenantPlan?.tier;
+        }
+    }
+
+    // One place decides own-vs-platform Resend + branded renderer, shared with
+    // non-request contexts (workflows/scheduled) via assembleTenantEmailService.
+    const buildEmailService = () => assembleTenantEmailService(c.env, emailCfg, c.get('tenantId'), buildPlanQuota(), tenantTierForQuota);
+
+    // Build the core->portal outbox sink, gated on the SYNC_QUEUE producer
+    // binding — the transport itself. No queue → no sink → append() no-ops:
+    // standalone never accumulates dead rows, and a misconfigured saas deploy
+    // (queue binding missing) fails loudly-by-absence instead of silently
+    // queueing rows nothing will ever publish. (The portal Service Binding was
+    // retired after the queue migration — the old drain POST was its last
+    // functional use; saas-mode detection now reads APP_MODE.)
+    // On every append() the freshly-inserted row is pushed to the queue via
+    // executionCtx.waitUntil (zero user-facing latency). A send failure is
+    // swallowed — the row stays `pending` and the cron sweeper republishes it.
+    // AuthService / TeamService stay ignorant of the queue: they only see the
+    // UserSyncOutbox.append seam.
+    const buildOutbox = (): OutboxService | undefined => {
+        const queue = c.env.SYNC_QUEUE;
+        if (!queue) return undefined;
+        return new OutboxService(c.env.DB, (row) => {
+            c.executionCtx.waitUntil(
+                publishRow(c.env.DB, queue, row).catch(() => {
+                    /* send failed — row stays pending; the sweeper handles it */
+                }),
+            );
+        });
+    };
+
+    // Free-tier usage-quota guard, gated on the deployment profile (SaaS only —
+    // see hasUsageQuota in deployment-profile.ts). Standalone gets `undefined`,
+    // so every consuming service's `this.planQuota?.` optional-chain calls
+    // no-op and creation stays unlimited by construction, not by a branch
+    // here. Every inspection-creation path is guarded: InspectionCoreService
+    // (create/clone/reinspection), BookingService (public self-serve
+    // booking), ConciergeService (agent-submitted booking), and
+    // InspectionRequestService (multi-service request + append-a-sub-inspection).
+    const buildPlanQuota = (): PlanQuotaGuard | undefined => {
+        if (!c.var.profile.hasUsageQuota) return undefined;
+        return new PlanQuotaGuard(c.env.DB, { enforced: true, billingPortalUrl: c.var.profile.billingPortalUrl, aiCaps: tenantAiCapsLoader(c.env.DB) });
+    };
+
+    const services = {} as AppServices;
+
+    c.set('services', new Proxy(services, {
+        get(target, prop: keyof AppServices) {
+            if (target[prop]) return target[prop];
+
+            switch (prop) {
+                case 'admin':
+                    {
+                        // Who OWNS the tenant record, not the mode string.
+                        // `PortalProvider` encodes saas semantics over DB+KV (it
+                        // never fetched the retired binding).
+                        const provider = c.var.profile.tenantRecordOwnedByPortal
+                            ? new PortalProvider(c.env.DB, c.env.TENANT_CACHE)
+                            : new StandaloneProvider(c.env.DB, c.env.TENANT_CACHE);
+                        target.admin = new AdminService(c.env.DB, provider);
+                    }
+                    break;
+                case 'ai':
+                    // ONE credential resolution, made in build-ai-service.ts: the meter
+                    // tag, the gate source, the provenance mode and the allowance cap all
+                    // read from it. A second resolve is a second answer to whose key
+                    // funded the call.
+                    target.ai = buildTenantAiService({
+                        db: c.env.DB,
+                        profile: c.var.profile,
+                        tenantId,
+                        tenantKey: emailCfg.dbSecrets.geminiApiKey || null,
+                        // Resolved through the shared answer rather than read
+                        // straight from env: the provisioning read asks the
+                        // same question, and a deployment configured one way
+                        // and read the other way makes that console wrong.
+                        managedKey: resolveManagedAiCredential(c.env),
+                        // No default: an unset AI_MODEL fails closed at the service.
+                        model: c.env.AI_MODEL ?? '',
+                        plan: tenantPlan,
+                        tenantKeyAttested: emailCfg.aiKeyAttested === true, // unloaded config → NOT confirmed
+                        quotaGuard: buildPlanQuota(),
+                        // The workspace's own AI backend choice, off the SAME
+                        // config row as the attestation above. An unloaded row
+                        // means "nothing switched off", which is why this one
+                        // defaults TRUE while the attestation defaults false.
+                        aiEnabled: emailCfg.aiEnabled !== false,
+                        tenantBaseUrl: emailCfg.aiBaseUrl ?? null,
+                        tenantModel: emailCfg.aiModel ?? null,
+                        // No default: an unset AI_BASE_URL fails closed at the adapter.
+                        baseUrl: c.env.AI_BASE_URL ?? '',
+                    });
+                    break;
+                case 'auth':
+                    // Outbox forwarding to portal is SaaS-only: buildOutbox
+                    // returns undefined when SYNC_QUEUE is absent (standalone)
+                    // → AuthService.append no-ops (guarded by `if (this.outbox)`),
+                    // so no portal code runs and no dead sync_outbox rows accumulate.
+                    target.auth = new AuthService(
+                        c.env.DB,
+                        c.env.TENANT_CACHE,
+                        buildOutbox(),
+                    );
+                    break;
+                case 'outbox':
+                    // SaaS-only: concrete sink exists only when SYNC_QUEUE is
+                    // bound. Standalone leaves it undefined (keeps standalone
+                    // free of server/portal/ code by construction, not by accident).
+                    target.outbox = buildOutbox();
+                    break;
+                case 'booking':
+                    target.booking = new BookingService(c.env.DB, buildPlanQuota());
+                    break;
+                case 'branding':
+                    target.branding = new BrandingService(c.env.DB, c.env.TENANT_CACHE, c.env.PHOTOS);
+                    // Request scope, so the tenant_configs reads memoise per request.
+                    target.branding.requestEnv = c.env;
+                    break;
+                case 'legalVersion':
+                    target.legalVersion = new LegalVersionService(drizzle(c.env.DB));
+                    break;
+                case 'email':
+                    target.email = buildEmailService();
+                    break;
+                case 'inspection':
+                    target.inspection = new InspectionService(c.env.DB, c.env.PHOTOS, c.get('sdb'), c.env.TENANT_CACHE, (c.env as unknown as { IMAGES?: ImagesBinding }).IMAGES, buildPlanQuota(), c.env.KEY_ENCRYPTION_SECRET || c.env.JWT_SECRET);
+                    // This middleware is the only layer holding `c.env`, so it is
+                    // the only place the request scope can enter the service tree.
+                    // Without it PeopleService.listPeople cannot memoise and the
+                    // render reads the same people join once per endpoint.
+                    target.inspection.setRequestEnv(c.env);
+                    break;
+                case 'portal':
+                    // PortalService depends on InspectionService — resolve it via the
+                    // proxy target the same way auditLog resolves signingKey.
+                    if (!target.inspection) {
+                        target.inspection = new InspectionService(c.env.DB, c.env.PHOTOS, c.get('sdb'), c.env.TENANT_CACHE, (c.env as unknown as { IMAGES?: ImagesBinding }).IMAGES, buildPlanQuota(), c.env.KEY_ENCRYPTION_SECRET || c.env.JWT_SECRET);
+                        target.inspection.setRequestEnv(c.env);
+                    }
+                    target.portal = new PortalService(c.env.DB, target.inspection);
+                    break;
+                case 'team':
+                    // Removal emits `user.deleted`, writes a `pwchanged` marker,
+                    // and revokes MCP grants (OAUTH_PROVIDER is only on env when
+                    // MCP_ENABLED — lib/mcp/oauth-provider.ts).
+                    target.team = new TeamService(c.env.DB, buildOutbox(), c.env.TENANT_CACHE, (c.env as { OAUTH_PROVIDER?: OAuthHelpers }).OAUTH_PROVIDER);
+                    break;
+                case 'template':
+                    target.template = new TemplateService(c.env.DB);
+                    break;
+                case 'agreement':
+                    target.agreement = new AgreementService(c.env.DB, {
+                        jwtSecret: c.env.JWT_SECRET,
+                        ...(c.env.JWT_SECRET_PREVIOUS ? { jwtSecretPrevious: c.env.JWT_SECRET_PREVIOUS } : {}),
+                    });
+                    break;
+                case 'signingKey':
+                    target.signingKey = new SigningKeyService(c.env.DB, c.env.KEY_ENCRYPTION_SECRET || c.env.JWT_SECRET);
+                    break;
+                case 'auditLog':
+                    {
+                        // auditLog depends on signingKey — pull via the proxy so it lazy-resolves the same way
+                        if (!target.signingKey) {
+                            target.signingKey = new SigningKeyService(c.env.DB, c.env.KEY_ENCRYPTION_SECRET || c.env.JWT_SECRET);
+                        }
+                        target.auditLog = new AuditLogService(c.env.DB, target.signingKey);
+                    }
+                    break;
+                case 'availability':
+                    target.availability = new AvailabilityService(c.env.DB);
+                    break;
+                case 'contact':
+                    // IA-100 — contact archiving needs to see (and optionally
+                    // revoke) the report links a contact still holds, and that
+                    // predicate lives in PortalAccessService. Injected rather
+                    // than re-implemented so "what counts as live access" has
+                    // exactly one definition.
+                    target.contact = new ContactService(
+                        c.env.DB,
+                        new PortalAccessService(c.env.DB, {
+                            jwtSecret: c.env.JWT_SECRET,
+                            ...(c.env.JWT_SECRET_PREVIOUS ? { jwtSecretPrevious: c.env.JWT_SECRET_PREVIOUS } : {}),
+                        }),
+                    );
+                    break;
+                case 'invoice':
+                    target.invoice = new InvoiceService(c.env.DB);
+                    break;
+                case 'portalAccess':
+                    target.portalAccess = new PortalAccessService(c.env.DB, {
+                        jwtSecret: c.env.JWT_SECRET,
+                        ...(c.env.JWT_SECRET_PREVIOUS ? { jwtSecretPrevious: c.env.JWT_SECRET_PREVIOUS } : {}),
+                    });
+                    break;
+                case 'people':
+                    target.people = new PeopleService(c.env);
+                    break;
+                case 'service':
+                    target.service = new ServiceService(c.env.DB);
+                    break;
+                case 'automation':
+                    target.automation = new AutomationService(
+                        c.env.DB,
+                        new NotificationService(c.env.DB),
+                    );
+                    break;
+                case 'marketplace':
+                    target.marketplace = new MarketplaceService(c.env.DB, c.get('tenantId'), c.env.PHOTOS);
+                    break;
+                case 'message':
+                    target.message = new MessageService(c.env.DB, new NotificationService(c.env.DB));
+                    break;
+                case 'widget':
+                    target.widget = new WidgetService(c.env.DB);
+                    break;
+                case 'notification':
+                    target.notification = new NotificationService(c.env.DB);
+                    break;
+                case 'recommendation':
+                    target.recommendation = new RecommendationService(c.env.DB);
+                    break;
+                case 'contractorType':
+                    target.contractorType = new ContractorTypeService(c.env.DB);
+                    break;
+                case 'credentials':
+                    target.credentials = new CredentialService(c.env.DB, c.env.PHOTOS);
+                    break;
+                case 'event':
+                    target.event = new EventService(c.env.DB);
+                    break;
+                case 'inspectionType':
+                    target.inspectionType = new InspectionTypeService(c.env.DB);
+                    break;
+                case 'totp':
+                    target.totp = new TotpService();
+                    break;
+                case 'templateSeed':
+                    target.templateSeed = new TemplateSeedService(c.env.DB);
+                    break;
+                case 'reportPdf':
+                    target.reportPdf = new ReportPdfService(c.env.DB, c.env.BROWSER, c.env.PHOTOS);
+                    break;
+                case 'reportTranslation':
+                    target.reportTranslation = new ReportTranslationService(c.env.DB);
+                    break;
+                case 'reportExport':
+                    // Commercial PCA Phase W Task 4 — .docx export status row + R2
+                    // stream. Reuses the PHOTOS bucket binding (same object store as
+                    // report PDFs; see server/lib/r2-keys.ts:reportWordExport).
+                    target.reportExport = new ReportExportService(c.env.DB, c.env.PHOTOS);
+                    break;
+                case 'importHistory':
+                    target.importHistory = new ImportHistoryService(c.env.DB, c.get('tenantId'));
+                    break;
+                case 'inspectionRequest':
+                    target.inspectionRequest = new InspectionRequestService(c.env.DB, buildPlanQuota());
+                    break;
+                case 'ratingSystem':
+                    target.ratingSystem = new RatingSystemService(c.env.DB);
+                    break;
+                case 'dashboardPrefs':
+                    target.dashboardPrefs = new DashboardPrefsService(c.env.DB);
+                    break;
+                case 'tag':
+                    target.tag = new TagService(c.env.DB);
+                    break;
+                case 'propertyLookup':
+                    target.propertyLookup = new PropertyLookupService({
+                        ESTATED_API_KEY: c.env.ESTATED_API_KEY,
+                    });
+                    break;
+                case 'user':
+                    target.user = new UserService(c.env.DB);
+                    break;
+                case 'ics':
+                    {
+                        // Booking #7 Sprint C-2 — busy-only inspector calendar.
+                        // Host derived from APP_BASE_URL when set so UID values
+                        // are stable across environments; falls back to a
+                        // generic 'openinspection' tag in local dev.
+                        const host = c.env.APP_BASE_URL?.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'openinspection';
+                        target.ics = new IcsService(c.env.DB, host);
+                    }
+                    break;
+                case 'agent':
+                    // No EmailService or APP_BASE_URL any more: both existed
+                    // solely to mint and send agent-invite accept links, and
+                    // that track is gone (agents reach a report through a
+                    // per-inspection token that needs no account).
+                    target.agent = new AgentService(c.env.DB);
+                    break;
+                case 'concierge':
+                    {
+                        // Agent Accounts A3 — concierge state-machine service.
+                        // Depends on EmailService (for client/inspector/agent
+                        // notifications) + APP_BASE_URL for the magic-link target.
+                        if (!target.email) {
+                            target.email = buildEmailService();
+                        }
+                        target.concierge = new ConciergeService(
+                            c.env.DB,
+                            target.email,
+                            c.env.APP_BASE_URL || '',
+                            buildPlanQuota(),
+                        );
+                    }
+                    break;
+                case 'qbo':
+                    target.qbo = new QBOService(
+                        c.env.DB,
+                        c.env.QBO_CLIENT_ID ?? '',
+                        c.env.QBO_CLIENT_SECRET ?? '',
+                        c.env.QBO_WEBHOOK_SECRET ?? '',
+                        c.env.JWT_SECRET,
+                        c.env.QBO_ENV,
+                    );
+                    break;
+                case 'unit':
+                    target.unit = new UnitService(c.env.DB);
+                    break;
+                case 'unitSwitch':
+                    target.unitSwitch = new UnitSwitchService(c.env.DB);
+                    break;
+                case 'reportVersion':
+                    target.reportVersion = new ReportVersionService(c.env.DB, c.env.KEY_ENCRYPTION_SECRET || c.env.JWT_SECRET);
+                    break;
+                case 'integrations':
+                    target.integrations = new IntegrationsService(c.env.DB, c.env);
+                    break;
+                case 'analytics':
+                    target.analytics = new AnalyticsService(c.env.DB);
+                    break;
+                case 'repairRequest':
+                    target.repairRequest = new RepairRequestService(c.env.DB);
+                    break;
+                case 'clientDocument':
+                    target.clientDocument = new ClientDocumentService(c.env.DB, c.env.PHOTOS);
+                    break;
+                case 'compliance':
+                    // Commercial PCA Phase M — reuses the tenant Ed25519 signing key
+                    // (same secret as signingKey/reportVersion) for dual sign-off attestations.
+                    target.compliance = new ComplianceService(c.env.DB, c.env.KEY_ENCRYPTION_SECRET || c.env.JWT_SECRET);
+                    break;
+            }
+            return target[prop];
+        }
+    }));
+
+    await next();
+}

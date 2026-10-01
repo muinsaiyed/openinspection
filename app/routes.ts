@@ -1,0 +1,265 @@
+import {
+  type RouteConfig,
+  index,
+  route,
+  layout,
+} from "@react-router/dev/routes";
+
+export default [
+  index("routes/home.tsx"),
+  route("login", "routes/login.tsx"),
+  route("forgot-password", "routes/forgot-password.tsx"),
+  route("reset-password", "routes/reset-password.tsx"),
+  route("logout", "routes/logout.tsx"),
+  // The agent portal's own teardown path. Same module — the difference is
+  // entirely in the path, which is what `loginPathFor` reads to decide which
+  // sign-in page the session ends on. `/logout` would send an agent to the
+  // STAFF login (and, in SaaS, on to the portal's), which is not a door they
+  // have a key to. See app/lib/session.server.ts.
+  route("agent-logout", "routes/logout.tsx", { id: "agent-logout" }),
+  // Remote MCP OAuth consent screen (B3). Bare route (own chrome, own auth
+  // handling); the OAuthProvider wrapper routes /oauth/authorize here via the
+  // defaultHandler, injecting env.OAUTH_PROVIDER for the loader/action.
+  route("oauth/authorize", "routes/oauth/authorize.tsx"),
+  // Full-screen editor (own chrome, no sidebar)
+  route("inspections/:id/edit", "routes/inspection-edit.tsx"),
+  route("templates/:id/edit", "routes/template-edit.tsx"),
+  // Public pages — no auth, minimal layout, SSR for SEO
+  layout("routes/public-layout.tsx", [
+    route("book/:tenant", "routes/public/booking.tsx"),
+    route("report/:tenant/:id", "routes/public/report.tsx"),
+    route(
+      "agreements/sign/:tenant/:token",
+      "routes/public/agreement-sign.tsx",
+    ),
+    route("checkout/:tenant/:token", "routes/public/checkout.tsx"),
+    route("invoice/:id", "routes/public/invoice.tsx"),
+    // Intuit's Disconnect URL, registered on their developer portal. QuickBooks
+    // redirects a user here after they disconnect the app from their side. It
+    // must be public: that navigation is cross-site and carries no cookie of
+    // ours, so there is no session to resolve. See the route's own note.
+    route(
+      "integrations/quickbooks/disconnected",
+      "routes/public/integrations-quickbooks-disconnected.tsx",
+    ),
+    route("verify/:envelopeId", "routes/public/verify.tsx"),
+    route("verify", "routes/public/verify-offline.tsx"),
+    route("v/:token", "routes/public/v.$token.tsx"),
+    // Flow A — client redeems the agent-concierge magic link emailed as
+    // ${APP_BASE_URL}/confirm/<token>. Shows booking details then POSTs the
+    // confirm and follows the server-chosen redirect (agreement / report).
+    route("confirm/:token", "routes/public/concierge-confirm-token.tsx"),
+    route(
+      "report-gate/:tenant/:id",
+      "routes/public/report-gate.tsx",
+    ),
+    route(
+      "report-view/:tenant/:id",
+      "routes/public/report-card-stack.tsx",
+    ),
+    // Track L (D6, path B) — public SMS double-opt-in confirmation page.
+    route("sms-optin/:token", "routes/public/sms-optin.tsx"),
+    // Where an emailed unsubscribe link lands. The loader only DESCRIBES the
+    // link; the change is a POST behind a confirm control, because every mail
+    // scanner between the sender and the inbox fetches this URL.
+    route("unsubscribe/:token", "routes/public/unsubscribe.tsx"),
+    // Per-tenant legal pages — privacy/terms URLs for managed compliance (TFV/A2P)
+    // and booking opt-in links. doc ∈ privacy|terms; unknown → 404.
+    route("legal/:tenant/:doc", "routes/public/legal.tsx"),
+    route("repair-request/:shareToken", "routes/public/repair-request.$shareToken.tsx"),
+    route("repair-builder/:tenant/:id", "routes/public/repair-builder.$tenant.$id.tsx"),
+    // Unified client portal (phase ①) — magic-link login, My Inspections, per-inspection Hub.
+    route("portal/:tenant", "routes/public/portal.tsx"),
+    route("portal/:tenant/auth", "routes/public/portal-auth.tsx"),
+    route("portal/:tenant/i/:inspectionId", "routes/public/portal-inspection.tsx"),
+    // Notification settings as a page of its own, so the privacy policy and the
+    // terms have somewhere to link that names no inspection and assumes no
+    // session (spec §4.1). Signed out, it asks for an email and sends a
+    // one-time link back here — without saying whether the address is known.
+    route("portal/:tenant/notifications", "routes/public/portal-notifications.tsx"),
+  ]),
+  // Standalone pages (own chrome, no sidebar)
+  route("setup", "routes/setup.tsx"),
+  route("join/:token", "routes/join.tsx"),
+  route("version-diff/:id", "routes/version-diff.tsx"),
+  // Standalone public — no layout (iframe-friendly). Company-level embed only
+  // (no inspector slug); the server auto-assigns the first available inspector.
+  route("embed/:tenant", "routes/public/booking-embed-company.tsx"),
+  // Standalone agent pages — no agent-layout chrome
+  route("agent-signup", "routes/agent/signup.tsx"),
+  // Spec 3 Task 5 — core dual-mode agent front door (password + magic-link).
+  route("agent-login", "routes/agent/login.tsx"),
+  // The way out of the agent-terms gate. Standalone on purpose: agent-layout's
+  // loader is what redirects a gated agent here, so a page under that layout
+  // would redirect to itself. Keeps the `agent-` prefix so loginPathFor() sends
+  // an expired session on this page to the agent door, not the staff one.
+  route("agent-accept-terms", "routes/agent/accept-terms.tsx"),
+  // Error / utility pages (bare, outside auth)
+  route("not-found", "routes/not-found.tsx"),
+  route("feature-disabled", "routes/feature-disabled.tsx"),
+  // API docs (Swagger UI) — was hono GET /ui; OpenAPI JSON still served at /doc
+  route("ui", "routes/docs.tsx"),
+  // BFF resource routes (no UI) — Token-Relay endpoints for editor hooks
+  // (Track H / C-12: client code never fetches /api directly).
+  // #61 — AI writing assistance on an inspection note, and the record that a
+  // person reviewed the result before it became one. The API endpoints predate
+  // this route by a long way and had no caller in `app/` at all.
+  route("resources/ai-assist", "routes/resources/ai-assist.tsx"),
+  route("resources/two-factor", "routes/resources/two-factor.tsx"),
+  route("resources/discount-codes", "routes/resources/discount-codes.tsx"),
+  route("resources/comments-library", "routes/resources/comments-library.tsx"),
+  route("resources/defect-categories", "routes/resources/defect-categories.tsx"),
+  route("resources/repair-items", "routes/resources/repair-items.tsx"),
+  route("resources/cost-items", "routes/resources/cost-items.tsx"),
+  route("resources/cost-export", "routes/resources/cost-export.tsx"),
+  // The starter spreadsheets, offered where an operator is about to upload one.
+  // Their columns are DERIVED from the interchange vocabulary and from the live
+  // mapping decision; the route modules and server/lib/migration-intake/
+  // starter-template.ts say why they are resource routes and not API paths.
+  // Two routes rather than one with a parameter: each entry point reads
+  // different columns, so each file teaches a different format.
+  route("resources/contacts-template", "routes/resources/starter-template.ts"),
+  route("resources/members-template", "routes/resources/members-template.ts"),
+  route("resources/inspection-prefs", "routes/resources/inspection-prefs.tsx"),
+  route("resources/marketplace-install", "routes/resources/marketplace-install.tsx"),
+  route("resources/marketplace-uninstall", "routes/resources/marketplace-uninstall.tsx"),
+  route("resources/statutory-update", "routes/resources/statutory-update.tsx"),
+  route("resources/inspection-settings-sheet", "routes/resources/inspection-settings-sheet.tsx"),
+  route("resources/inspection-media", "routes/resources/inspection-media.tsx"),
+  route("resources/publish-readiness", "routes/resources/publish-readiness.tsx"),
+  route("resources/recent-inspections", "routes/resources/recent-inspections.tsx"),
+  route("resources/entity-audit", "routes/resources/entity-audit.tsx"),
+  // C3 — the agent bell's writes (its reads ride the agent-layout loader).
+  route("resources/agent-notices", "routes/resources/agent-notices.tsx"),
+  route("resources/staff-notices", "routes/resources/staff-notices.tsx"),
+  route("resources/inspection-communication", "routes/resources/inspection-communication.tsx"),
+  // #67 — the cancellation quote (loader) and the cancel itself (action). Both
+  // API endpoints shipped with the fee ladder and had no caller anywhere in
+  // app/; this is the only front door to them.
+  route("resources/inspection-cancellation", "routes/resources/inspection-cancellation.tsx"),
+  // #81 — the way back, and the same story: POST /:id/uncancel had no caller
+  // either. One door, shared by the hub's Lifecycle card and the list row.
+  route("resources/inspection-restore", "routes/resources/inspection-restore.tsx"),
+  route("resources/agreement-signers", "routes/resources/agreement-signers.tsx"),
+  route("resources/agreement-templates", "routes/resources/agreement-templates.tsx"),
+  route("resources/team-members", "routes/resources/team-members.tsx"),
+  route("resources/contact-access", "routes/resources/contact-access.tsx"),
+  route("resources/template-search", "routes/resources/template-search.tsx"),
+  route("resources/inspection-search", "routes/resources/inspection-search.tsx"),
+  // The command palette's `@` prefix. Server-side search, like the two above:
+  // the palette advertised the prefix while searching nothing but the recent
+  // inspections it had already loaded (F64).
+  route("resources/contact-search", "routes/resources/contact-search.tsx"),
+  // OI #271 — the report RECIPIENT's Art. 21 control. The only resource route
+  // with no staff-token gate, because its caller has no account: the API
+  // authenticates the `?token=` link or the portal-session cookie. See the
+  // route module's header before adding a gate here.
+  route("resources/view-tracking", "routes/resources/view-tracking.tsx"),
+  layout("routes/auth-layout.tsx", [
+    // IA-6 — BFF resource route for advisory schedule-conflict detection.
+    // Loaded via useFetcher; no UI rendered; must be inside the auth layout so
+    // requireToken() can redirect to /login when unauthenticated.
+    route("resources/schedule-conflicts", "routes/resources/schedule-conflicts.ts"),
+    route("resources/holiday-check", "routes/resources/holiday-check.ts"),
+    route("resources/week-summary", "routes/resources/week-summary.ts"),
+    // Find-a-Time: one day of slots WITH the free inspectors named (the public
+    // booking surface withholds identities by design).
+    route("resources/day-slots", "routes/resources/day-slots.ts"),
+    // #198 — Google Places autocomplete/details BFF (token-relay proxy).
+    route("resources/places", "routes/resources/places.tsx"),
+    // Inspections workspace — the primary list/stats/wizard surface (formerly
+    // /dashboard). The thin status-grouped list was retired; this is the one
+    // canonical inspections route.
+    route("inspections", "routes/inspections.tsx"),
+    // Dedicated New Inspection wizard page (formerly a modal overlay mounted
+    // from /inspections). Static `new` outranks the dynamic `inspections/:id`
+    // hub route, so this resolves first.
+    route("inspections/new", "routes/inspections.new.tsx"),
+    // Issue #111 — the inspector portal ("where does this job stand?"). Inside the
+    // auth layout: it is a management page, and sitting outside it meant walking
+    // from the list into the hub dropped the entire workspace nav, leaving the
+    // breadcrumb as the only way back. (The EDITOR is deliberately outside — it
+    // is a full-screen work surface with its own chrome.) The hub had been
+    // reproducing this layout's container by hand, which is now removed.
+    route("inspections/:id", "routes/inspector-portal.tsx"),
+    // #69 — the Repair Request Log, entered from the hub's Report card. Its own
+    // page rather than a card on the hub: it lists every repair request built
+    // for the order, each with its items, which is more than a hub block can
+    // hold. Inside the auth layout for the same reason the hub is — walking out
+    // of the hub into it must not drop the workspace nav. The static
+    // `repair-requests` segment outranks nothing: `inspections/:id` is a leaf,
+    // not a layout, so this is a sibling path and there is no collision.
+    route("inspections/:id/repair-requests", "routes/inspection-repair-requests.tsx"),
+    route("calendar", "routes/calendar.tsx"),
+    // Day-centric dispatch board. Static `dispatch` sits under the calendar
+    // path but is its own route, not a mode of /calendar: the audience is
+    // narrower (scheduleOthers, enforced server-side) and so is the data.
+    route("calendar/dispatch", "routes/calendar-dispatch.tsx"),
+    route("contacts", "routes/contacts.tsx"),
+    // IA-18 (#111) — contact detail (record + inspection history + stats).
+    route("contacts/:id", "routes/contact-detail.tsx"),
+    route("invoices", "routes/invoices.tsx"),
+    route("notifications", "routes/notifications.tsx"),
+    route("team", "routes/team.tsx"),
+    route("metrics", "routes/metrics.tsx"),
+    route("messages", "routes/messages.tsx"),
+    layout("routes/settings-layout.tsx", [
+      route("settings", "routes/settings-hub.tsx"),
+      route("settings/profile", "routes/settings-profile.tsx"),
+      route("settings/inspection", "routes/settings-inspection.tsx"),
+      route("settings/workspace", "routes/settings-workspace.tsx"),
+      route("settings/services", "routes/settings-services.tsx"),
+      route("settings/communication", "routes/settings-communication.tsx"),
+      route("settings/communication/templates", "routes/settings-communication-templates.tsx"),
+      route("settings/communication/templates/:trigger", "routes/settings-communication-template.tsx"),
+      route("settings/automations", "routes/settings-automations.tsx"),
+      route("settings/data", "routes/settings-data.tsx"),
+      route("settings/imports", "routes/settings-imports.tsx"),
+      route("settings/imports/:batchId", "routes/settings-imports-batch.tsx"),
+      route("settings/compliance", "routes/settings-compliance.tsx"),
+      // The authority's own PDF for each statutory revision this build
+      // publishes. In Settings rather than Library because it is a deployment
+      // prerequisite shared by every workspace, not a workspace's own content —
+      // the route module's header has the whole argument.
+      route("settings/statutory-forms", "routes/settings-statutory-forms.tsx"),
+      route("settings/advanced", "routes/settings-advanced.tsx"),
+      route("settings/integrations", "routes/settings-integrations.tsx"),
+      route("settings/integrations/qbo", "routes/settings-integrations-qbo.tsx"),
+      route("settings/event-types", "routes/settings-event-types.tsx"),
+      route("settings/contractor-types", "routes/settings-contractor-types.tsx"),
+      route("settings/inspection-types", "routes/settings-inspection-types.tsx"),
+      route("settings/inspection-roles", "routes/settings-inspection-roles.tsx"),
+      route("settings/schedule", "routes/settings-schedule.tsx"),
+      route("settings/booking", "routes/settings-booking.tsx"),
+      route("settings/billing", "routes/settings-billing.tsx"),
+      route("settings/usage", "routes/settings-usage.tsx"),
+      route("settings/security", "routes/settings-security.tsx"),
+      route("settings/connected-apps", "routes/settings-connected-apps.tsx"),
+    ]),
+    layout("routes/library-layout.tsx", [
+      route("library", "routes/library-hub.tsx"),
+      route("library/templates", "routes/templates.tsx"),
+      route("library/comments", "routes/comments.tsx"),
+      route("library/repair-items", "routes/repair-items.tsx"),
+      route("library/tags", "routes/library/tags.tsx"),
+      route("library/agreements", "routes/agreements.tsx"),
+      route("library/rating-systems", "routes/library/rating-systems.tsx"),
+      route("library/defect-categories", "routes/library/defect-categories.tsx"),
+      route("library/marketplace", "routes/marketplace.tsx"),
+      // #348 — reviewing what a library update would overwrite, before it does.
+      route("library/marketplace/:libraryId/update", "routes/library/marketplace-update.tsx"),
+    ]),
+  ]),
+  layout("routes/agent-layout.tsx", [
+    route("agent-dashboard", "routes/agent/dashboard.tsx"),
+    route("agent-settings/profile", "routes/agent/settings-profile.tsx"),
+    // The agent's own acceptance record. Under agent-layout like every other
+    // account page, so a gated agent is sent to accept before reading history —
+    // which is the ordinary ordering and needs no exemption anywhere.
+    route("agent-settings/legal", "routes/agent/settings-legal.tsx"),
+    route("agent-inspectors", "routes/agent/inspectors.tsx"),
+    route("agent-repair-items", "routes/agent/repair-items.tsx"),
+    // IA-54 — old path 301s to the renamed one.
+    route("agent-recommendations", "routes/agent/agent-repair-items-redirect.tsx"),
+  ]),
+] satisfies RouteConfig;

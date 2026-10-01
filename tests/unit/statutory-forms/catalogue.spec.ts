@@ -1,0 +1,113 @@
+/**
+ * The catalogue is consistent with itself, and its emptiness is declared.
+ *
+ * ⚠️ THE CENSUS BELOW WAS 0 AND IS NOW 1 (2026-08-29, TX TREC REI 7-6). It was
+ * asserted out loud precisely so that this day would arrive as a FAILING TEST
+ * rather than as a suite of loops quietly continuing to pass over a list that
+ * had stopped being empty. It worked: publishing the first form turned this
+ * file red on exactly one line.
+ *
+ * Every loop below is now load-bearing for real — read them that way. The
+ * `checked` counters that used to prove "the loop ran zero times, and said so"
+ * now prove it ran once against a published revision.
+ */
+import { describe, it, expect } from 'vitest';
+import {
+    EMPTY_CATALOGUE_REASON,
+    FIELD_MAPS,
+    PUBLISHED_FORM_VERSIONS,
+    fieldMapFor,
+} from '../../../server/lib/statutory/forms';
+import { validateFieldMap } from '../../../server/lib/statutory/field-map';
+
+describe('the statutory form catalogue', () => {
+    it('declares WHY it is empty, whenever it is empty', () => {
+        // The two states this pins together: a list with nothing in it must
+        // carry a reason, and a reason must not outlive the emptiness it
+        // explains. Either half alone lets "no statutory forms" become
+        // unverifiable — the first because silence reads as a failed load, the
+        // second because a stale explanation reads as the current state.
+        if (PUBLISHED_FORM_VERSIONS.length === 0) {
+            expect(EMPTY_CATALOGUE_REASON, 'an empty catalogue must say why').not.toBeNull();
+            expect((EMPTY_CATALOGUE_REASON ?? '').length).toBeGreaterThan(40);
+        } else {
+            expect(EMPTY_CATALOGUE_REASON, 'a non-empty catalogue must drop the reason').toBeNull();
+        }
+    });
+
+    it('publishes the number of forms it claims to — today, four', () => {
+        // The census, stated rather than looped over. When this fails because a
+        // form was published or withdrawn, update the number and re-read every
+        // test below: each one's reach changes with this line.
+        expect(PUBLISHED_FORM_VERSIONS).toHaveLength(4);
+        expect(FIELD_MAPS).toHaveLength(4);
+        expect(PUBLISHED_FORM_VERSIONS.map((v) => v.formId)).toEqual([
+            'tx_trec_rei',
+            'fl_citizens_4point',
+            'fl_citizens_roof',
+            'fl_oir_b1_1802',
+        ]);
+    });
+
+    it('publishes no form id that carries its own revision label', () => {
+        // `form-registry.ts` states the rule where `formId` is declared: an id
+        // names a form and never a revision. It is not tidiness —
+        // `versionForInspection` GROUPS on this field, so a revision spelt into
+        // the id becomes a separate form that the next revision of the same
+        // form can never be compared against, and selecting by inspection date
+        // stops working with nothing going red.
+        //
+        // `tx_trec_rei_7_6` was the one that broke it and is now `tx_trec_rei`.
+        // Its revision label did not move: `REI 7-6` is what the authority
+        // prints on every page, and `revisionStatus` compares it for equality.
+        //
+        // Judged against each row's OWN revision label rather than a pattern
+        // chosen here: an id "carries a revision" when the label, spelt the way
+        // an id is spelt, is a substring of it. A hand-written regex would only
+        // ever agree with itself.
+        const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+        const carriesRevision = (rows: readonly { formId: string; version: string }[]) => rows
+            .filter((v) => v.formId.includes(slug(v.version)))
+            .map((v) => v.formId);
+
+        // The positive control, and it runs FIRST. An empty answer is what a
+        // broken `slug`, a renamed field and an empty catalogue all produce
+        // alike, so the detector is shown catching the exact shape it exists to
+        // catch before its zero over the real catalogue is believed.
+        expect(carriesRevision([{ formId: 'tx_trec_rei_7_6', version: 'REI 7-6' }]))
+            .toEqual(['tx_trec_rei_7_6']);
+
+        expect(PUBLISHED_FORM_VERSIONS.length).toBeGreaterThan(0);
+        expect(carriesRevision(PUBLISHED_FORM_VERSIONS)).toEqual([]);
+    });
+
+    it('pairs every revision with exactly one field map, both ways', () => {
+        const versionKeys = PUBLISHED_FORM_VERSIONS.map((v) => `${v.formId} ${v.version}`).sort();
+        const mapKeys = FIELD_MAPS.map((m) => `${m.formId} ${m.version}`).sort();
+        expect(mapKeys).toEqual(versionKeys);
+        // A revision that appears twice would give `fieldMapFor` two answers and
+        // no way to choose.
+        expect(new Set(versionKeys).size).toBe(versionKeys.length);
+    });
+
+    it('every published map validates against its own revision', () => {
+        let checked = 0;
+        for (const version of PUBLISHED_FORM_VERSIONS) {
+            const map = FIELD_MAPS.find(
+                (m) => m.formId === version.formId && m.version === version.version,
+            );
+            expect(map, `${version.formId} ${version.version} has no field map`).toBeDefined();
+            if (map !== undefined) {
+                expect(() => validateFieldMap(map, version)).not.toThrow();
+                checked += 1;
+            }
+        }
+        // The loop above proves nothing on its own while the list is empty. This
+        // line says how much it actually did.
+        expect(checked).toBe(PUBLISHED_FORM_VERSIONS.length);
+    });
+
+    it('returns null for a form nothing publishes, rather than the nearest thing', () => {
+        expect(fieldMapFor('xx_not_published', '1-0')).toBeNull();
+    });
+});

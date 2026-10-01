@@ -1,0 +1,595 @@
+import { drizzle } from 'drizzle-orm/d1';
+import { and, eq, isNull } from 'drizzle-orm';
+import {
+    inspections,
+    tenantConfigs,
+    conciergeConfirmTokens,
+    contacts,
+    users,
+    tenants,
+    contactRoleProfiles,
+} from '../lib/db/schema';
+import { Errors } from '../lib/errors';
+import { resolveHoldInspector, resolveInvitingUser, attachHoldServices } from './concierge/hold-inputs';
+import { INSPECTION_STATUS } from '../lib/status/inspection-status';
+import { logger } from '../lib/logger';
+import { syncInspectionAssignments } from '../lib/db/assignment-links';
+import { hashToken } from '../lib/token-hash';
+import { PeopleService } from './people.service';
+import { ContactService } from './contact.service';
+import type { EmailService } from './email.service';
+import type { PlanQuotaGuard } from '../features/plan-quota/guard';
+
+/**
+ * Agent Accounts A3 — Concierge state machine service.
+ *
+ * Per-tenant concierge_review_required toggles between:
+ *   - HomeGauge auto mode (default, OFF): agent submits -> client gets magic link immediately
+ *   - Spectora reviewer mode (ON):        agent submits -> inspector approves -> client gets magic link
+ *
+ * State machine:
+ *   agent submits  ─┬─> 'awaiting_inspector' ── approveByInspector ──> 'awaiting_client'
+ *                   └─> 'awaiting_client' (default)
+ *   awaiting_client ── confirmByClient ──> NULL + inspection.status='confirmed'
+ *
+ * Tokens: 7-day TTL, single-use, marked via `confirmed_at` timestamp.
+ */
+
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface ConciergeBookParams {
+    tenantId: string;
+    agentUserId: string;
+    /**
+     * Naming the inspector is OPTIONAL — a hold with nobody assigned is the
+     * normal case when the agent takes whoever is free. Two forms are accepted
+     * because two callers know two different things: a booking form knows the
+     * inspector's user id (what the company profile publishes), while the
+     * contact id is the identifier the tenant's own contact list uses.
+     */
+    inspectorUserId?: string;
+    inspectorContactId?: string;
+    date: string;
+    timeSlot: string;
+    propertyAddress: string;
+    clientName: string;
+    clientEmail: string;
+    clientPhone?: string;
+    /** Services the agent picked; snapshotted onto the hold for pricing. */
+    services?: { serviceId: string }[];
+    agreementRequired: boolean;
+    paymentRequired: boolean;
+}
+
+export interface ConciergeBookResult {
+    inspectionId: string;
+    status: 'awaiting_inspector' | 'awaiting_client';
+}
+
+export interface ConciergeTokenView {
+    inspection: {
+        id: string;
+        tenantId: string;
+        tenantSlug: string;
+        propertyAddress: string;
+        date: string;
+        clientName: string | null;
+        clientEmail: string | null;
+        agreementRequired: boolean;
+        inspectorId: string | null;
+    };
+    inspector: {
+        name: string | null;
+        photoUrl: string | null;
+        email: string | null;
+    } | null;
+    expired: boolean;
+    alreadyConfirmed: boolean;
+}
+
+function mintToken(): string {
+    // 32 bytes -> 64 hex chars. crypto.randomUUID() is 16 random bytes; concatenate
+    // two without dashes for full 256-bit entropy.
+    return (
+        crypto.randomUUID().replace(/-/g, '') +
+        crypto.randomUUID().replace(/-/g, '')
+    );
+}
+
+function toMs(value: Date | number | null | undefined): number {
+    if (value == null) return 0;
+    if (value instanceof Date) return value.getTime();
+    return Number(value);
+}
+
+export class ConciergeService {
+    /**
+     * Free-tier usage-quota guard (optional). Present only in SaaS deploys
+     * with `hasUsageQuota` (see deployment-profile.ts); undefined in
+     * standalone, where concierge booking stays unlimited. See the
+     * `consumeInspection` call site in createBooking.
+     */
+    constructor(
+        private db: D1Database,
+        private email: EmailService,
+        private appBaseUrl: string,
+        private planQuota?: PlanQuotaGuard,
+    ) {}
+
+    private getDrizzle() {
+        return drizzle(this.db);
+    }
+
+    /**
+     * Step 1 of the concierge flow. Verifies the agent ↔ tenant link is active,
+     * resolves the inspector (when one was named), reads
+     * tenant.concierge_review_required, and creates the hold in the
+     * appropriate state. Mints a magic-link token + sends the client confirm
+     * email when the tenant is in auto-confirm mode; otherwise sends the
+     * inspector-review notification.
+     */
+    async createBooking(params: ConciergeBookParams): Promise<ConciergeBookResult> {
+        const db = this.getDrizzle();
+
+        // 1. Verify this agent is bound to a live contact in this tenant.
+        //    IA-104 — the binding is the contact, so the row we check IS the
+        //    row we then file the booking against; there is no second lookup
+        //    that could resolve to a different contact.
+        const link = await db
+            .select({
+                id: contacts.id,
+                inspectorContactId: contacts.id,
+                invitedByUserId: contacts.createdByUserId,
+            })
+            .from(contacts)
+            .where(
+                and(
+                    eq(contacts.agentUserId, params.agentUserId),
+                    eq(contacts.tenantId, params.tenantId),
+                    isNull(contacts.agentRevokedAt),
+                ),
+            )
+            .get();
+        if (!link) {
+            throw Errors.Forbidden('Agent not linked to this tenant');
+        }
+
+        // 2. Resolve the inspector, when one was named at all. Either form must
+        //    land on a user inside THIS tenant — an id from elsewhere is a
+        //    rejection, never a silent unassigned hold.
+        const inspector = await resolveHoldInspector(db, params);
+
+        // 3. Read tenant config to decide which mode to enter.
+        const cfg = await db
+            .select()
+            .from(tenantConfigs)
+            .where(eq(tenantConfigs.tenantId, params.tenantId))
+            .get();
+        const reviewRequired = !!cfg?.conciergeReviewRequired;
+
+        // 4. Insert inspection in the appropriate concierge state.
+        const inspectionId = crypto.randomUUID();
+        const conciergeStatus: 'awaiting_inspector' | 'awaiting_client' =
+            reviewRequired ? 'awaiting_inspector' : 'awaiting_client';
+        // Quota is consumed only after every precondition check above (agent
+        // link active, inspector contact resolved, inspector user resolved)
+        // has passed and immediately before the insert that actually creates
+        // the inspection — a failed validation must never burn a free
+        // tenant's lifetime slot.
+        await this.planQuota?.consumeInspection(params.tenantId);
+        await db.insert(inspections).values({
+            id: inspectionId,
+            tenantId: params.tenantId,
+            inspectorId: inspector?.id ?? null,
+            propertyAddress: params.propertyAddress,
+            date: params.date,
+            // A booking someone else placed for the client is a HOLD: it wants
+            // an inspection, it does not settle one. The office (or the client's
+            // own confirmation) moves it on from here.
+            status: INSPECTION_STATUS.REQUESTED,
+            paymentStatus: 'unpaid',
+            paymentRequired: params.paymentRequired,
+            agreementRequired: params.agreementRequired,
+            price: 0,
+            conciergeStatus,
+            createdAt: new Date(),
+        });
+        // DB-8: mirror assignment into inspection_inspectors link table.
+        if (inspector) {
+            await syncInspectionAssignments(db, params.tenantId, inspectionId, { inspectorId: inspector.id });
+        }
+
+        if (params.services?.length) {
+            const total = await attachHoldServices(db, params.tenantId, inspectionId, params.services);
+            await db.update(inspections).set({ price: total })
+                .where(and(eq(inspections.id, inspectionId), eq(inspections.tenantId, params.tenantId)));
+        }
+
+        // Task 7b (people-role-profiles), FIXED (Task 9b regression) — mirror
+        // both the client and the referring agent into inspection_people
+        // (client / buyer_agent). Task 13 dropped the legacy clientName/
+        // clientEmail/clientPhone/referredByAgentId columns from inspections,
+        // so this is now the ONLY persistence of WHO. The client contact is
+        // resolved via the same idempotent upsert booking.service/core.ts use
+        // (matches by tenant + normalized email), so approveByInspector's
+        // PeopleService.getPrimaryClient join (Task 9b) always resolves a
+        // client for a concierge booking.
+        // Non-fatal: a people-write failure must never roll back an
+        // already-committed inspection row.
+        try {
+            const roleRows = await db.select({ id: contactRoleProfiles.id, key: contactRoleProfiles.key })
+                .from(contactRoleProfiles)
+                .where(and(eq(contactRoleProfiles.tenantId, params.tenantId), eq(contactRoleProfiles.active, true)));
+            const roleIdByKey = new Map(roleRows.map(r => [r.key, r.id]));
+            const people = new PeopleService({ DB: this.db });
+
+            let clientContactId: string | null = null;
+            if (params.clientEmail || params.clientName) {
+                const { id } = await new ContactService(this.db).upsertClientContact(params.tenantId, {
+                    name: params.clientName,
+                    email: params.clientEmail,
+                    type: 'client',
+                    ...(params.clientPhone ? { phone: params.clientPhone } : {}),
+                });
+                clientContactId = id;
+            }
+
+            const links: Array<[string | null, string | undefined]> = [
+                [clientContactId, roleIdByKey.get('client')],
+                [link.inspectorContactId, roleIdByKey.get('buyer_agent')],
+            ];
+            for (const [contactId, roleProfileId] of links) {
+                if (contactId && roleProfileId) {
+                    await people.addPerson(params.tenantId, inspectionId, contactId, roleProfileId);
+                }
+            }
+        } catch (err) {
+            logger.error('inspection-people write from concierge create failed', { inspectionId }, err instanceof Error ? err : undefined);
+        }
+
+        logger.info('concierge.createBooking', {
+            tenantId: params.tenantId,
+            inspectionId,
+            status: conciergeStatus,
+        });
+
+        // 5. Branch on mode: mint token + email client OR notify inspector.
+        if (!reviewRequired) {
+            await this.mintTokenAndEmailClient(
+                inspectionId,
+                params.tenantId,
+                params.clientEmail,
+                {
+                    propertyAddress: params.propertyAddress,
+                    date: params.date,
+                    inspectorName: inspector?.name ?? inspector?.email ?? 'your inspector',
+                },
+            );
+            return { inspectionId, status: 'awaiting_client' };
+        }
+        // Reviewer mode needs somebody to review it. The named inspector when
+        // there is one, else the inspector who brought this agent in — an
+        // unassigned hold still has to reach a human.
+        const reviewer = inspector ?? (await resolveInvitingUser(db, params.tenantId, link.invitedByUserId));
+        if (!reviewer) {
+            throw Errors.BadRequest('Choose an inspector — this company reviews agent bookings.');
+        }
+        try {
+            await this.email.sendConciergeInspectorReview(reviewer.email, {
+                inspectionId,
+                clientName: params.clientName,
+                propertyAddress: params.propertyAddress,
+                date: params.date,
+                reviewUrl: `${this.appBaseUrl.replace(/\/$/, '')}/inspections`,
+            });
+        } catch (err) {
+            logger.warn('concierge.inspectorReviewEmail.failed', {
+                tenantId: params.tenantId,
+                inspectionId,
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
+        return { inspectionId, status: 'awaiting_inspector' };
+    }
+
+    /**
+     * Step 2 (reviewer mode only). Inspector approves the draft: flips
+     * `concierge_status` from 'awaiting_inspector' to 'awaiting_client',
+     * mints the magic-link token, sends the client confirm email.
+     */
+    async approveByInspector(inspectionId: string, tenantId: string): Promise<void> {
+        const db = this.getDrizzle();
+        const insp = await db
+            .select()
+            .from(inspections)
+            .where(and(eq(inspections.id, inspectionId), eq(inspections.tenantId, tenantId)))
+            .get();
+        if (!insp) throw Errors.NotFound('Inspection not found');
+        if (insp.conciergeStatus !== 'awaiting_inspector') {
+            throw Errors.Conflict('Inspection is not awaiting inspector approval');
+        }
+        // Resolve the client via the inspection_people primary-client join
+        // (insp.clientEmail is a frozen legacy cache, dropped Task 13).
+        const client = await new PeopleService({ DB: this.db }).getPrimaryClient(tenantId, inspectionId);
+        if (!client?.email) {
+            throw Errors.BadRequest('Inspection has no client email on file');
+        }
+
+        // Resolve inspector for the email payload.
+        let inspectorName = 'your inspector';
+        if (insp.inspectorId) {
+            const inspector = await db
+                .select({ name: users.name, email: users.email })
+                .from(users)
+                .where(eq(users.id, insp.inspectorId))
+                .get();
+            inspectorName = inspector?.name ?? inspector?.email ?? inspectorName;
+        }
+
+        await db
+            .update(inspections)
+            .set({ conciergeStatus: 'awaiting_client' })
+            .where(and(eq(inspections.id, inspectionId), eq(inspections.tenantId, tenantId)));
+
+        await this.mintTokenAndEmailClient(inspectionId, tenantId, client.email, {
+            propertyAddress: insp.propertyAddress,
+            date: insp.date,
+            inspectorName,
+        });
+        logger.info('concierge.approveByInspector', { tenantId, inspectionId });
+    }
+
+    /**
+     * Step 3 (final). Client redeems the magic link. Verifies token validity
+     * (exists, not expired, not yet redeemed), clears the concierge_status,
+     * sets inspection.status='confirmed', marks the token confirmed_at, and
+     * notifies the agent who originally booked it.
+     */
+    async confirmByClient(token: string): Promise<{ inspectionId: string }> {
+        const db = this.getDrizzle();
+        const row = await this.resolveConfirmToken(token);
+        if (!row) throw Errors.NotFound('Token not found');
+        if (row.confirmedAt) throw Errors.Conflict('Token already used');
+        const expMs = toMs(row.expiresAt);
+        if (expMs <= Date.now()) throw Errors.BadRequest('Token has expired');
+
+        // #81 — a fifth way out of `cancelled`, reachable by someone who is not
+        // signed in. The link is minted BEFORE the client confirms, so the
+        // inspection can be cancelled while it is sitting in their inbox;
+        // redeeming it then resurrected the job as `confirmed`, with
+        // `cancel_reason` still on the row and no staff member involved.
+        //
+        // Deliberately NOT the shared USE_UNCANCEL_ENDPOINT refusal: that one
+        // names an API endpoint, and the audience here is a client following a
+        // link from an email. What they need to know is that the appointment is
+        // off and who to talk to, not which route the office should call.
+        const current = await db
+            .select({ status: inspections.status })
+            .from(inspections)
+            .where(and(eq(inspections.id, row.inspectionId), eq(inspections.tenantId, row.tenantId)))
+            .get();
+        if (current?.status === INSPECTION_STATUS.CANCELLED) {
+            throw Errors.BadRequest('This inspection was cancelled. Contact the inspection company to rebook.');
+        }
+
+        // Flip inspection state.
+        await db
+            .update(inspections)
+            .set({ conciergeStatus: null, status: INSPECTION_STATUS.CONFIRMED })
+            .where(
+                and(
+                    eq(inspections.id, row.inspectionId),
+                    eq(inspections.tenantId, row.tenantId),
+                ),
+            );
+        // Mark token used. Keyed on the row id — `resolveConfirmToken` just
+        // returned this row by hash, so the id is exact. The tenant filter is
+        // restated from that same row rather than assumed: the hash index is
+        // global (a confirm link arrives with no tenant in the URL), so the id
+        // alone would be a by-id write with nothing scoping it.
+        await db
+            .update(conciergeConfirmTokens)
+            .set({ confirmedAt: new Date() })
+            .where(and(
+                eq(conciergeConfirmTokens.id, row.id),
+                eq(conciergeConfirmTokens.tenantId, row.tenantId),
+            ));
+
+        // Notify the originating agent. The buyer's-agent contact is resolved
+        // via the inspection_people (buyer_agent) join (Task 9c-X2) — not the
+        // legacy inspections.referredByAgentId column (frozen cache, dropped
+        // Task 13) — then looked up in contacts as before.
+        try {
+            const insp = await db
+                .select({
+                    propertyAddress: inspections.propertyAddress,
+                    date: inspections.date,
+                })
+                .from(inspections)
+                .where(eq(inspections.id, row.inspectionId))
+                .get();
+            const buyerAgentContactId = await new PeopleService({ DB: this.db })
+                .contactIdForRole(row.tenantId, row.inspectionId, 'buyer_agent');
+            if (insp && buyerAgentContactId) {
+                const agentContact = await db
+                    .select({ email: contacts.email, name: contacts.name })
+                    .from(contacts)
+                    .where(
+                        and(
+                            eq(contacts.id, buyerAgentContactId),
+                            eq(contacts.tenantId, row.tenantId),
+                        ),
+                    )
+                    .get();
+                if (agentContact?.email) {
+                    await this.email.sendConciergeConfirmedToAgent(agentContact.email, {
+                        propertyAddress: insp.propertyAddress,
+                        date: insp.date,
+                        clientName: row.clientEmail,
+                    });
+                }
+            }
+        } catch (err) {
+            // Email failures must not block the state transition.
+            logger.warn('concierge.confirmedAgentEmail.failed', {
+                tenantId: row.tenantId,
+                inspectionId: row.inspectionId,
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
+
+        logger.info('concierge.confirmByClient', {
+            tenantId: row.tenantId,
+            inspectionId: row.inspectionId,
+        });
+        return { inspectionId: row.inspectionId };
+    }
+
+    /**
+     * Track I-a — resolve a presented confirm token to its row. Hash-first
+     * (token_hash) with a permanent legacy plaintext fallback that lazily
+     * upgrades the row in place. `token` is the PK; the upgrade rewrites it to a
+     * random sentinel and stores token_hash. Tier-1: hash only (single-use).
+     */
+    private async resolveConfirmToken(token: string): Promise<typeof conciergeConfirmTokens.$inferSelect | null> {
+        const db = this.getDrizzle();
+        // Hash-only. There is no plaintext column to fall back to, and there is
+        // nothing to lazily upgrade: every row this table has ever held that was
+        // reachable by plaintext is gone (the table was empty when the column was).
+        const hash = await hashToken(token);
+        return (await db.select().from(conciergeConfirmTokens)
+            .where(eq(conciergeConfirmTokens.tokenHash, hash)).get()) ?? null;
+    }
+
+    /**
+     * Read-only token resolution for the public /confirm/<token> page. Returns
+     * a view-friendly summary (inspector + property + date + agreement flag),
+     * along with `expired` and `alreadyConfirmed` flags so the page can render
+     * the right state. Returns null when the token does not exist.
+     */
+    async resolveToken(token: string): Promise<ConciergeTokenView | null> {
+        const db = this.getDrizzle();
+        const row = await this.resolveConfirmToken(token);
+        if (!row) return null;
+
+        const insp = await db
+            .select()
+            .from(inspections)
+            .where(eq(inspections.id, row.inspectionId))
+            .get();
+        if (!insp) return null;
+
+        const tenantRow = await db
+            .select({ slug: tenants.slug })
+            .from(tenants)
+            .where(eq(tenants.id, insp.tenantId))
+            .get();
+        const tenantSlug = tenantRow?.slug ?? '';
+
+        let inspector: ConciergeTokenView['inspector'] = null;
+        if (insp.inspectorId) {
+            const u = await db
+                .select({ name: users.name, photoUrl: users.photoUrl, email: users.email })
+                .from(users)
+                .where(eq(users.id, insp.inspectorId))
+                .get();
+            if (u) {
+                inspector = {
+                    name: u.name ?? null,
+                    photoUrl: u.photoUrl ?? null,
+                    email: u.email ?? null,
+                };
+            }
+        }
+
+        // Task 9c (people-role-profiles) — clientName/clientEmail are sourced
+        // from the inspection_people primary-client join (PeopleService), not
+        // the legacy inspections.client_name/_email columns (frozen cache,
+        // dropped Task 13). Hard cutover, no legacy-column fallback, mirroring
+        // approveByInspector's PeopleService.getPrimaryClient use above.
+        const primaryClient = await new PeopleService({ DB: this.db }).getPrimaryClient(insp.tenantId, insp.id);
+
+        const expMs = toMs(row.expiresAt);
+        return {
+            inspection: {
+                id: insp.id,
+                tenantId: insp.tenantId,
+                tenantSlug,
+                propertyAddress: insp.propertyAddress,
+                date: insp.date,
+                clientName: primaryClient?.name ?? null,
+                clientEmail: primaryClient?.email ?? null,
+                agreementRequired: !!insp.agreementRequired,
+                inspectorId: insp.inspectorId ?? null,
+            },
+            inspector,
+            expired: expMs <= Date.now(),
+            alreadyConfirmed: row.confirmedAt !== null && row.confirmedAt !== undefined,
+        };
+    }
+
+    /**
+     * Lists awaiting_inspector concierge inspections for the inspector
+     * dashboard's UPCOMING substate. Used by GET /api/inspections/dashboard
+     * + the dashboard count widget.
+     */
+    async listAwaitingInspector(tenantId: string): Promise<{ count: number }> {
+        const db = this.getDrizzle();
+        const rows = await db
+            .select({ id: inspections.id })
+            .from(inspections)
+            .where(
+                and(
+                    eq(inspections.tenantId, tenantId),
+                    eq(inspections.conciergeStatus, 'awaiting_inspector'),
+                ),
+            )
+            .all();
+        return { count: rows.length };
+    }
+
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    private async mintTokenAndEmailClient(
+        inspectionId: string,
+        tenantId: string,
+        clientEmail: string,
+        emailPayload: { propertyAddress: string; date: string; inspectorName: string },
+    ): Promise<void> {
+        const db = this.getDrizzle();
+        const token = mintToken();
+        await db.insert(conciergeConfirmTokens).values({
+            // Tier-1: hash only (single-use magic link). The plaintext lives in
+            // the email and nowhere else.
+            id: crypto.randomUUID(),
+            tokenHash: await hashToken(token),
+            inspectionId,
+            tenantId,
+            clientEmail,
+            expiresAt: new Date(Date.now() + TOKEN_TTL_MS),
+            confirmedAt: null,
+            createdAt: new Date(),
+        });
+        const confirmUrl = `${this.appBaseUrl.replace(/\/$/, '')}/confirm/${encodeURIComponent(token)}`;
+        try {
+            await this.email.sendConciergeClientConfirm(clientEmail, {
+                token,
+                confirmUrl,
+                propertyAddress: emailPayload.propertyAddress,
+                date: emailPayload.date,
+                inspectorName: emailPayload.inspectorName,
+            });
+        } catch (err) {
+            // Surface the token via DB even if email delivery flakes; an inspector
+            // can copy the link manually from a future admin tool. For A3 we just
+            // log + continue so the state transition isn't blocked.
+            logger.warn('concierge.clientConfirmEmail.failed', {
+                tenantId,
+                inspectionId,
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
+    }
+}

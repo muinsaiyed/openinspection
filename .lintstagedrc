@@ -1,0 +1,5 @@
+{
+  "{server,app,workers,packages}/**/*.{ts,tsx}": [
+    "eslint --fix --cache --cache-strategy content"
+  ]
+}

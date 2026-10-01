@@ -1,0 +1,757 @@
+/**
+ * Turning an upload into a batch.
+ *
+ * Three things are decided here and nowhere else: whether this person may run
+ * THIS import (per intent, reusing the gates the rest of the product already
+ * enforces), whether anything can read the file, and — when nothing can —
+ * whether there is anybody to hand it to.
+ *
+ * Where there is not, the file is refused BEFORE it is stored. Keeping a third
+ * party's personal data that we could do nothing with has no reason behind it,
+ * and "we might add an adapter later" is not one.
+ *
+ * ⚠️ EVERY refusal here is asserted on its OWN sentence, not on its status
+ * code. Four different guards on this one route answer 400, and three answer
+ * 403/422 in pairs — a spec that asserted the code alone would have passed with
+ * any one of them wired to the wrong branch. Each refusal is paired with a
+ * positive control: the same request with the single blocking condition removed.
+ */
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { Hono } from 'hono';
+import { eq } from 'drizzle-orm';
+import { createTestDb, setupSchema } from '../db';
+import { withBatch } from '../helpers/d1-binding';
+import { zipOf } from '../helpers/zip-fixture';
+import * as schema from '../../../server/lib/db/schema';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type { Database as SqliteDatabase } from 'better-sqlite3';
+import type { HonoConfig } from '../../../server/types/hono';
+import { AppError } from '../../../server/lib/errors';
+
+vi.mock('drizzle-orm/d1', () => ({ drizzle: vi.fn() }));
+import { drizzle as mockDrizzle } from 'drizzle-orm/d1';
+import migrationIntakeRoutes from '../../../server/api/migration-intake';
+import {
+    SAAS_PROFILE,
+    STANDALONE_PROFILE,
+    type DeploymentProfile,
+} from '../../../server/lib/deployment-profile';
+import {
+    MIGRATION_INTAKE_ASSISTED_RETENTION_DAYS,
+    MIGRATION_INTAKE_STAGED_RETENTION_DAYS,
+} from '../../../server/lib/compliance/retention-windows';
+// The shared R2 double rather than a copy of it: the store holds bytes, and a
+// per-file copy is the drift the harness exists to prevent.
+import { intakeBucket, storedText } from '../helpers/migration-intake-routes-harness';
+import type { OutboxEvent } from '../../../server/portal/outbox.service';
+
+const TENANT = '11111111-1111-1111-1111-1111111111a1';
+const USER = '22222222-2222-2222-2222-2222222222b2';
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const CONTACTS_CSV = 'Full Name,Email\nAlice Ng,alice@example.test\n';
+/**
+ * A file no adapter in the registry can read FOR A CONTACT IMPORT.
+ *
+ * Some other product's own JSON export -- exactly what somebody uploads when
+ * they are leaving a product that is not Spectora. The spreadsheet adapter
+ * refuses JSON outright (a line splitter finds "columns" in `{"a":1,"b":2}`
+ * because it is looking for commas), and the template adapter is never
+ * consulted for a contact import.
+ */
+const UNREADABLE = JSON.stringify({ exportedFrom: 'SomeOtherApp', records: [{ a: 1 }] });
+
+interface AppOpts {
+    role: string;
+    profile?: DeploymentProfile;
+    store: Map<string, Uint8Array>;
+    /** `permission_overrides` the capability resolver should read off the user row. */
+    overrides?: Record<string, boolean>;
+    /**
+     * Collects whatever the route hands the core→platform outbox.
+     *
+     * Absent on purpose in every other test here: the sink does not exist in
+     * standalone, and leaving `services` unset is the faithful shape of that.
+     * A route that dereferenced it unguarded would fail those tests rather than
+     * this one, which is the right way round.
+     */
+    emitted?: OutboxEvent[];
+}
+
+function appFor(opts: AppOpts) {
+    const app = new Hono<HonoConfig>();
+    // Mirrors what server/index.ts's onError does, so a guard's refusal reaches
+    // the assertions as its status AND its sentence rather than as a 500.
+    app.onError((err, c) => {
+        if (err instanceof AppError) {
+            return c.json({ success: false, error: { code: err.code, message: err.message } }, err.status);
+        }
+        throw err;
+    });
+    app.use('*', async (c, next) => {
+        c.set('tenantId', TENANT);
+        c.set('user', { sub: USER, role: opts.role as 'owner' });
+        c.set('userRole', opts.role as 'owner');
+        c.set('profile', opts.profile ?? SAAS_PROFILE);
+        if (opts.overrides) {
+            c.set('sdb', {
+                getById: async () => ({ permissionOverrides: opts.overrides }),
+            } as never);
+        }
+        if (opts.emitted) {
+            const sink = opts.emitted;
+            c.set('services', {
+                outbox: { append: async (e: OutboxEvent) => { sink.push(e); return 'id'; } },
+            } as never);
+        }
+        await next();
+    });
+    app.route('/api/imports', migrationIntakeRoutes);
+    return app;
+}
+
+/**
+ * The uploaded file, as text OR as bytes.
+ *
+ * Both arms, because every real vendor template export is a binary container
+ * and a spec that could only send text could only ever exercise the tabular
+ * half of this route.
+ */
+interface UploadedFile {
+    name: string;
+    text: string | Uint8Array;
+}
+
+function upload(fields: Record<string, string>, file: UploadedFile): FormData {
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+    const binary = typeof file.text !== 'string';
+    fd.append('file', new File(
+        [file.text as BlobPart], file.name,
+        { type: binary ? 'application/octet-stream' : 'text/csv' },
+    ));
+    return fd;
+}
+
+/**
+ * A template export as the export button produces it: a workbook, one row per
+ * canned comment. Built rather than checked in, so nothing derived from a real
+ * file enters this repository.
+ */
+async function templateExport(): Promise<Uint8Array> {
+    const rows = [
+        ['Section Name', 'Item Name', 'Comment Name', 'Comment Text', 'Comment Type (info, limit, defect)'],
+        ['Roof', 'Covering', 'Worn', 'The covering is worn.', 'defect'],
+    ];
+    const cell = (v: string, col: number, row: number) =>
+        `<c r="${String.fromCharCode(65 + col)}${row}" t="str"><v>${v}</v></c>`;
+    const body = rows.map((r, i) =>
+        `<row r="${i + 1}">${r.map((v, c) => cell(v, c, i + 1)).join('')}</row>`).join('');
+    return zipOf({
+        'xl/worksheets/sheet1.xml':
+            `<?xml version="1.0"?><worksheet><sheetData>${body}</sheetData></worksheet>`,
+    });
+}
+
+/** The waiting-run event, if this request produced one. */
+function assistanceEvent(emitted: OutboxEvent[]) {
+    return emitted.find((e) => e.type === 'migration.assistance_requested');
+}
+
+function post(opts: AppOpts, fields: Record<string, string>, file: UploadedFile) {
+    return appFor(opts).request(
+        '/api/imports',
+        { method: 'POST', body: upload(fields, file) },
+        { DB: {}, PHOTOS: intakeBucket(opts.store) },
+    );
+}
+
+async function message(res: Response): Promise<string> {
+    const body = await res.json() as { error?: { message?: string } };
+    return body.error?.message ?? '';
+}
+
+describe('POST /api/imports', () => {
+    let db: BetterSQLite3Database<typeof schema>;
+    let sqlite: SqliteDatabase;
+    let store: Map<string, Uint8Array>;
+
+    beforeEach(async () => {
+        const fix = createTestDb();
+        db = fix.db;
+        sqlite = fix.sqlite;
+        await setupSchema(sqlite);
+        // The staging service batches its writes, and better-sqlite3 is the one
+        // Drizzle driver with no `batch()` — see helpers/d1-binding.ts.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mockDrizzle as any).mockReturnValue(withBatch(db, sqlite));
+        store = new Map();
+        await db.insert(schema.tenants).values({
+            id: TENANT, slug: 'a', status: 'active', deploymentMode: 'shared', tier: 'free', createdAt: new Date(),
+        });
+        await db.insert(schema.users).values({
+            id: USER, tenantId: TENANT, email: 'owner@example.test', passwordHash: 'x',
+            role: 'owner', createdAt: new Date(),
+        });
+    });
+
+    it('stages a readable spreadsheet and stores the file it came from', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { batchId: string; status: string; needsAssistance: boolean } };
+        expect(body.data.status).toBe('staged');
+        expect(body.data.needsAssistance).toBe(false);
+        expect(store.size).toBe(1);
+        // The tie between run and file is the COLUMN, not the key's shape: the
+        // key is minted before the run has an id, so `source_key` is the only
+        // thing that can be asserted to point at what was actually stored.
+        const row = await db.select().from(schema.migrationBatches)
+            .where(eq(schema.migrationBatches.id, body.data.batchId)).get();
+        expect(row?.sourceKey).toMatch(new RegExp(`^${TENANT}/migrations/[^/]+/source\\.csv$`));
+        expect(storedText(store, row?.sourceKey as string)).toBe(CONTACTS_CSV);
+    });
+
+    it('records the storage authorisation and the staged run\'s own expiry', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        const { data } = await res.json() as { data: { batchId: string } };
+        const row = await db.select().from(schema.migrationBatches)
+            .where(eq(schema.migrationBatches.id, data.batchId)).get();
+        expect(row?.uploadAuthorizedBy).toBe(USER);
+        expect(row?.uploadAuthorizedAt).not.toBeNull();
+        expect(row?.uploadAuthorizationVersion).toBeTruthy();
+        // The shorter of the two windows: this run is on the operator's clock.
+        // Without a value here the sweep never reaches it and the file is kept
+        // forever under an authorisation that promised otherwise.
+        const days = ((row?.expiresAt as Date).getTime() - Date.now()) / DAY_MS;
+        expect(Math.round(days)).toBe(MIGRATION_INTAKE_STAGED_RETENTION_DAYS);
+        // Nobody was asked to read this file, so nobody is recorded as allowed to.
+        expect(row?.staffAccessAuthorizedBy).toBeNull();
+    });
+
+    it('refuses an upload that does not carry the storage authorisation, by name', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(400);
+        // THE point of asserting the sentence: the size cap and the empty-file
+        // check answer 400 from this same route.
+        expect(await message(res)).toBe(
+            'The file can only be kept with your agreement, and this upload did not carry it.',
+        );
+        expect(store.size).toBe(0);
+        expect(await db.select().from(schema.migrationBatches).all()).toEqual([]);
+    });
+
+    it('accepts that same upload once the authorisation is on it', async () => {
+        // Positive control for the refusal above: one field is the difference.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(201);
+        expect(store.size).toBe(1);
+    });
+
+    /**
+     * THE PROVENANCE NAMES THE ADAPTER, NOT ONLY THE VENDOR.
+     *
+     * The staged-run audit entry is deliberately narrow — its comment says
+     * "counts and provenance only. The file name is left out on purpose: an
+     * export is routinely named after the person it is about." Right, and it was
+     * recording the vendor the operator DECLARED while dropping which reader
+     * actually parsed the file and at which version.
+     *
+     * `AdapterMatch` carries both and nothing read either. They are the first
+     * thing anybody wants when a conversion turns out to have produced the wrong
+     * rows: two runs of the same vendor adapter can differ, and without the
+     * version there is no way to tell a bad file from a bad reader.
+     *
+     * Still no file name, and no row content — this adds the identity of OUR
+     * code, not anything about the third party in the file.
+     */
+    it('records which adapter, at which version, read the file', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'contacts.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(201);
+
+        const rows = await db.select().from(schema.auditLogs).all();
+        const staged = rows.find((r) => r.action === 'migration.staged');
+        expect(staged, 'no migration.staged audit entry').toBeDefined();
+        const meta = staged!.metadata as Record<string, unknown>;
+        expect(meta.adapterName).toBeTruthy();
+        expect(meta.adapterVersion).toBeTruthy();
+        // The narrowness the entry's own comment promises still holds.
+        expect(meta).not.toHaveProperty('fileName');
+    });
+
+    /**
+     * A FILE THAT IS SIMPLY MIS-DECLARED GETS THE CORRECTION, NOT THE HUMAN.
+     *
+     * `describeVendorMismatch` exists to tell these two apart and says so in its
+     * own header: "one offers a correction, the other offers the assisted path,
+     * and conflating them sends people down the wrong one." It was built, it was
+     * tested in adapter-contract.spec.ts — and nothing ever called it. The route
+     * answered every unmatched file with `openWaitingRun()`, which is the
+     * conflation that header warns about, and an expensive one: the assisted
+     * path needs an owner's decision, hands a third party's file to a person,
+     * and is refused outright on a deployment that has no support path. All
+     * because a picker was answered wrongly.
+     */
+    it('names the vendor a mis-declared file actually looks like, instead of parking it', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'spectora', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'contacts.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(422);
+        expect(await message(res)).toMatch(/csv_generic/);
+    });
+
+    // The file is refused BEFORE it is stored: a correction the operator can act
+    // on in one click is no reason to keep a third party's data lying around.
+    it('does not store a file it is about to hand back for correction', async () => {
+        await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'spectora', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'contacts.csv', text: CONTACTS_CSV },
+        );
+        expect(store.size).toBe(0);
+    });
+
+    it('parks an unreadable file for a person, on a platform that has one', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'weird.json', text: UNREADABLE },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { batchId: string; status: string; needsAssistance: boolean } };
+        expect(body.data.status).toBe('needs_assistance');
+        expect(body.data.needsAssistance).toBe(true);
+        expect(store.size).toBe(1);
+
+        const row = await db.select().from(schema.migrationBatches)
+            .where(eq(schema.migrationBatches.id, body.data.batchId)).get();
+        // Both authorisations, with their versions — a waiting run is the only
+        // kind a person opens, so the record of that agreement is what lets them.
+        expect(row?.staffAccessAuthorizedBy).toBe(USER);
+        expect(row?.staffAccessAuthorizationVersion).toBeTruthy();
+        // The longer window: this clock is on us, not on the operator.
+        const days = ((row?.expiresAt as Date).getTime() - Date.now()) / DAY_MS;
+        expect(Math.round(days)).toBe(MIGRATION_INTAKE_ASSISTED_RETENTION_DAYS);
+    });
+
+    /**
+     * Whether anything actually TELLS the deployment operator.
+     *
+     * Everything above proves a waiting run is created correctly. None of it
+     * proves anybody hears about it, and for the whole life of this pipeline
+     * nobody did: `notifyReceived` emails the workspace's own owners and
+     * managers, so a file could sit in `needs_assistance` until it expired with
+     * no one on the operator's side ever having been told it arrived.
+     *
+     * ⚠️ There is an audit action of the SAME NAME, written a few lines from the
+     * emit in the route. It is not this. A search for the name finds it first,
+     * and finding it proves only that this workspace's own trail records the
+     * request — the audit table is tenant-scoped and nothing on the operator's
+     * side reads it. These tests assert the OTHER artefact.
+     */
+    describe('telling the platform a file is waiting', () => {
+        it('emits the waiting-run event through the door that names assistance outright', async () => {
+            const emitted: OutboxEvent[] = [];
+            const res = await post(
+                { role: 'owner', store, emitted },
+                { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+                { name: 'mystery.bin', text: UNREADABLE },
+            );
+            expect(res.status).toBe(201);
+            const body = await res.json() as { data: { batchId: string } };
+            const event = assistanceEvent(emitted);
+            expect(event, 'nothing told the platform a file is waiting').toBeDefined();
+            expect(event!.payload['batchId']).toBe(body.data.batchId);
+            expect(event!.payload['tenantId']).toBe(TENANT);
+            // No adapter ran, and this door never asked which product it came
+            // from — so there is no vendor to name and the wire says so.
+            expect(event!.payload['vendor']).toBeNull();
+        });
+
+        it('emits it through the OTHER door too — the one an unreadable file falls through', async () => {
+            // The two doors reach the same decision by different routes, and the
+            // owner rule already had to be written on both after it was written
+            // on only one. A notice on only one door is that defect again.
+            const emitted: OutboxEvent[] = [];
+            const res = await post(
+                { role: 'owner', store, emitted },
+                { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+                { name: 'weird.json', text: UNREADABLE },
+            );
+            expect(res.status).toBe(201);
+            const event = assistanceEvent(emitted);
+            expect(event, 'the unreadable-file door told nobody').toBeDefined();
+            // This door DID ask which product the file came from, so the
+            // operator's own declaration travels. It is not a guess: no adapter
+            // read the file, and nothing here inferred anything.
+            expect(event!.payload['vendor']).toBe('csv_generic');
+        });
+
+        it('carries the retention clock, in the unit the console subtracts', async () => {
+            const emitted: OutboxEvent[] = [];
+            await post(
+                { role: 'owner', store, emitted },
+                { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+                { name: 'mystery.bin', text: UNREADABLE },
+            );
+            const payload = assistanceEvent(emitted)!.payload;
+            const days = ((payload['expiresAt'] as number) - (payload['uploadedAt'] as number)) / DAY_MS;
+            expect(Math.round(days)).toBe(MIGRATION_INTAKE_ASSISTED_RETENTION_DAYS);
+            // The row's clock and the wire's clock are the same clock. Two
+            // numbers that agree today and are computed twice drift.
+            const row = await db.select().from(schema.migrationBatches).get();
+            expect(payload['expiresAt']).toBe((row?.expiresAt as Date).getTime());
+        });
+
+        it('says the file may not be used for anything beyond this run', async () => {
+            // Always false, on every run: two authorisations are asked for —
+            // keeping the file, and a person opening it — and there is no third.
+            // The console shows this per row so the rule is visible where
+            // somebody could break it, rather than remembered.
+            const emitted: OutboxEvent[] = [];
+            await post(
+                { role: 'owner', store, emitted },
+                { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+                { name: 'mystery.bin', text: UNREADABLE },
+            );
+            expect(assistanceEvent(emitted)!.payload['secondaryUseAuthorised']).toBe(false);
+        });
+
+        it('NEGATIVE CONTROL — a run that staged cleanly tells the platform nothing', async () => {
+            // Otherwise every assertion above would pass for a route that
+            // emitted the event on every upload, and the operator's queue would
+            // fill with runs nobody is waiting on.
+            const emitted: OutboxEvent[] = [];
+            const res = await post(
+                { role: 'owner', store, emitted },
+                { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+                { name: 'contacts.csv', text: CONTACTS_CSV },
+            );
+            expect(res.status).toBe(201);
+            expect(assistanceEvent(emitted)).toBeUndefined();
+        });
+
+        it('NEGATIVE CONTROL — a refused upload tells the platform nothing either', async () => {
+            // The refusal happens before the run exists. An event naming a batch
+            // id nothing ever wrote would put a row in the operator's queue that
+            // can never be opened, downloaded or closed.
+            const emitted: OutboxEvent[] = [];
+            const res = await post(
+                { role: 'owner', profile: STANDALONE_PROFILE, store, emitted },
+                { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+                { name: 'weird.json', text: UNREADABLE },
+            );
+            expect(res.status).not.toBe(201);
+            expect(assistanceEvent(emitted)).toBeUndefined();
+        });
+    });
+
+    it('refuses an unreadable file BEFORE storing it where there is nobody to hand it to', async () => {
+        const res = await post(
+            { role: 'owner', profile: STANDALONE_PROFILE, store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'weird.json', text: UNREADABLE },
+        );
+        expect(res.status).toBe(422);
+        const text = await message(res);
+        expect(text).toMatch(/Spectora|spreadsheet/i);
+        // This deployment has no support path at all, so the sentence must not
+        // offer one — the authorisation was even supplied and changed nothing.
+        expect(text).not.toMatch(/converted by a person/i);
+        // The whole point: nothing was written.
+        expect(store.size).toBe(0);
+        expect(await db.select().from(schema.migrationBatches).all()).toEqual([]);
+    });
+
+    it('refuses an unreadable file where a person could read it but was not authorised to', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'weird.json', text: UNREADABLE },
+        );
+        expect(res.status).toBe(422);
+        // A DIFFERENT refusal from the one above at the same status code: this
+        // one names the way forward, because on this deployment there is one.
+        expect(await message(res)).toMatch(/converted by a person/i);
+        expect(store.size).toBe(0);
+        expect(await db.select().from(schema.migrationBatches).all()).toEqual([]);
+    });
+
+    it('never opens a waiting run without the authorisation already recorded', async () => {
+        // Why there is no route for granting staff access AFTER the fact: this
+        // route refuses, and stores nothing, when a person has not been
+        // authorised to open the file, and it records the name, the instant and
+        // the wording version in the same insert as the row. So there is no such
+        // thing as a waiting run missing that authorisation.
+        //
+        // Both doors that can open one are driven, not one: the unreadable-file
+        // fallback and the "I do not know what this is" entry point write the
+        // batch through different branches.
+        const fallback = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'weird.json', text: UNREADABLE },
+        );
+        expect(fallback.status).toBe(201);
+        const direct = await post(
+            { role: 'owner', store },
+            { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'x.csv', text: CONTACTS_CSV },
+        );
+        expect(direct.status).toBe(201);
+
+        const waiting = await db.select().from(schema.migrationBatches)
+            .where(eq(schema.migrationBatches.status, 'needs_assistance')).all();
+        for (const r of waiting) {
+            // All THREE, not a flag: who agreed, when, and to WHICH WORDING. A
+            // boolean cannot be read back later as an answer to "agreed to what",
+            // and a name with no version is a signature on an unknown document.
+            expect(r.staffAccessAuthorizedBy).toBe(USER);
+            expect(r.staffAccessAuthorizedAt).toBeInstanceOf(Date);
+            expect(r.staffAccessAuthorizationVersion).toBe('1');
+        }
+        // The positive control: the loop above passes trivially on an empty
+        // list, and it is one status filter away from always being empty.
+        expect(waiting).toHaveLength(2);
+    });
+
+    it('lets only an owner start the "I do not know what this is" route', async () => {
+        const res = await post(
+            { role: 'manager', store },
+            { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'x.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(403);
+        // Named, because the role floor below refuses with the same code.
+        expect(await message(res)).toBe('Only an owner can send a file to be converted.');
+        expect(store.size).toBe(0);
+    });
+
+    it('lets the owner start it — the same request, one role different', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'x.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { status: string } };
+        // Even a readable spreadsheet: this entry point never runs an adapter,
+        // because guessing what the file is, is the thing it exists not to do.
+        expect(body.data.status).toBe('needs_assistance');
+    });
+
+    it('lets only an owner reach the SAME decision through the unreadable-file door', async () => {
+        // The rule is about the decision, not about the button that led to it:
+        // putting a file of somebody else's personal data in front of an
+        // outside person is an owner's call. A manager starting a contact
+        // import and happening to pick a file no adapter can read arrives at
+        // exactly that decision by a different route, and the intent gate never
+        // sees it — `contacts.import` is allowed for a manager, and the
+        // fallback is chosen afterwards by whether an adapter matched.
+        const res = await post(
+            { role: 'manager', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'weird.json', text: UNREADABLE },
+        );
+        expect(res.status).toBe(403);
+        // Its own sentence: three other refusals on this route answer 403, and
+        // this one has to say what the manager could not decide.
+        expect(await message(res)).toBe(
+            'Nothing here can read that file, and only an owner can decide to have somebody open it.',
+        );
+        // Refused BEFORE the file is stored — the same rule the other two
+        // unreadable-file refusals follow.
+        expect(store.size).toBe(0);
+        expect(await db.select().from(schema.migrationBatches).all()).toEqual([]);
+    });
+
+    it('lets an owner through that same door — the same request, one role different', async () => {
+        // Positive control for the refusal above, on THIS door specifically:
+        // without it, "manager was refused" could be caused by the file, the
+        // intent, or the authorisation rather than by the role.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'weird.json', text: UNREADABLE },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { status: string } };
+        expect(body.data.status).toBe('needs_assistance');
+        expect(store.size).toBe(1);
+    });
+
+    it('still lets a manager run an import of a file something CAN read', async () => {
+        // The other side of the same control: the owner rule must not have
+        // become a role floor on the whole route. A manager importing a
+        // readable spreadsheet decides nothing about staff access.
+        const res = await post(
+            { role: 'manager', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { status: string } };
+        expect(body.data.status).toBe('staged');
+    });
+
+    it('keeps an inspector out of the route entirely', async () => {
+        const res = await post(
+            { role: 'inspector', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(403);
+        // The route's own floor, refusing before any intent gate is consulted.
+        expect(await message(res)).toBe('Requires one of [owner, manager]');
+        expect(store.size).toBe(0);
+    });
+
+    it('refuses a template import from somebody the Templates page hides it from', async () => {
+        const res = await post(
+            { role: 'manager', store, overrides: { templateImport: false } },
+            { intent: 'templates.create', vendor: 'spectora', uploadAuthorized: 'true' },
+            { name: 't.json', text: '{"id":"x","name":"R","sections":[]}' },
+        );
+        expect(res.status).toBe(403);
+        expect(await message(res)).toBe("Requires the 'templateImport' capability");
+        expect(store.size).toBe(0);
+    });
+
+    it('lets the same manager through once the capability is back', async () => {
+        // Positive control: identical request, one override flipped.
+        const res = await post(
+            { role: 'manager', store, overrides: { templateImport: true } },
+            { intent: 'templates.create', vendor: 'spectora', uploadAuthorized: 'true' },
+            { name: 'Residential.xlsx', text: await templateExport() },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { status: string } };
+        expect(body.data.status).toBe('staged');
+    });
+
+    it('refuses a file over the deployment cap without storing it', async () => {
+        const res = await post(
+            { role: 'owner', profile: { ...SAAS_PROFILE, importMaxCsvBytes: 10 }, store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(400);
+        // Both numbers, and a sentence distinct from the authorisation refusal
+        // that shares this status code.
+        expect(await message(res)).toMatch(/the limit is 0 MB/);
+        expect(store.size).toBe(0);
+    });
+
+    it('refuses an entry point this product does not offer', async () => {
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'invoices.import', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(400);
+        // The schema, not a handler check — named by its code and the field it
+        // rejected, so it cannot be confused with the two handler 400s above.
+        const body = await res.json() as { error: { code: string; fields: Record<string, string> } };
+        expect(body.error.code).toBe('VALIDATION_ERROR');
+        expect(Object.keys(body.error.fields)).toContain('intent');
+        expect(store.size).toBe(0);
+    });
+
+    it('refuses an upload that never says which product the file came from', async () => {
+        // The rule this replaces was deleted twice. It lived in the registry as
+        // "the intent decides the vendor" and was then reinstated in this route
+        // as a default, so that callers with no picker kept working. With the
+        // picker built, a request carrying no declaration must be REFUSED and
+        // not guessed at: a guess here silently ignores what the operator chose
+        // on the screen, which is the exact failure the picker was built for.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(400);
+        expect(await message(res)).toMatch(/which product/i);
+        expect(store.size).toBe(0);
+    });
+
+    it('reads that same upload once it says — the positive control', async () => {
+        // One field different. Without this, the refusal above would also be
+        // satisfied by a route that refused every upload.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: CONTACTS_CSV },
+        );
+        expect(res.status).toBe(201);
+    });
+
+    it('does not ask the entry point whose owner could not name the product', async () => {
+        // `assisted.full` exists for exactly that case, so demanding a
+        // declaration there would close the one door built for not having one.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'assisted.full', uploadAuthorized: 'true', staffAccessAuthorized: 'true' },
+            { name: 'mystery.bin', text: new Uint8Array([1, 2, 3]) },
+        );
+        expect(res.status).toBe(201);
+        const body = await res.json() as { data: { needsAssistance: boolean } };
+        expect(body.data.needsAssistance).toBe(true);
+    });
+
+    it('reads the declared product, not the one the intent used to imply', async () => {
+        // The deleted rule made `templates.create` mean Spectora. A Home
+        // Inspector Pro template is a different container entirely, and the
+        // only thing that can tell this route which reader to run is the
+        // declaration on the request.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'templates.create', vendor: 'home_inspector_pro', uploadAuthorized: 'true' },
+            { name: 't.xlsx', text: await templateExport() },
+        );
+        // The file IS a Spectora workbook, so the declared reader must refuse
+        // it. A route still deriving `spectora` from the intent would stage it.
+        expect(res.status).not.toBe(201);
+    });
+
+    it('takes the stored file back out when staging refuses the bundle', async () => {
+        // A CSV with a header and no data rows is readable and stages nothing.
+        // The object is written BEFORE staging runs — the batch has to carry a
+        // key from its first write — so the refusal has to remove it, or a
+        // file is retained under an authorisation for a run that never existed.
+        const res = await post(
+            { role: 'owner', store },
+            { intent: 'contacts.import', vendor: 'csv_generic', uploadAuthorized: 'true' },
+            { name: 'c.csv', text: 'Full Name,Email\n' },
+        );
+        expect(res.status).toBe(400);
+        // WHICH 400 is load-bearing here, not decoration. An empty store also
+        // satisfies this test if the request were refused before anything was
+        // written — by the authorisation check or the size cap, both of which
+        // answer 400 from this route. Naming the staging refusal is what proves
+        // the file really was stored first and really was taken back out.
+        expect(await message(res)).toBe('This file contains no contacts to import.');
+        expect(store.size).toBe(0);
+        expect(await db.select().from(schema.migrationBatches).all()).toEqual([]);
+    });
+});

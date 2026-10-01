@@ -1,0 +1,374 @@
+import { Link, useLoaderData, useActionData, useNavigation, useFetcher } from "react-router";
+import { SettingsCrumb } from "~/components/SettingsCrumb";
+import { useForm } from "@conform-to/react";
+import { parseWithZod } from "@conform-to/zod/v4";
+import type { Route } from "./+types/settings-advanced";
+import { requireToken } from "~/lib/session.server";
+import { createApi } from "~/lib/api-client.server";
+import { useFlash } from "~/hooks/useFlash";
+import { makeStripeConnectSchema } from "~/lib/forms/settings-config.schema";
+import { requireAdminLoader } from "~/lib/access.server";
+import { AccessDenied } from "~/components/AccessDenied";
+import { StripeConnectPanel } from "~/components/settings/advanced/StripeConnectPanel";
+import { AiFeaturesPanel } from "~/components/settings/advanced/AiFeaturesPanel";
+import { IntegrationKeysPanel } from "~/components/settings/advanced/IntegrationKeysPanel";
+import { IsnPanel, ISN_SECRET_KEYS } from "~/components/settings/advanced/IsnPanel";
+import { loadIsnSettings } from "~/lib/isn-settings.server";
+import { SectionNav } from "~/components/settings/SectionNav";
+import { parseTestResults } from "~/lib/connection-test";
+import { m } from "~/paraglide/messages";
+
+// F68 — with no `meta` this page's browser tab reads only "OpenInspection".
+// Why it is a catalogue key and not a literal: settings-meta-titles.test.ts.
+export function meta() {
+  return [{ title: m.settings_advanced_meta_title() }];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
+interface AdvancedConfig {
+  stripeConnected: boolean;
+  stripeAccountId?: string | null;
+  geminiConfigured: boolean;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Loader                                                             */
+/* ------------------------------------------------------------------ */
+
+export async function loader({ request, context }: Route.LoaderArgs) {
+  const { forbidden, token } = await requireAdminLoader(context, request);
+  if (forbidden) return { forbidden: true as const };
+  const api = createApi(context, { token });
+
+  // Fetch Stripe connect status + secrets + AI configuration in parallel.
+  const [stripeRes, secretsRes, testResultsRes, aiConfigRes] = await Promise.all([
+    api.admin["stripe-connect"].$get().catch(() => null),
+    api.secrets.secrets.$get().catch(() => null),
+    api.integrations["test-results"].$get().catch(() => null),
+    api.integrationsAi.config.$get().catch(() => null),
+  ]);
+
+  let stripeConnected = false;
+  let stripeAccountId: string | null = null;
+  if (stripeRes?.ok) {
+    const body = (await stripeRes.json()) as Record<string, unknown>;
+    const data = (body.data ?? {}) as Record<string, unknown>;
+    stripeConnected = Boolean(data?.accountId);
+    stripeAccountId = (data?.accountId as string) || null;
+  }
+
+  const secretsBody = secretsRes?.ok ? ((await secretsRes.json()) as Record<string, unknown>) : {};
+  const secrets = (secretsBody.data ?? {}) as Record<string, string>;
+
+  // "Configured" reflects the tenant's OWN bound key in encrypted secrets — the
+  // only credential this panel manages (no GET /api/ai/status route — derive
+  // from presence). A deployment may also provide a key for tenants it grants
+  // managed access to; that is resolved server-side and is not shown here.
+  const geminiConfigured = !!secrets.GEMINI_API_KEY;
+
+  const testResults = await parseTestResults(testResultsRes);
+
+  // A failed read reads as "not configured yet", which is what an unreachable
+  // config and an unset one look like to the person on this page. The switch
+  // defaults to the column's own default rather than to a second opinion.
+  const aiCfgBody = aiConfigRes?.ok ? ((await aiConfigRes.json()) as { data?: { aiEnabled: boolean; aiBaseUrl: string; aiModel: string; courtesyTranslationEnabled: boolean } }) : null;
+  const ai = aiCfgBody?.data ?? { aiEnabled: true, aiBaseUrl: "", aiModel: "", courtesyTranslationEnabled: false };
+
+  return {
+    config: { stripeConnected, stripeAccountId, geminiConfigured } as AdvancedConfig,
+    ai,
+    secrets: {
+      GEMINI_API_KEY: secrets.GEMINI_API_KEY || "",
+      GOOGLE_PLACES_API_KEY: secrets.GOOGLE_PLACES_API_KEY || "",
+      ESTATED_API_KEY: secrets.ESTATED_API_KEY || "",
+      APP_BASE_URL: secrets.APP_BASE_URL || "",
+    },
+    testResults,
+    isn: loadIsnSettings(secrets),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Action                                                             */
+/* ------------------------------------------------------------------ */
+
+export async function action({ request, context }: Route.ActionArgs) {
+  const token = await requireToken(context, request);
+  const fd = await request.formData();
+  const intent = fd.get("intent");
+  const api = createApi(context, { token });
+
+  // Shared subset -> secrets-store PUT: ISN and Integration Keys share this one
+  // call site instead of each writing their own (see check-middleware-budget.mjs).
+  const putSecrets = async (keys: readonly string[], fallbackError: string) => {
+    const body: Record<string, string> = {};
+    for (const key of keys) {
+      const val = fd.get(key);
+      if (val && typeof val === "string" && val.trim()) body[key] = val;
+    }
+    if (Object.keys(body).length === 0) return { intent, success: true, error: null, field: null, test: null };
+    const res = await api.secrets.secrets.$put({ json: body });
+    if (res.ok) return { intent, success: true, error: null, field: null, test: null };
+    const errBody = (await res.json().catch(() => null)) as { error?: { message?: string; field?: string } } | null;
+    return { intent, success: false, error: errBody?.error?.message ?? fallbackError, field: errBody?.error?.field ?? null, test: null };
+  };
+
+  if (intent === "connect-stripe") {
+    const submission = parseWithZod(fd, { schema: makeStripeConnectSchema() });
+    if (submission.status !== "success") {
+      return submission.reply();
+    }
+    const { stripeAccountId } = submission.value;
+    const res = await api.admin["stripe-connect"].$put({ json: { accountId: stripeAccountId } });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      return submission.reply({
+        formErrors: [(err as Record<string, string>)?.message || m.settings_advanced_stripe_connect_error()],
+      });
+    }
+    return { success: true, error: null };
+  }
+
+  if (intent === "disconnect-stripe") {
+    const res = await api.admin["stripe-connect"].$delete();
+    if (!res.ok) {
+      return { intent, success: false, error: m.settings_advanced_stripe_disconnect_error(), field: null, test: null };
+    }
+    return { intent, success: true, error: null, field: null, test: null };
+  }
+
+  if (intent === "save-ai") {
+    const geminiApiKey = fd.get("GEMINI_API_KEY");
+    const newKey = typeof geminiApiKey === "string" ? geminiApiKey.trim() : "";
+    // A key already on file may be CONFIRMED without being re-entered. The
+    // SecretField submits an empty value when it was never focused, so a
+    // workspace whose key predates the confirmation requirement would otherwise
+    // have to re-paste a credential it already has just to lift the pause.
+    const keyConfigured = fd.get("keyConfigured") === "1";
+    if (!newKey && !keyConfigured) {
+      return { intent, success: false, error: m.settings_advanced_api_key_required(), field: "GEMINI_API_KEY", test: null };
+    }
+    // The three statements the workspace confirms about its own AI provider
+    // account. Read as present/absent — an unchecked box sends nothing at all,
+    // which is why the API field has no default: "absent" must mean "not
+    // confirmed", never "false by default". The API refuses the save without
+    // all three, so this is a faithful relay, not the enforcement point.
+    const aiKeyAttestation = {
+      reviewedProviderTerms: fd.get("attestReviewedProviderTerms") === "on",
+      tierPermitsIntendedUse: fd.get("attestTierPermitsIntendedUse") === "on",
+      understandsProviderProcessing: fd.get("attestUnderstandsProviderProcessing") === "on",
+    };
+    if (Object.values(aiKeyAttestation).some((confirmed) => !confirmed)) {
+      return { intent, success: false, error: m.settings_ai_attest_required(), field: "GEMINI_API_KEY", test: null };
+    }
+    const res = await api.secrets.secrets.$put({
+      json: newKey ? { GEMINI_API_KEY: newKey, aiKeyAttestation } : { aiKeyAttestation },
+    });
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => null)) as
+        | { error?: { message?: string; field?: string } }
+        | null;
+      return {
+        intent,
+        success: false,
+        error: errBody?.error?.message ?? m.settings_advanced_ai_save_error(),
+        field: errBody?.error?.field ?? null,
+        test: null,
+      };
+    }
+    // The provider configuration is not a secret and does not live with the
+    // key. Saving it after the key means a rejected attestation leaves BOTH
+    // untouched, rather than storing an endpoint for a key that was refused.
+    const cfgRes = await api.integrationsAi.config.$put({
+      json: {
+        aiEnabled: fd.get("aiEnabled") === "on",
+        courtesyTranslationEnabled: fd.get("courtesyTranslationEnabled") === "on",
+        aiBaseUrl: String(fd.get("aiBaseUrl") ?? ""),
+        aiModel: String(fd.get("aiModel") ?? ""),
+      },
+    });
+    if (!cfgRes.ok) {
+      return { intent, success: false, error: m.settings_advanced_ai_save_error(), field: "aiBaseUrl", test: null };
+    }
+    return { intent, success: true, error: null, field: null, test: null };
+  }
+
+  if (intent === "test-ai") {
+    const res = await api.integrationsAi.test.$post({
+      json: {
+        baseUrl: String(fd.get("aiBaseUrl") ?? ""),
+        model: String(fd.get("aiModel") ?? ""),
+        apiKey: String(fd.get("aiApiKey") ?? ""),
+      },
+    });
+    // This endpoint always answers 200 — the outcome is IN the body, with
+    // `field` naming which input to blame. A transport failure and a rejected
+    // configuration are different things and only one of them has a field.
+    const body = (await res.json().catch(() => null)) as
+      | { data?: { ok: true } | { ok: false; field: string; message: string } }
+      | null;
+    const result = body?.data;
+    if (!result) {
+      return { intent, success: false, error: m.settings_connection_test_failed(), field: null, test: null };
+    }
+    if (!result.ok) {
+      return { intent, success: false, error: result.message, field: result.field, test: null };
+    }
+    return { intent, success: true, error: null, field: null, test: { ok: true as const } };
+  }
+
+  if (intent === "save-isn") return putSecrets(ISN_SECRET_KEYS, m.settings_isn_save_error());
+
+  if (intent === "save-advanced-secrets") {
+    return putSecrets(["GOOGLE_PLACES_API_KEY", "ESTATED_API_KEY", "APP_BASE_URL"], m.settings_advanced_integration_keys_save_error());
+  }
+
+  return { intent: null, success: false, error: m.settings_unknown_action(), field: null, test: null };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Page                                                               */
+/* ------------------------------------------------------------------ */
+
+export default function SettingsAdvancedPage() {
+  const loaderResult = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
+  const nav = useNavigation();
+  const geminiTestFetcher = useFetcher<typeof action>();
+
+  // Only the `connect-stripe` intent returns a Conform SubmissionResult; the
+  // other intents return a `{ success, error }` flash shape. Feed Conform its
+  // own result, never the flash object (which has no `initialValue`/`error`).
+  const stripeResult =
+    actionData && !("success" in actionData) ? actionData : undefined;
+  const [stripeForm, stripeFields] = useForm({
+    lastResult: stripeResult,
+    onValidate({ formData }) {
+      return parseWithZod(formData, { schema: makeStripeConnectSchema() });
+    },
+    shouldValidate: "onBlur",
+    shouldRevalidate: "onInput",
+  });
+
+  // Pending save state, per secret intent.
+  const savingAi = nav.state !== "idle" && nav.formData?.get("intent") === "save-ai";
+  const savingAdvanced =
+    nav.state !== "idle" && nav.formData?.get("intent") === "save-advanced-secrets";
+
+  // Transient success flash — visible for 4s after a save round-trip.
+  const { flashVisible } = useFlash(
+    !!actionData && "success" in actionData && !!actionData.success,
+    actionData,
+  );
+
+  if ("forbidden" in loaderResult) return <AccessDenied />;
+  const { config, secrets, testResults, ai, isn } = loaderResult;
+
+  // Map a server `field` error back onto the matching SecretField.
+  const secretFieldError = (name: string): string | undefined => {
+    if (
+      actionData &&
+      "field" in actionData &&
+      actionData.field === name &&
+      "success" in actionData &&
+      !actionData.success
+    ) {
+      return actionData.error ?? undefined;
+    }
+    return undefined;
+  };
+
+  const navSections = [
+    { id: "stripe-connect", label: m.settings_stripeconnect_heading() },
+    { id: "ai-features", label: m.settings_ai_heading() },
+    { id: "integration-keys", label: m.settings_intkeys_heading() },
+    { id: "isn", label: m.settings_isn_heading() },
+    { id: "data", label: m.settings_advanced_data_heading() },
+  ];
+
+  return (
+    <div className="space-y-ih-list max-w-3xl">
+      <SettingsCrumb items={[{ label: m.settings_crumb_root(), href: "/settings" }, { label: m.settings_advanced_crumb() }]} />
+      <p className="text-[13px] text-ih-fg-3">{m.settings_advanced_intro()}</p>
+
+      {/* Flash */}
+      {flashVisible && actionData && "success" in actionData && actionData.success && (
+        <div className="px-4 py-2.5 rounded-md bg-ih-ok-bg border border-ih-ok-fg/20 text-[13px] text-ih-ok-fg font-medium">
+          {m.settings_flash_saved()}
+        </div>
+      )}
+      {actionData &&
+      "error" in actionData &&
+      typeof actionData.error === "string" &&
+      actionData.error &&
+      !("field" in actionData && actionData.field) ? (
+        <div className="px-4 py-2.5 rounded-md bg-ih-bad-bg border border-ih-bad text-[13px] text-ih-bad-fg font-medium">
+          {actionData.error}
+        </div>
+      ) : null}
+
+      {/* In-page section navigation (sticky; scroll-spy). Shows only when ≥3 sections visible. */}
+      <SectionNav sections={navSections} />
+
+      {/* Stripe Connect */}
+      <div id="stripe-connect" className="scroll-mt-12">
+        <StripeConnectPanel
+          stripeConnected={config.stripeConnected}
+          stripeAccountId={config.stripeAccountId}
+          stripeForm={stripeForm}
+          stripeFields={stripeFields}
+        />
+      </div>
+
+      {/* AI features */}
+      <div id="ai-features" className="scroll-mt-12">
+        <AiFeaturesPanel
+          geminiConfigured={config.geminiConfigured}
+          aiEnabled={ai.aiEnabled}
+          courtesyTranslationEnabled={ai.courtesyTranslationEnabled}
+          aiBaseUrl={ai.aiBaseUrl}
+          aiModel={ai.aiModel}
+          value={secrets.GEMINI_API_KEY}
+          fieldError={secretFieldError}
+          saving={savingAi}
+          geminiTestFetcher={geminiTestFetcher}
+          testResults={testResults}
+        />
+      </div>
+
+      {/* Integration API keys */}
+      <div id="integration-keys" className="scroll-mt-12">
+        <IntegrationKeysPanel
+          secrets={{
+            GOOGLE_PLACES_API_KEY: secrets.GOOGLE_PLACES_API_KEY,
+            ESTATED_API_KEY: secrets.ESTATED_API_KEY,
+            APP_BASE_URL: secrets.APP_BASE_URL,
+          }}
+          fieldError={secretFieldError}
+          saving={savingAdvanced}
+        />
+      </div>
+
+      <div id="isn" className="scroll-mt-12">
+        <IsnPanel secrets={isn} fieldError={secretFieldError} saving={nav.state !== "idle" && nav.formData?.get("intent") === "save-isn"} />
+      </div>
+
+      {/* Data import/export */}
+      <section id="data" className="bg-ih-bg-card rounded-lg border border-ih-border p-6 space-y-5 scroll-mt-12">
+        <h3 className="text-[11px] font-bold text-ih-fg-2 uppercase tracking-[0.2em]">{m.settings_advanced_data_heading()}</h3>
+        <p className="text-[13px] text-ih-fg-3">
+          {m.settings_advanced_data_desc()}
+        </p>
+        <div className="flex flex-wrap gap-3">
+          <Link to="/settings/data"
+            className="h-9 px-4 rounded-md border border-ih-border bg-ih-bg-card text-ih-fg-2 text-[13px] font-semibold hover:bg-ih-bg-muted transition-colors inline-flex items-center">
+            {m.settings_advanced_import_export()}
+          </Link>
+        </div>
+      </section>
+    </div>
+  );
+}
